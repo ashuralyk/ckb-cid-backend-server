@@ -7,3 +7,5 @@ publish = false
 [dependencies]
 cid-backend-core = { path = "../crates/cid-backend-core" }
 ckb-types = { workspace = true }
+cid-protocol = { workspace = true }
+cid-process-executor = { workspace = true }

@@ -86,6 +86,8 @@ name = "cid-backend-tests"
 version = "0.1.0"
 dependencies = [
  "cid-backend-core",
+ "cid-process-executor",
+ "cid-protocol",
  "ckb-types",
 ]
 
