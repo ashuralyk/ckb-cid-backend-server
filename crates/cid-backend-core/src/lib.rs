@@ -4,7 +4,9 @@ pub mod process;
 pub mod ssri;
 pub mod assemble;
 
-pub use assemble::{assemble_digest_ok, AssembleError, ExecutionSkeleton};
+pub use assemble::{
+    assemble_digest_incompatible, assemble_digest_ok, AssembleError, ExecutionSkeleton,
+};
 pub use process::{ProcessResolver, ResolvedProcess};
 pub use rpc::{out_point_key, script_hash32, LiveCell, Rpc, RpcError};
 pub use scan::{

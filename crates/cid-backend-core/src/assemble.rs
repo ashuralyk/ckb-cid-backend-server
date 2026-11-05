@@ -2,7 +2,7 @@ use crate::process::ResolvedProcess;
 use crate::rpc::script_hash32;
 use crate::scan::ScannedIntention;
 use ckb_types::core::{TransactionBuilder, TransactionView};
-use ckb_types::packed::{CellDep, CellInput, CellOutput};
+use ckb_types::packed::{CellDep, CellInput, CellOutput, Script};
 use ckb_types::prelude::*;
 use cid_process_executor::PartialTx;
 use std::fmt;
@@ -112,6 +112,62 @@ pub fn assemble_digest_ok(
     outputs_data.push(proc_data);
 
     finish(inputs, input_capacity, outputs, outputs_data, extra_cell_deps)
+}
+
+fn protocol_script_to_packed(script: &cid_protocol::Script) -> Script {
+    Script::new_builder()
+        .code_hash(script.code_hash.pack())
+        .hash_type(script.hash_type.into())
+        .args(script.args.clone().pack())
+        .build()
+}
+
+pub fn assemble_digest_incompatible(
+    intentions: &[ScannedIntention],
+    extra_cell_deps: &[CellDep],
+) -> Result<ExecutionSkeleton, AssembleError> {
+    if intentions.is_empty() {
+        return Err(AssembleError::RefundUnbuildable(
+            "no intentions to refund".into(),
+        ));
+    }
+    let mut inputs = Vec::new();
+    let mut input_capacity = 0u64;
+    let mut outputs = Vec::new();
+    let mut outputs_data = Vec::new();
+    for intent in intentions {
+        inputs.push(cell_input(&intent.out_point));
+        input_capacity += intent.capacity;
+        let (out, data) = refund_output(intent)?;
+        outputs.push(out);
+        outputs_data.push(data);
+    }
+    finish(inputs, input_capacity, outputs, outputs_data, extra_cell_deps)
+}
+
+fn refund_output(
+    intent: &ScannedIntention,
+) -> Result<(CellOutput, Vec<u8>), AssembleError> {
+    let user = protocol_script_to_packed(&intent.args.entry.user_lock);
+    let mut builder = CellOutput::new_builder()
+        .capacity(intent.capacity.pack())
+        .lock(user);
+    if let Some(ts) = &intent.type_script {
+        let code: [u8; 32] = ts.code_hash().unpack();
+        let ht: u8 = ts.hash_type().into();
+        if !cid_protocol::is_standard_xudt(&code, ht) {
+            return Err(AssembleError::RefundUnbuildable(
+                "non-standard type script; cannot exact-refund".into(),
+            ));
+        }
+        if intent.data.len() != cid_protocol::XUDT_AMOUNT_LEN {
+            return Err(AssembleError::RefundUnbuildable(
+                "xUDT amount is not 16 bytes".into(),
+            ));
+        }
+        builder = builder.type_(Some(ts.clone()).pack());
+    }
+    Ok((builder.build(), intent.data.clone()))
 }
 
 #[cfg(test)]
@@ -284,5 +340,57 @@ mod tests {
         assert_eq!(cap, 180_0000_0000);
         let data: Vec<u8> = skel.tx.outputs_data().get(1).unwrap().unpack();
         assert_eq!(data, vec![0x01]);
+    }
+
+    #[test]
+    fn digest_incompatible_refunds_user_lock_without_process_pair() {
+        let intent = intention(1, [0xAB; 32], 100_0000_0000);
+        let skel = assemble_digest_incompatible(&[intent.clone()], &[]).unwrap();
+        let tx = skel.tx;
+        assert_eq!(tx.inputs().len(), 1);
+        assert_eq!(tx.inputs().get(0).unwrap().previous_output(), intent.out_point);
+        assert_eq!(tx.outputs().len(), 1);
+        let out = tx.outputs().get(0).unwrap();
+        let cap: u64 = out.capacity().unpack();
+        assert_eq!(cap, 100_0000_0000);
+        let lock = out.lock();
+        let code: [u8; 32] = lock.code_hash().unpack();
+        assert_eq!(code, user_lock().code_hash);
+        assert!(out.type_().to_opt().is_none());
+        assert!(tx.header_deps().is_empty());
+    }
+
+    #[test]
+    fn digest_incompatible_preserves_standard_xudt() {
+        use cid_protocol::{XUDT_AMOUNT_LEN, XUDT_CODE_HASH, SCRIPT_HASH_TYPE_DATA1};
+        let mut intent = intention(1, [0xAB; 32], 100_0000_0000);
+        let ts = Script::new_builder()
+            .code_hash(XUDT_CODE_HASH.pack())
+            .hash_type(SCRIPT_HASH_TYPE_DATA1.into())
+            .args([0x33u8; 32].to_vec().pack())
+            .build();
+        intent.type_script = Some(ts.clone());
+        intent.data = 1_000u128.to_le_bytes()[..XUDT_AMOUNT_LEN].to_vec();
+        let skel = assemble_digest_incompatible(&[intent], &[]).unwrap();
+        let out = skel.tx.outputs().get(0).unwrap();
+        let got = out.type_().to_opt().expect("xudt type");
+        assert_eq!(got.as_slice(), ts.as_slice());
+        let data: Vec<u8> = skel.tx.outputs_data().get(0).unwrap().unpack();
+        assert_eq!(data, 1_000u128.to_le_bytes()[..XUDT_AMOUNT_LEN].to_vec());
+    }
+
+    #[test]
+    fn digest_incompatible_rejects_non_standard_type() {
+        let mut intent = intention(1, [0xAB; 32], 100_0000_0000);
+        intent.type_script = Some(
+            Script::new_builder()
+                .code_hash([0xFFu8; 32].pack())
+                .hash_type(ScriptHashType::Type.into())
+                .args(Vec::<u8>::new().pack())
+                .build(),
+        );
+        intent.data = vec![1, 2, 3];
+        let err = assemble_digest_incompatible(&[intent], &[]).unwrap_err();
+        assert!(matches!(err, AssembleError::RefundUnbuildable(_)));
     }
 }
