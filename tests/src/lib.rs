@@ -5,3 +5,4 @@ pub mod scripted_ssri;
 pub mod submit_inflight;
 pub mod vertical_n1;
 pub mod vertical_batch_bounds;
+pub mod vertical_incompatible;
