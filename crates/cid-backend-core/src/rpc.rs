@@ -24,6 +24,13 @@ impl LiveCell {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxStatus {
+    Pending,
+    Committed,
+    Dropped,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RpcError {
     Unavailable(String),
@@ -64,4 +71,6 @@ pub trait Rpc {
     ) -> Result<Option<LiveCell>, RpcError>;
 
     fn submit_transaction(&self, tx: &TransactionView) -> Result<Byte32, RpcError>;
+
+    fn get_transaction_status(&self, tx_hash: &Byte32) -> Result<TxStatus, RpcError>;
 }

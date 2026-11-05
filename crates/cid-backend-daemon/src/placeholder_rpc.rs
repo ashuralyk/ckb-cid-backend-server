@@ -1,6 +1,6 @@
 use ckb_types::core::{ScriptHashType, TransactionView};
 use ckb_types::packed::Byte32;
-use cid_backend_core::rpc::{LiveCell, Rpc, RpcError};
+use cid_backend_core::rpc::{LiveCell, Rpc, RpcError, TxStatus};
 
 pub struct PlaceholderRpc {
     pub node_url: String,
@@ -32,6 +32,12 @@ impl Rpc for PlaceholderRpc {
     fn submit_transaction(&self, _tx: &TransactionView) -> Result<Byte32, RpcError> {
         Err(RpcError::Unavailable(
             "v0 placeholder; no live JSON-RPC submit".into(),
+        ))
+    }
+
+    fn get_transaction_status(&self, _tx_hash: &Byte32) -> Result<TxStatus, RpcError> {
+        Err(RpcError::Unavailable(
+            "v0 placeholder; no live JSON-RPC tx status".into(),
         ))
     }
 }

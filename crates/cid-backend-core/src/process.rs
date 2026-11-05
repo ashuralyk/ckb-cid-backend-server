@@ -11,9 +11,14 @@ pub struct ResolvedProcess {
     pub binary: Vec<u8>,
 }
 
+struct CachedBinary {
+    live_data: Vec<u8>,
+    binary: Vec<u8>,
+}
+
 pub struct ProcessResolver {
     fallback: Option<ProcessFallback>,
-    binary_cache: HashMap<[u8; 32], Vec<u8>>,
+    binary_cache: HashMap<[u8; 32], CachedBinary>,
 }
 
 impl Default for ProcessResolver {
@@ -59,29 +64,47 @@ impl ProcessResolver {
             );
             return Ok(None);
         };
-        let binary = if let Some(cached) = self.binary_cache.get(process_type_hash) {
-            cached.clone()
-        } else if looks_like_elf(&cell.data) {
-            cell.data.clone()
-        } else if let Some(fb) = &self.fallback {
-            match fb(process_type_hash, &cell) {
-                Some(b) if looks_like_elf(&b) => b,
-                _ => {
-                    log::warn!("Process cell data empty/unusable and fallback missing");
+        let binary = match self.binary_cache.get(process_type_hash) {
+            Some(cached) if cached.live_data == cell.data => cached.binary.clone(),
+            _ => match self.derive_binary(process_type_hash, &cell) {
+                Some(binary) => {
+                    self.binary_cache.insert(
+                        *process_type_hash,
+                        CachedBinary {
+                            live_data: cell.data.clone(),
+                            binary: binary.clone(),
+                        },
+                    );
+                    binary
+                }
+                None => {
+                    self.binary_cache.remove(process_type_hash);
                     return Ok(None);
                 }
-            }
-        } else {
-            log::warn!("Process cell data empty/unusable; no fallback installed");
-            return Ok(None);
+            },
         };
-        self.binary_cache
-            .insert(*process_type_hash, binary.clone());
         Ok(Some(ResolvedProcess {
             type_hash: *process_type_hash,
             live_cell: cell,
             binary,
         }))
+    }
+
+    fn derive_binary(&self, process_type_hash: &[u8; 32], cell: &LiveCell) -> Option<Vec<u8>> {
+        if looks_like_elf(&cell.data) {
+            return Some(cell.data.clone());
+        }
+        if let Some(fb) = &self.fallback {
+            match fb(process_type_hash, cell) {
+                Some(b) if looks_like_elf(&b) => return Some(b),
+                _ => {
+                    log::warn!("Process cell data empty/unusable and fallback missing");
+                    return None;
+                }
+            }
+        }
+        log::warn!("Process cell data empty/unusable; no fallback installed");
+        None
     }
 }
 
@@ -92,7 +115,7 @@ fn looks_like_elf(data: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rpc::{LiveCell, Rpc, RpcError};
+    use crate::rpc::{LiveCell, Rpc, RpcError, TxStatus};
     use ckb_types::core::{ScriptHashType, TransactionView};
     use ckb_types::packed::{Byte32, CellOutput, OutPoint, Script};
     use ckb_types::prelude::*;
@@ -117,6 +140,9 @@ mod tests {
             Ok(self.cell.borrow().clone())
         }
         fn submit_transaction(&self, _tx: &TransactionView) -> Result<Byte32, RpcError> {
+            Err(RpcError::Unavailable("no".into()))
+        }
+        fn get_transaction_status(&self, _tx_hash: &Byte32) -> Result<TxStatus, RpcError> {
             Err(RpcError::Unavailable("no".into()))
         }
     }
@@ -206,5 +232,60 @@ mod tests {
         let second = resolver.resolve(&rpc, &hash).unwrap().unwrap();
         assert_eq!(second.live_cell.out_point, cell2.out_point);
         assert_eq!(second.binary, first.binary);
+    }
+
+    #[test]
+    fn resolve_uses_updated_live_data_for_same_type_hash() {
+        let (hash, cell1) = process_cell(vec![0x7f, b'E', b'L', b'F', 0x01]);
+        let rpc = TestRpc {
+            cell: RefCell::new(Some(cell1.clone())),
+        };
+        let mut resolver = ProcessResolver::new();
+        let first = resolver.resolve(&rpc, &hash).unwrap().unwrap();
+        assert_eq!(first.binary, vec![0x7f, b'E', b'L', b'F', 0x01]);
+
+        let mut cell2 = cell1.clone();
+        cell2.out_point = OutPoint::new_builder()
+            .tx_hash(Byte32::from_slice(&[0x99; 32]).unwrap())
+            .index(0u32.pack())
+            .build();
+        cell2.data = vec![0x7f, b'E', b'L', b'F', 0x02];
+        rpc.cell.replace(Some(cell2.clone()));
+        let second = resolver.resolve(&rpc, &hash).unwrap().unwrap();
+        assert_eq!(second.live_cell.out_point, cell2.out_point);
+        assert_eq!(second.binary, vec![0x7f, b'E', b'L', b'F', 0x02]);
+    }
+
+    #[test]
+    fn resolve_skips_when_live_data_changes_from_elf_to_non_elf_without_fallback() {
+        let (hash, cell1) = process_cell(vec![0x7f, b'E', b'L', b'F', 0x01]);
+        let rpc = TestRpc {
+            cell: RefCell::new(Some(cell1.clone())),
+        };
+        let mut resolver = ProcessResolver::new();
+        assert!(resolver.resolve(&rpc, &hash).unwrap().is_some());
+
+        let mut cell2 = cell1;
+        cell2.data = b"not-an-elf".to_vec();
+        rpc.cell.replace(Some(cell2));
+        assert!(resolver.resolve(&rpc, &hash).unwrap().is_none());
+    }
+
+    #[test]
+    fn resolve_fallback_when_live_data_changes_from_elf_to_non_elf() {
+        let (hash, cell1) = process_cell(vec![0x7f, b'E', b'L', b'F', 0x01]);
+        let rpc = TestRpc {
+            cell: RefCell::new(Some(cell1.clone())),
+        };
+        let mut resolver = ProcessResolver::with_fallback_binary(vec![0x7f, b'E', b'L', b'F', 0xFB]);
+        let first = resolver.resolve(&rpc, &hash).unwrap().unwrap();
+        assert_eq!(first.binary, vec![0x7f, b'E', b'L', b'F', 0x01]);
+
+        let mut cell2 = cell1;
+        cell2.data = b"not-an-elf".to_vec();
+        rpc.cell.replace(Some(cell2.clone()));
+        let second = resolver.resolve(&rpc, &hash).unwrap().unwrap();
+        assert_eq!(second.binary, vec![0x7f, b'E', b'L', b'F', 0xFB]);
+        assert_eq!(second.live_cell.data, b"not-an-elf");
     }
 }

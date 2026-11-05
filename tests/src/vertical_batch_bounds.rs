@@ -102,4 +102,60 @@ mod tests {
             "asc bucket head"
         );
     }
+
+    #[test]
+    fn two_full_batches_one_digest_ok_per_tick_no_process_double_spend() {
+        let rpc = FakeRpc::new();
+        let ts = process_type_script(2);
+        let hash = script_hash32(&ts);
+        let proc = process_cell(2, 400_0000_0000, vec![0x7f, b'E', b'L', b'F', 2]);
+        rpc.insert_cell(proc.clone());
+        for i in 1..=4 {
+            rpc.insert_cell(intention_cell(i, hash, 100_0000_0000));
+        }
+        let mut loop_ = DigestLoop::new(
+            rpc,
+            NopClock,
+            ScriptedSsri::mimic((2, 2)),
+            cfg(),
+            ProcessResolver::new(),
+        );
+
+        let first = loop_.tick();
+        assert_eq!(first.submitted, 1, "one digest_ok per tick");
+        assert_eq!(first.conflicts, 0, "must not double-spend Process");
+        let tx1 = &loop_.rpc().submitted()[0];
+        let process_in = tx1.inputs().get(tx1.inputs().len() - 1).unwrap().previous_output();
+        assert_eq!(process_in, proc.out_point);
+        let remaining_intentions = loop_
+            .rpc()
+            .live_cells()
+            .iter()
+            .filter(|c| c.lock().code_hash().as_slice() == CID_CODE)
+            .count();
+        assert_eq!(remaining_intentions, 2);
+
+        let second = loop_.tick();
+        assert_eq!(second.submitted, 1);
+        assert_eq!(second.conflicts, 0);
+        let txs = loop_.rpc().submitted();
+        assert_eq!(txs.len(), 2);
+        let tx2_process = txs[1]
+            .inputs()
+            .get(txs[1].inputs().len() - 1)
+            .unwrap()
+            .previous_output();
+        assert_eq!(
+            tx2_process.tx_hash(),
+            txs[0].hash(),
+            "next tick spends Process recreate from prior digest_ok"
+        );
+        let leftover = loop_
+            .rpc()
+            .live_cells()
+            .iter()
+            .filter(|c| c.lock().code_hash().as_slice() == CID_CODE)
+            .count();
+        assert_eq!(leftover, 0);
+    }
 }

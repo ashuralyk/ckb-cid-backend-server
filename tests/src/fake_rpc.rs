@@ -4,7 +4,9 @@ use std::collections::HashMap;
 use ckb_types::core::{ScriptHashType, TransactionView};
 use ckb_types::packed::{Byte32, OutPoint};
 use ckb_types::prelude::*;
-use cid_backend_core::rpc::{out_point_key, script_hash32, LiveCell, Rpc, RpcError};
+use cid_backend_core::rpc::{
+    out_point_key, script_hash32, LiveCell, Rpc, RpcError, TxStatus,
+};
 
 #[derive(Default)]
 struct Inner {
@@ -12,6 +14,8 @@ struct Inner {
     order: Vec<OutPoint>,
     fail_next_submit: bool,
     submitted: Vec<TransactionView>,
+    consumed_by_tx: HashMap<Vec<u8>, Vec<LiveCell>>,
+    tx_status: HashMap<Vec<u8>, TxStatus>,
 }
 
 pub struct FakeRpc {
@@ -55,6 +59,25 @@ impl FakeRpc {
 
     pub fn submitted(&self) -> Vec<TransactionView> {
         self.inner.borrow().submitted.clone()
+    }
+
+    /// Restore consumed inputs of `tx_hash`, drop its outputs, and mark the tx Dropped.
+    /// Models a pool eviction after `submit_transaction` succeeded.
+    pub fn simulate_drop(&self, tx_hash: &Byte32) {
+        let mut inner = self.inner.borrow_mut();
+        let key = tx_hash.as_slice().to_vec();
+        inner.order.retain(|op| op.tx_hash() != *tx_hash);
+        inner.cells.retain(|_, cell| cell.out_point.tx_hash() != *tx_hash);
+        if let Some(cells) = inner.consumed_by_tx.get(&key).cloned() {
+            for cell in cells {
+                let cell_key = out_point_key(&cell.out_point);
+                if !inner.cells.contains_key(&cell_key) {
+                    inner.order.push(cell.out_point.clone());
+                }
+                inner.cells.insert(cell_key, cell);
+            }
+        }
+        inner.tx_status.insert(key, TxStatus::Dropped);
     }
 }
 
@@ -116,12 +139,22 @@ impl Rpc for FakeRpc {
                 return Err(RpcError::Conflict("input cell missing".into()));
             }
         }
+        let mut consumed_cells = Vec::new();
         for input in tx.inputs() {
             let op = input.previous_output();
-            inner.cells.remove(&out_point_key(&op));
+            let key = out_point_key(&op);
+            if let Some(cell) = inner.cells.remove(&key) {
+                consumed_cells.push(cell);
+            }
             inner.order.retain(|o| o.as_slice() != op.as_slice());
         }
         let tx_hash = tx.hash();
+        inner
+            .consumed_by_tx
+            .insert(tx_hash.as_slice().to_vec(), consumed_cells);
+        inner
+            .tx_status
+            .insert(tx_hash.as_slice().to_vec(), TxStatus::Committed);
         for (i, (output, data)) in tx
             .outputs()
             .into_iter()
@@ -143,6 +176,16 @@ impl Rpc for FakeRpc {
         }
         inner.submitted.push(tx.clone());
         Ok(tx_hash)
+    }
+
+    fn get_transaction_status(&self, tx_hash: &Byte32) -> Result<TxStatus, RpcError> {
+        Ok(self
+            .inner
+            .borrow()
+            .tx_status
+            .get(tx_hash.as_slice())
+            .copied()
+            .unwrap_or(TxStatus::Dropped))
     }
 }
 
