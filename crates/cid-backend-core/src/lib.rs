@@ -3,6 +3,7 @@ pub mod scan;
 pub mod process;
 pub mod ssri;
 pub mod assemble;
+pub mod submit;
 
 pub use assemble::{
     assemble_digest_incompatible, assemble_digest_ok, AssembleError, ExecutionSkeleton,
@@ -13,3 +14,4 @@ pub use scan::{
     bucket_by_process_type_hash, decode_cells, scan_intentions, ScannedIntention,
 };
 pub use ssri::{map_executor_error, to_intention_input, EmbeddedSsri, SsriError, SsriHost};
+pub use submit::{submit_execution, SubmitState};
