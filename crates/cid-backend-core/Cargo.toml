@@ -1,0 +1,8 @@
+[package]
+name = "cid-backend-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ckb-types = { workspace = true }
+log = { workspace = true }

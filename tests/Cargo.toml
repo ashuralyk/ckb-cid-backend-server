@@ -1,0 +1,9 @@
+[package]
+name = "cid-backend-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+cid-backend-core = { path = "../crates/cid-backend-core" }
+ckb-types = { workspace = true }
