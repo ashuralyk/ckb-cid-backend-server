@@ -7,3 +7,4 @@ edition = "2021"
 ckb-types = { workspace = true }
 log = { workspace = true }
 cid-protocol = { workspace = true }
+cid-process-executor = { workspace = true }
