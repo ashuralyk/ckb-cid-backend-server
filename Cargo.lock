@@ -59,6 +59,7 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 name = "cid-backend-core"
 version = "0.1.0"
 dependencies = [
+ "cid-protocol",
  "ckb-types",
  "log",
 ]
@@ -73,6 +74,15 @@ version = "0.1.0"
 dependencies = [
  "cid-backend-core",
  "ckb-types",
+]
+
+[[package]]
+name = "cid-protocol"
+version = "0.1.0"
+source = "git+https://github.com/ashuralyk/ckb-common-intention-dispatcher?rev=d9ee77805f7ac930ab149648bed70f484a9886de#d9ee77805f7ac930ab149648bed70f484a9886de"
+dependencies = [
+ "serde",
+ "serde_molecule",
 ]
 
 [[package]]
@@ -561,6 +571,15 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "serde_molecule"
+version = "1.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2bc06f0c67a492a3969744eb47ce58a86529140fba6b395c83b9dea432032503"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

@@ -6,3 +6,4 @@ edition = "2021"
 [dependencies]
 ckb-types = { workspace = true }
 log = { workspace = true }
+cid-protocol = { workspace = true }
