@@ -57,13 +57,7 @@ pub struct DigestLoop<R: Rpc, C: Clock, S: SsriHost> {
 }
 
 impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
-    pub fn new(
-        rpc: R,
-        clock: C,
-        ssri: S,
-        config: LoopConfig,
-        resolver: ProcessResolver,
-    ) -> Self {
+    pub fn new(rpc: R, clock: C, ssri: S, config: LoopConfig, resolver: ProcessResolver) -> Self {
         Self {
             rpc,
             clock,
@@ -93,32 +87,30 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
 
     pub fn tick(&mut self) -> TickReport {
         let mut report = TickReport::default();
-        let scanned = match scan_intentions(
-            &self.rpc,
-            &self.config.cid_code_hash,
-            self.config.hash_type,
-        ) {
-            Ok(v) => v,
-            Err(RpcError::Unavailable(m)) => {
-                log::warn!("scan unavailable: {m}");
-                return report;
-            }
-            Err(e) => {
-                log::warn!("scan error: {e}");
-                return report;
-            }
-        };
+        let scanned =
+            match scan_intentions(&self.rpc, &self.config.cid_code_hash, self.config.hash_type) {
+                Ok(v) => v,
+                Err(RpcError::Unavailable(m)) => {
+                    log::warn!("scan unavailable: {m}");
+                    return report;
+                }
+                Err(e) => {
+                    log::warn!("scan error: {e}");
+                    return report;
+                }
+            };
         report.scanned = scanned.len();
 
         let live_keys: HashSet<Vec<u8>> = scanned
             .iter()
             .map(|i| out_point_key(&i.out_point))
             .collect();
-        self.reconcile_pending(&live_keys);
+        self.reconcile_pending();
+        let pending_occupied = self.state.submit.pending_occupied_keys();
         self.state
             .submit
             .in_flight
-            .retain(|k| live_keys.contains(k));
+            .retain(|k| live_keys.contains(k) || pending_occupied.contains(k));
 
         let eligible: Vec<ScannedIntention> = scanned
             .into_iter()
@@ -137,7 +129,7 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
         report
     }
 
-    fn reconcile_pending(&mut self, live_keys: &HashSet<Vec<u8>>) {
+    fn reconcile_pending(&mut self) {
         let hashes: Vec<Vec<u8>> = self.state.submit.pending.keys().cloned().collect();
         for hash_bytes in hashes {
             let tx_hash = match Byte32::from_slice(&hash_bytes) {
@@ -151,9 +143,7 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                 Ok(TxStatus::Dropped) => {
                     if let Some(ops) = self.state.submit.pending.remove(&hash_bytes) {
                         for k in ops {
-                            if live_keys.contains(&k) {
-                                self.state.submit.in_flight.remove(&k);
-                            }
+                            self.state.submit.in_flight.remove(&k);
                         }
                     }
                 }
@@ -225,24 +215,30 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
         let inputs: Vec<_> = batch.iter().map(to_intention_input).collect();
         let assembled = self.ssri.assemble(&process.binary, &inputs);
         let skeleton = match assembled {
-            Ok(partial) => match assemble_digest_ok(
-                &batch,
-                process,
-                &partial,
-                &self.config.extra_cell_deps,
-            ) {
-                Ok(s) => s,
-                Err(AssembleError::CapacityShortfall { inputs, outputs }) => {
-                    log::warn!("skip batch: capacity in={inputs} out={outputs}");
+            Ok(partial) => {
+                if self
+                    .state
+                    .submit
+                    .pending_occupies(&process.live_cell.out_point)
+                {
+                    log::warn!("skip batch: Process occupied by pending submit");
                     report.skipped += batch.len();
-                    return false;
+                    return true;
                 }
-                Err(e) => {
-                    log::warn!("skip batch: digest_ok {e}");
-                    report.skipped += batch.len();
-                    return false;
+                match assemble_digest_ok(&batch, process, &partial, &self.config.extra_cell_deps) {
+                    Ok(s) => s,
+                    Err(AssembleError::CapacityShortfall { inputs, outputs }) => {
+                        log::warn!("skip batch: capacity in={inputs} out={outputs}");
+                        report.skipped += batch.len();
+                        return false;
+                    }
+                    Err(e) => {
+                        log::warn!("skip batch: digest_ok {e}");
+                        report.skipped += batch.len();
+                        return false;
+                    }
                 }
-            },
+            }
             Err(SsriError::Incompatible(code)) => {
                 log::info!("ssri incompatible {code}; attempting user-lock refund");
                 match assemble_digest_incompatible(&batch, &self.config.extra_cell_deps) {

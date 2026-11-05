@@ -12,6 +12,17 @@ pub struct SubmitState {
     pub pending: HashMap<Vec<u8>, Vec<Vec<u8>>>,
 }
 
+impl SubmitState {
+    pub fn pending_occupies(&self, op: &OutPoint) -> bool {
+        let k = out_point_key(op);
+        self.pending.values().any(|ops| ops.iter().any(|o| o == &k))
+    }
+
+    pub fn pending_occupied_keys(&self) -> HashSet<Vec<u8>> {
+        self.pending.values().flatten().cloned().collect()
+    }
+}
+
 pub fn submit_execution<R: Rpc>(
     rpc: &R,
     skeleton: &ExecutionSkeleton,

@@ -8,3 +8,4 @@ pub mod vertical_batch_bounds;
 pub mod vertical_incompatible;
 pub mod vertical_submit_conflict;
 pub mod vertical_submit_drop;
+pub mod vertical_submit_pending;

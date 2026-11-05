@@ -1,18 +1,17 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+use cid_backend_core::rpc::{out_point_key, script_hash32, LiveCell, Rpc, RpcError, TxStatus};
 use ckb_types::core::{ScriptHashType, TransactionView};
 use ckb_types::packed::{Byte32, OutPoint};
 use ckb_types::prelude::*;
-use cid_backend_core::rpc::{
-    out_point_key, script_hash32, LiveCell, Rpc, RpcError, TxStatus,
-};
 
 #[derive(Default)]
 struct Inner {
     cells: HashMap<Vec<u8>, LiveCell>,
     order: Vec<OutPoint>,
     fail_next_submit: bool,
+    defer_commit: bool,
     submitted: Vec<TransactionView>,
     consumed_by_tx: HashMap<Vec<u8>, Vec<LiveCell>>,
     tx_status: HashMap<Vec<u8>, TxStatus>,
@@ -48,6 +47,11 @@ impl FakeRpc {
         self.inner.borrow_mut().fail_next_submit = true;
     }
 
+    /// Submit succeeds but leaves inputs live and does not apply outputs (indexer lag / mempool).
+    pub fn defer_commit(&self) {
+        self.inner.borrow_mut().defer_commit = true;
+    }
+
     pub fn live_cells(&self) -> Vec<LiveCell> {
         let inner = self.inner.borrow();
         inner
@@ -67,7 +71,9 @@ impl FakeRpc {
         let mut inner = self.inner.borrow_mut();
         let key = tx_hash.as_slice().to_vec();
         inner.order.retain(|op| op.tx_hash() != *tx_hash);
-        inner.cells.retain(|_, cell| cell.out_point.tx_hash() != *tx_hash);
+        inner
+            .cells
+            .retain(|_, cell| cell.out_point.tx_hash() != *tx_hash);
         if let Some(cells) = inner.consumed_by_tx.get(&key).cloned() {
             for cell in cells {
                 let cell_key = out_point_key(&cell.out_point);
@@ -78,6 +84,56 @@ impl FakeRpc {
             }
         }
         inner.tx_status.insert(key, TxStatus::Dropped);
+    }
+
+    /// Apply a previously deferred submit: consume inputs and create outputs.
+    pub fn commit_pending(&self, tx_hash: &Byte32) {
+        let mut inner = self.inner.borrow_mut();
+        let key = tx_hash.as_slice().to_vec();
+        if inner.tx_status.get(&key) != Some(&TxStatus::Pending) {
+            return;
+        }
+        apply_commit(&mut inner, tx_hash);
+        inner.tx_status.insert(key, TxStatus::Committed);
+    }
+}
+
+fn apply_commit(inner: &mut Inner, tx_hash: &Byte32) {
+    let key = tx_hash.as_slice().to_vec();
+    if let Some(cells) = inner.consumed_by_tx.get(&key).cloned() {
+        for cell in cells {
+            inner.cells.remove(&out_point_key(&cell.out_point));
+            inner
+                .order
+                .retain(|o| o.as_slice() != cell.out_point.as_slice());
+        }
+    }
+    let Some(tx) = inner
+        .submitted
+        .iter()
+        .find(|t| t.hash() == *tx_hash)
+        .cloned()
+    else {
+        return;
+    };
+    for (i, (output, data)) in tx
+        .outputs()
+        .into_iter()
+        .zip(tx.outputs_data().into_iter())
+        .enumerate()
+    {
+        let op = OutPoint::new_builder()
+            .tx_hash(tx_hash.clone())
+            .index((i as u32).pack())
+            .build();
+        let bytes: Vec<u8> = data.unpack();
+        let cell = LiveCell {
+            out_point: op.clone(),
+            output,
+            data: bytes,
+        };
+        inner.order.push(op.clone());
+        inner.cells.insert(out_point_key(&op), cell);
     }
 }
 
@@ -143,38 +199,23 @@ impl Rpc for FakeRpc {
         for input in tx.inputs() {
             let op = input.previous_output();
             let key = out_point_key(&op);
-            if let Some(cell) = inner.cells.remove(&key) {
-                consumed_cells.push(cell);
-            }
-            inner.order.retain(|o| o.as_slice() != op.as_slice());
+            let Some(cell) = inner.cells.get(&key).cloned() else {
+                return Err(RpcError::Conflict("input cell missing".into()));
+            };
+            consumed_cells.push(cell);
         }
         let tx_hash = tx.hash();
+        let hash_key = tx_hash.as_slice().to_vec();
         inner
             .consumed_by_tx
-            .insert(tx_hash.as_slice().to_vec(), consumed_cells);
-        inner
-            .tx_status
-            .insert(tx_hash.as_slice().to_vec(), TxStatus::Committed);
-        for (i, (output, data)) in tx
-            .outputs()
-            .into_iter()
-            .zip(tx.outputs_data().into_iter())
-            .enumerate()
-        {
-            let op = OutPoint::new_builder()
-                .tx_hash(tx_hash.clone())
-                .index((i as u32).pack())
-                .build();
-            let bytes: Vec<u8> = data.unpack();
-            let cell = LiveCell {
-                out_point: op.clone(),
-                output,
-                data: bytes,
-            };
-            inner.order.push(op.clone());
-            inner.cells.insert(out_point_key(&op), cell);
-        }
+            .insert(hash_key.clone(), consumed_cells);
         inner.submitted.push(tx.clone());
+        if inner.defer_commit {
+            inner.tx_status.insert(hash_key, TxStatus::Pending);
+        } else {
+            apply_commit(&mut inner, &tx_hash);
+            inner.tx_status.insert(hash_key, TxStatus::Committed);
+        }
         Ok(tx_hash)
     }
 
