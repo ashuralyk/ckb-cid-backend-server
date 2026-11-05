@@ -5,3 +5,4 @@
 - Task 3: complete (commits e820ef7)
 - Task 4: complete (commits bc58996)
 - Task 5: complete (commits 6931c32)
+- Task 6: complete (commits c580718)
