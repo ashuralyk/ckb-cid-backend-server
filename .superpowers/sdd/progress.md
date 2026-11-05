@@ -7,3 +7,4 @@
 - Task 5: complete (commits 6931c32)
 - Task 6: complete (commits c580718)
 - Task 7: complete (commits 607ef0d)
+- Task 8: complete (commits d8ac0b4)
