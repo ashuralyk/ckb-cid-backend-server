@@ -12,6 +12,7 @@ struct Inner {
     order: Vec<OutPoint>,
     fail_next_submit: bool,
     defer_commit: bool,
+    fail_status_queries: bool,
     submitted: Vec<TransactionView>,
     consumed_by_tx: HashMap<Vec<u8>, Vec<LiveCell>>,
     tx_status: HashMap<Vec<u8>, TxStatus>,
@@ -50,6 +51,11 @@ impl FakeRpc {
     /// Submit succeeds but leaves inputs live and does not apply outputs (indexer lag / mempool).
     pub fn defer_commit(&self) {
         self.inner.borrow_mut().defer_commit = true;
+    }
+
+    /// `get_transaction_status` returns Unavailable until restored (occupancy must be held).
+    pub fn fail_status_queries(&self) {
+        self.inner.borrow_mut().fail_status_queries = true;
     }
 
     pub fn live_cells(&self) -> Vec<LiveCell> {
@@ -220,9 +226,11 @@ impl Rpc for FakeRpc {
     }
 
     fn get_transaction_status(&self, tx_hash: &Byte32) -> Result<TxStatus, RpcError> {
-        Ok(self
-            .inner
-            .borrow()
+        let inner = self.inner.borrow();
+        if inner.fail_status_queries {
+            return Err(RpcError::Unavailable("injected status unavailable".into()));
+        }
+        Ok(inner
             .tx_status
             .get(tx_hash.as_slice())
             .copied()
