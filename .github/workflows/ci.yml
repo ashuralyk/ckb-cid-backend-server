@@ -1,0 +1,80 @@
+# FakeRpc regression CI. Same commands as README "Tests".
+# Does not talk to a CKB node. Does not build cid_process_example.
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  test:
+    name: cargo test (FakeRpc)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry, git deps, and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test cid-backend-core
+        run: |
+          set -euo pipefail
+          cargo test --locked -p cid-backend-core -- --nocapture | tee core-test.log
+          if grep -F 'skip: cid_process_example missing' core-test.log; then
+            echo '::notice title=Optional SSRI fixture skipped::real_example_binary_batch_bounds_if_present returned without executing the real guest (cid_process_example absent). This is not a real-SSRI pass. FakeRpc suites are unaffected.'
+          fi
+
+      - name: Test cid-backend-daemon
+        run: cargo test --locked -p cid-backend-daemon -- --nocapture | tee daemon-test.log
+        shell: bash
+
+      - name: Test cid-backend-tests (FakeRpc verticals)
+        run: cargo test --locked -p cid-backend-tests -- --nocapture | tee tests-test.log
+        shell: bash
+
+      - name: Summarize results
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo '## cargo test'
+            echo
+            echo 'Commands (reproducible, no live CKB RPC):'
+            echo '```'
+            echo 'cargo test --locked -p cid-backend-core'
+            echo 'cargo test --locked -p cid-backend-daemon'
+            echo 'cargo test --locked -p cid-backend-tests'
+            echo '```'
+            echo
+            for label in core daemon tests; do
+              f="${label}-test.log"
+              if [ -f "$f" ]; then
+                echo "### ${label}"
+                echo '```'
+                awk '/^test result:/{print; exit}' "$f" || echo '(no test result line)'
+                echo '```'
+              fi
+            done
+            if [ -f core-test.log ] && grep -F 'skip: cid_process_example missing' core-test.log >/dev/null; then
+              echo
+              echo '**Skipped (not executed):** `real_example_binary_batch_bounds_if_present` — `cid_process_example` fixture absent. Do not treat this as a real-SSRI pass.'
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"

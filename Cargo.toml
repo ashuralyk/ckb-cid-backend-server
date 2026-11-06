@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cid-backend-core",
+    "crates/cid-backend-daemon",
+    "tests",
+]
+
+[workspace.dependencies]
+ckb-types = "0.119"
+log = "0.4"
+cid-process-executor = { git = "https://github.com/ashuralyk/ckb-common-intention-dispatcher", rev = "d9ee77805f7ac930ab149648bed70f484a9886de" }
+cid-protocol = { git = "https://github.com/ashuralyk/ckb-common-intention-dispatcher", rev = "d9ee77805f7ac930ab149648bed70f484a9886de" }

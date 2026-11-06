@@ -1,0 +1,10 @@
+[package]
+name = "cid-backend-daemon"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cid-backend-core = { path = "../cid-backend-core" }
+ckb-types = { workspace = true }
+log = { workspace = true }
+env_logger = "0.11"
