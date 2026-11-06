@@ -47,20 +47,12 @@ cargo test --locked -p cid-backend-tests
 
 Do not point these tests at a CKB node. Verticals: n=1 `digest_ok`, batch bounds, Incompatible refund, submit conflict retry.
 
-GitHub Actions (`.github/workflows/ci.yml`) runs those same commands on `push`, `pull_request` (including drafts), and `workflow_dispatch`. Failures fail the check. The optional `cid_process_example` guest is **not** built in CI; if it is absent, `real_example_binary_batch_bounds_if_present` prints a skip message and is not a real-SSRI execution.
+Default local `cargo test` **ignores** the real SSRI guest test (`real_example_binary_batch_bounds_and_assemble`) when `cid_process_example` is absent — that `ignored` count is **not** a real-SSRI pass.
 
-Optional real guest for `EmbeddedSsri` tests:
+GitHub Actions (`.github/workflows/ci.yml`) on `push`, `pull_request` (including drafts), and `workflow_dispatch`:
 
-```bash
-git clone https://github.com/ashuralyk/ckb-common-intention-dispatcher
-cd ckb-common-intention-dispatcher
-git checkout d9ee77805f7ac930ab149648bed70f484a9886de
-rustup target add riscv64imac-unknown-none-elf
-make prepare
-make CONTRACT=cid_process_example build
-cp build/release/cid_process_example \
-  /path/to/ckb-cid-backend-server/tests/fixtures/cid_process_example
-# or: export CID_PROCESS_EXAMPLE_PATH=/abs/path/to/cid_process_example
-```
+1. Builds `cid_process_example` from pin `d9ee77805f7ac930ab149648bed70f484a9886de` (`clang-18` + `riscv64imac-unknown-none-elf`).
+2. Fails if the ELF is missing.
+3. Runs `cargo test --locked -p cid-backend-core -- --include-ignored` so the guest executes `Process.batch` / `Process.assemble` on ckb-vm, plus the FakeRpc daemon/tests suites.
 
-See `tests/fixtures/README.md`.
+The ELF is not committed; see `tests/fixtures/README.md` and `./scripts/build-cid-process-example.sh`.
