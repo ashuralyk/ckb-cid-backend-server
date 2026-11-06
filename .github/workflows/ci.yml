@@ -66,7 +66,7 @@ jobs:
           CID_PROCESS_EXAMPLE_PATH: ${{ github.workspace }}/tests/fixtures/cid_process_example
         run: |
           set -euo pipefail
-          cargo test --locked -p cid-backend-core -- --include-ignored --nocapture | tee core-test.log
+          cargo test --locked -p cid-backend-core -- --include-ignored --nocapture 2>&1 | tee core-test.log
           if grep -E 'skip: cid_process_example missing|ignoring: cid_process_example' core-test.log; then
             echo '::error::real SSRI guest test skipped; CI must execute ckb-vm Process.batch/assemble'
             exit 1
@@ -74,11 +74,11 @@ jobs:
           grep -F 'real SSRI guest executed:' core-test.log
 
       - name: Test cid-backend-daemon
-        run: cargo test --locked -p cid-backend-daemon -- --nocapture | tee daemon-test.log
+        run: cargo test --locked -p cid-backend-daemon -- --nocapture 2>&1 | tee daemon-test.log
         shell: bash
 
       - name: Test cid-backend-tests (FakeRpc verticals)
-        run: cargo test --locked -p cid-backend-tests -- --nocapture | tee tests-test.log
+        run: cargo test --locked -p cid-backend-tests -- --nocapture 2>&1 | tee tests-test.log
         shell: bash
 
       - name: Summarize results
