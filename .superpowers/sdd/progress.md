@@ -14,3 +14,4 @@
 - Task 12: complete (commits 9fd2b60)
 - Task 13: complete (commits 774a26c)
 - Phase 1 (real SSRI CI must-load): complete (commits 7aa6243, 10cbf54)
+- Phase 2 (real CKB JSON-RPC/Indexer adapter + local-dev-chain closure): complete (commits 38fce50)
