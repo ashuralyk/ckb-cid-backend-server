@@ -40,12 +40,14 @@ Illegal config (missing URL or CID lock code hash) exits immediately.
 ## Tests
 
 ```bash
-cargo test -p cid-backend-core
-cargo test -p cid-backend-daemon
-cargo test -p cid-backend-tests
+cargo test --locked -p cid-backend-core
+cargo test --locked -p cid-backend-daemon
+cargo test --locked -p cid-backend-tests
 ```
 
 Do not point these tests at a CKB node. Verticals: n=1 `digest_ok`, batch bounds, Incompatible refund, submit conflict retry.
+
+GitHub Actions (`.github/workflows/ci.yml`) runs those same commands on `push`, `pull_request` (including drafts), and `workflow_dispatch`. Failures fail the check. The optional `cid_process_example` guest is **not** built in CI; if it is absent, `real_example_binary_batch_bounds_if_present` prints a skip message and is not a real-SSRI execution.
 
 Optional real guest for `EmbeddedSsri` tests:
 
