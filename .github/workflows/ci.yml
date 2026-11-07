@@ -1,5 +1,4 @@
-# FakeRpc regression CI. Same commands as README "Tests".
-# Does not talk to a CKB node. Does not build cid_process_example.
+# FakeRpc regression + real SSRI guest (ckb-vm). No live CKB JSON-RPC.
 name: CI
 
 on:
@@ -18,36 +17,68 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   RUST_BACKTRACE: "1"
+  # Must match workspace.dependencies cid-process-executor / cid-protocol rev.
+  CID_DISPATCHER_REV: d9ee77805f7ac930ab149648bed70f484a9886de
 
 jobs:
   test:
-    name: cargo test (FakeRpc)
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    name: cargo test (FakeRpc + real SSRI guest)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust (rust-toolchain.toml)
+      - name: Checkout pinned Process example source
+        uses: actions/checkout@v4
+        with:
+          repository: ashuralyk/ckb-common-intention-dispatcher
+          ref: ${{ env.CID_DISPATCHER_REV }}
+          path: .cid-dispatcher-src
+
+      - name: Install Rust (stable + riscv64imac-unknown-none-elf)
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: riscv64imac-unknown-none-elf
 
       - name: Cache cargo registry, git deps, and target
         uses: Swatinem/rust-cache@v2
 
-      - name: Test cid-backend-core
+      - name: Install clang-18 (RISC-V contract CC)
+        run: sudo apt-get update && sudo apt-get install -y clang-18
+
+      - name: Build cid_process_example from pin
+        env:
+          CID_DISPATCHER_SRC: ${{ github.workspace }}/.cid-dispatcher-src
+          CID_PROCESS_EXAMPLE_PATH: ${{ github.workspace }}/tests/fixtures/cid_process_example
+          CLANG: clang-18
+        run: bash scripts/build-cid-process-example.sh
+
+      - name: Require Process ELF (fail if missing)
         run: |
           set -euo pipefail
-          cargo test --locked -p cid-backend-core -- --nocapture | tee core-test.log
-          if grep -F 'skip: cid_process_example missing' core-test.log; then
-            echo '::notice title=Optional SSRI fixture skipped::real_example_binary_batch_bounds_if_present returned without executing the real guest (cid_process_example absent). This is not a real-SSRI pass. FakeRpc suites are unaffected.'
+          ELF=tests/fixtures/cid_process_example
+          test -s "$ELF"
+          python3 -c 'import sys; p=sys.argv[1]; m=open(p,"rb").read(4); assert m==b"\x7fELF", m; print("fixture ok:", p)' "$ELF"
+
+      - name: Test cid-backend-core (include ignored real SSRI guest)
+        env:
+          CID_PROCESS_EXAMPLE_PATH: ${{ github.workspace }}/tests/fixtures/cid_process_example
+        run: |
+          set -euo pipefail
+          cargo test --locked -p cid-backend-core -- --include-ignored --nocapture 2>&1 | tee core-test.log
+          if grep -E 'skip: cid_process_example missing|ignoring: cid_process_example' core-test.log; then
+            echo '::error::real SSRI guest test skipped; CI must execute ckb-vm Process.batch/assemble'
+            exit 1
           fi
+          grep -F 'real SSRI guest executed:' core-test.log
 
       - name: Test cid-backend-daemon
-        run: cargo test --locked -p cid-backend-daemon -- --nocapture | tee daemon-test.log
+        run: cargo test --locked -p cid-backend-daemon -- --nocapture 2>&1 | tee daemon-test.log
         shell: bash
 
       - name: Test cid-backend-tests (FakeRpc verticals)
-        run: cargo test --locked -p cid-backend-tests -- --nocapture | tee tests-test.log
+        run: cargo test --locked -p cid-backend-tests -- --nocapture 2>&1 | tee tests-test.log
         shell: bash
 
       - name: Summarize results
@@ -59,10 +90,12 @@ jobs:
             echo
             echo 'Commands (reproducible, no live CKB RPC):'
             echo '```'
-            echo 'cargo test --locked -p cid-backend-core'
-            echo 'cargo test --locked -p cid-backend-daemon'
-            echo 'cargo test --locked -p cid-backend-tests'
+            echo 'cargo test --locked -p cid-backend-core -- --include-ignored --nocapture'
+            echo 'cargo test --locked -p cid-backend-daemon -- --nocapture'
+            echo 'cargo test --locked -p cid-backend-tests -- --nocapture'
             echo '```'
+            echo
+            echo "Process guest pin: \`${CID_DISPATCHER_REV}\`"
             echo
             for label in core daemon tests; do
               f="${label}-test.log"
@@ -73,8 +106,12 @@ jobs:
                 echo '```'
               fi
             done
-            if [ -f core-test.log ] && grep -F 'skip: cid_process_example missing' core-test.log >/dev/null; then
+            if [ -f core-test.log ] && grep -F 'real SSRI guest executed:' core-test.log >/dev/null; then
               echo
-              echo '**Skipped (not executed):** `real_example_binary_batch_bounds_if_present` — `cid_process_example` fixture absent. Do not treat this as a real-SSRI pass.'
+              echo '**Real SSRI guest:** executed (ckb-vm `Process.batch` / `Process.assemble`).'
+              grep -F 'real SSRI guest executed:' core-test.log | sed 's/^/- /'
+            elif [ -f core-test.log ]; then
+              echo
+              echo '**Real SSRI guest:** NOT executed (missing execution banner).'
             fi
           } | tee -a "$GITHUB_STEP_SUMMARY"

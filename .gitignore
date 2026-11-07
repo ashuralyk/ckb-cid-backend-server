@@ -1,2 +1,4 @@
 /target
 **/*.rs.bk
+tests/fixtures/cid_process_example
+.cid-dispatcher-src/
