@@ -1,8 +1,10 @@
 //! Live CKB node + indexer JSON-RPC adapter (`Rpc`).
 //!
-//! HTTP only. No disk state: every scan is a fresh `get_cells`. Process cells
-//! are found by type-script prefix (`CID_PROCESS_CODE_HASH`) then filtered to
-//! `calc_script_hash == process_type_hash` from CID args.
+//! HTTP only. No disk state: every scan is a fresh `get_cells` paged until the
+//! indexer is exhausted. A truncated page window is never treated as a complete
+//! live-set. Process cells are found by type-script prefix
+//! (`CID_PROCESS_CODE_HASH`) then filtered to `calc_script_hash ==
+//! process_type_hash` from CID args.
 
 use crate::config::DaemonConfig;
 use cid_backend_core::rpc::{script_hash32, LiveCell, Rpc, RpcError, TxStatus};
@@ -12,8 +14,10 @@ use ckb_types::prelude::*;
 use serde_json::{json, Value};
 use std::time::Duration;
 
-const PAGE: &str = "0x64";
-const MAX_PAGES: usize = 64;
+/// Indexer `limit` per `get_cells` call. Pagination continues until a short
+/// page (or empty objects). There is no page cap that drops the remainder.
+const PAGE_LIMIT: usize = 100;
+const PAGE_LIMIT_HEX: &str = "0x64";
 
 const HASH_TYPES: [ScriptHashType; 4] = [
     ScriptHashType::Type,
@@ -95,11 +99,11 @@ impl CkbRpc {
     fn get_cells(&self, search_key: &Value) -> Result<Vec<LiveCell>, RpcError> {
         let mut after = Value::Null;
         let mut out = Vec::new();
-        for _ in 0..MAX_PAGES {
+        loop {
             let result = self.rpc_call(
                 &self.indexer_url,
                 "get_cells",
-                json!([search_key, "asc", PAGE, after]),
+                json!([search_key, "asc", PAGE_LIMIT_HEX, after.clone()]),
             )?;
             let objects = result
                 .get("objects")
@@ -108,14 +112,25 @@ impl CkbRpc {
             for obj in objects {
                 out.push(live_cell_from_indexer(obj)?);
             }
+            if objects.len() < PAGE_LIMIT {
+                break;
+            }
             let cursor = result
                 .get("last_cursor")
                 .and_then(|c| c.as_str())
                 .unwrap_or("");
-            if objects.len() < 100 || cursor.is_empty() {
-                break;
+            if cursor_is_empty(cursor) {
+                return Err(RpcError::Unavailable(format!(
+                    "get_cells: full page of {PAGE_LIMIT} without last_cursor; refusing truncated live-set"
+                )));
             }
-            after = Value::String(cursor.to_string());
+            let next = Value::String(cursor.to_string());
+            if next == after {
+                return Err(RpcError::Unavailable(
+                    "get_cells: last_cursor did not advance; refusing truncated live-set".into(),
+                ));
+            }
+            after = next;
         }
         Ok(out)
     }
@@ -424,6 +439,14 @@ fn script_json(s: &Script) -> Value {
         "hash_type": hash_type_str(ht),
         "args": hex_bytes(&args),
     })
+}
+
+fn cursor_is_empty(cursor: &str) -> bool {
+    let t = cursor
+        .trim()
+        .trim_start_matches("0x")
+        .trim_start_matches("0X");
+    t.is_empty()
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
@@ -871,5 +894,223 @@ mod tests {
         let r2 = second.tick();
         assert_eq!(r2.submitted, 1, "restart resubmits; no persisted occupancy");
         assert_eq!(*submitted.lock().unwrap(), 2);
+    }
+
+    fn cursor_start(params: &Value) -> usize {
+        match params.get(3) {
+            None | Some(Value::Null) => 0,
+            Some(Value::String(s)) => {
+                let t = s.trim().trim_start_matches("0x").trim_start_matches("0X");
+                if t.is_empty() {
+                    0
+                } else {
+                    usize::from_str_radix(t, 16).unwrap_or(0)
+                }
+            }
+            _ => 0,
+        }
+    }
+
+    fn paged_objects(total: usize, start: usize, cell: impl Fn(u32) -> Value) -> Value {
+        let end = (start + PAGE_LIMIT).min(total);
+        let objects: Vec<Value> = (start..end).map(|i| cell(i as u32)).collect();
+        let last_cursor = if end < total || objects.len() == PAGE_LIMIT {
+            format!("0x{end:x}")
+        } else {
+            "0x".into()
+        };
+        json!({ "objects": objects, "last_cursor": last_cursor })
+    }
+
+    /// Full page with no usable cursor must not be reported as a complete scan.
+    #[test]
+    fn full_page_without_cursor_is_unavailable_not_silent_truncate() {
+        let url = spawn_mock(Arc::new(|method, _| {
+            assert_eq!(method, "get_cells");
+            let objects: Vec<Value> = (0..PAGE_LIMIT as u32)
+                .map(|i| indexer_cell(1, i, lock_json(CID_CODE, &[0x01]), None, 1, &[]))
+                .collect();
+            Ok(json!({ "objects": objects, "last_cursor": "0x" }))
+        }));
+        let rpc = CkbRpc::new(&url, &url);
+        let err = rpc
+            .list_live_intentions(&CID_CODE, ScriptHashType::Type)
+            .unwrap_err();
+        assert!(
+            matches!(err, RpcError::Unavailable(ref m) if m.contains("truncated")),
+            "{err:?}"
+        );
+    }
+
+    /// Old MAX_PAGES=64 dropped cells 6400+. Consecutive scans both return the
+    /// full live set (adapter has no sticky cursor; each call starts at Null).
+    #[test]
+    fn lists_more_than_6400_matching_cells_across_consecutive_scans() {
+        const TOTAL: usize = 6500;
+        let starts = Arc::new(Mutex::new(Vec::<Option<usize>>::new()));
+        let starts2 = starts.clone();
+        let url = spawn_mock(Arc::new(move |method, params| {
+            assert_eq!(method, "get_cells");
+            let start = cursor_start(&params);
+            starts2.lock().unwrap().push(params.get(3).and_then(|v| {
+                if v.is_null() {
+                    None
+                } else {
+                    Some(start)
+                }
+            }));
+            Ok(paged_objects(TOTAL, start, |i| {
+                indexer_cell(
+                    1,
+                    i,
+                    lock_json(CID_CODE, &[0x01]),
+                    None,
+                    100 + i as u64,
+                    &[],
+                )
+            }))
+        }));
+        let rpc = CkbRpc::new(&url, &url);
+        let first = rpc
+            .list_live_intentions(&CID_CODE, ScriptHashType::Type)
+            .expect("scan 1");
+        let second = rpc
+            .list_live_intentions(&CID_CODE, ScriptHashType::Type)
+            .expect("scan 2");
+        assert_eq!(first.len(), TOTAL, "first scan must not stop at 6400");
+        assert_eq!(second.len(), TOTAL, "second scan must also be complete");
+        assert_eq!(first.last().unwrap().capacity(), 100 + 6499);
+        let log = starts.lock().unwrap().clone();
+        let null_resets = log.iter().filter(|s| s.is_none()).count();
+        assert_eq!(null_resets, 2, "each scan starts after=Null, got {log:?}");
+        assert!(
+            log.len() >= 66 * 2,
+            "expected >=66 pages per scan (65 full + remainder), got {}",
+            log.len()
+        );
+    }
+
+    #[test]
+    fn finds_process_cell_on_page_65() {
+        let ts = process_type_script(7);
+        let hash = script_hash32(&ts);
+        let type_json = script_json(&ts);
+        const TARGET: u32 = 6400; // first cell of page 65 (0-based, PAGE=100)
+        const TOTAL: usize = 6401;
+        let url = spawn_mock(Arc::new(move |method, params| {
+            assert_eq!(method, "get_cells");
+            let code = params[0]["script"]["code_hash"].as_str().unwrap();
+            let ht = params[0]["script"]["hash_type"].as_str().unwrap();
+            if code == hex_bytes(&PROC_CODE) && ht == "type" {
+                let start = cursor_start(&params);
+                Ok(paged_objects(TOTAL, start, |i| {
+                    let ty = if i == TARGET {
+                        type_json.clone()
+                    } else {
+                        json_script(&PROC_CODE, ScriptHashType::Type, &i.to_be_bytes())
+                    };
+                    indexer_cell(
+                        0x50,
+                        i,
+                        lock_json([0; 32], &[]),
+                        Some(ty),
+                        200,
+                        &[0x7f, b'E', b'L', b'F'],
+                    )
+                }))
+            } else {
+                Ok(cells_result(vec![]))
+            }
+        }));
+        let rpc = CkbRpc::with_process_code_hashes(&url, &url, vec![PROC_CODE]);
+        let cell = rpc
+            .get_live_process_by_type_hash(&hash)
+            .expect("rpc")
+            .expect("process on page 65 must be found");
+        let idx: u32 = cell.out_point.index().unpack();
+        assert_eq!(idx, TARGET);
+        assert_eq!(script_hash32(&cell.type_script().unwrap()), hash);
+    }
+
+    /// Sticky unprocessable CID cells occupy the old 6400 window. The valid
+    /// Intention after that window must still be scanned and submitted, and
+    /// must remain visible on the next tick (not permanently starved).
+    #[test]
+    fn intention_beyond_6400_not_starved_by_sticky_unprocessable() {
+        let ts = process_type_script(1);
+        let hash = script_hash32(&ts);
+        let type_json = script_json(&ts);
+        let args = cid_args(hash);
+        let proc = indexer_cell(
+            0x50,
+            0,
+            lock_json([0; 32], &[]),
+            Some(type_json),
+            200_0000_0000,
+            &[0x7f, b'E', b'L', b'F', 1],
+        );
+        const STICKY: usize = 6400;
+        let submitted = Arc::new(Mutex::new(0usize));
+        let submitted2 = submitted.clone();
+        let url = spawn_mock(Arc::new(move |method, params| match method {
+            "get_cells" => {
+                let script_type = params[0]["script_type"].as_str().unwrap_or("");
+                if script_type == "lock" {
+                    let start = cursor_start(&params);
+                    Ok(paged_objects(STICKY + 1, start, |i| {
+                        if i as usize == STICKY {
+                            indexer_cell(2, i, lock_json(CID_CODE, &args), None, 100_0000_0000, &[])
+                        } else {
+                            indexer_cell(
+                                1,
+                                i,
+                                lock_json(CID_CODE, &[0xFF]),
+                                None,
+                                100_0000_0000,
+                                &[],
+                            )
+                        }
+                    }))
+                } else {
+                    Ok(cells_result(vec![proc.clone()]))
+                }
+            }
+            "send_transaction" => {
+                *submitted2.lock().unwrap() += 1;
+                Ok(Value::String(hex_bytes(&[0xab; 32])))
+            }
+            "get_transaction" => Ok(json!({"tx_status": {"status": "pending"}})),
+            other => Err((-1, format!("unexpected {other}"))),
+        }));
+        let cfg = LoopConfig {
+            cid_code_hash: CID_CODE,
+            hash_type: ScriptHashType::Type,
+            poll_interval: Duration::from_secs(1),
+            extra_cell_deps: vec![],
+        };
+        let mut loop_ = DigestLoop::new(
+            CkbRpc::with_process_code_hashes(&url, &url, vec![PROC_CODE]),
+            NopClock,
+            StubSsri,
+            cfg,
+            ProcessResolver::new(),
+        );
+        let r1 = loop_.tick();
+        assert_eq!(
+            r1.scanned, 1,
+            "decoded live-set must include the Intention past the old 6400 window"
+        );
+        assert_eq!(r1.submitted, 1, "valid Intention must not be starved");
+        assert_eq!(*submitted.lock().unwrap(), 1);
+
+        let r2 = loop_.tick();
+        assert_eq!(
+            r2.scanned, 1,
+            "consecutive tick still sees the Intention (complete rescan, not a stuck 6400 window)"
+        );
+        assert_eq!(
+            r2.submitted, 0,
+            "pending occupancy holds; sticky cells must not hide it from scan"
+        );
     }
 }
