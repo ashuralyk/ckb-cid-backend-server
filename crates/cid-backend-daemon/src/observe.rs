@@ -7,16 +7,19 @@ use cid_backend_core::digest_loop::TickReport;
 use serde::Serialize;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Health is GET-only. Any declared request body is rejected without draining
 /// it (tiny_http 0.12 would block forever in `EqualReader::drop`).
 const MAX_BODY_BYTES: usize = 0;
 const MAX_HEADER_BYTES: usize = 8 * 1024;
+/// Absolute deadline for reading the request head (not a per-read window).
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
+/// Opt-in liveness port: a few dozen workers is enough for probes + scrape.
+const MAX_HEALTH_WORKERS: usize = 32;
 
 #[derive(Debug)]
 pub struct DaemonStats {
@@ -144,16 +147,23 @@ fn now_ms() -> u64 {
 
 pub struct HealthHandle {
     pub local_addr: SocketAddr,
+    #[cfg(test)]
+    live_workers: Arc<AtomicUsize>,
 }
 
 /// Start `/healthz`, `/readyz`, `/stats`, `/metrics` on `bind`.
 ///
-/// Accept runs on `cid-health`; each connection is a timeout-bounded worker so
-/// one slow/incomplete body cannot occupy the listener. Bodies over
+/// Accept runs on `cid-health`; each connection is a worker with an absolute
+/// 2s request-head deadline so a slow drip of bytes cannot occupy it forever.
+/// At most `MAX_HEALTH_WORKERS` workers run at once; further sockets are
+/// refused on the accept thread (503) and shut down. Bodies over
 /// `MAX_BODY_BYTES` are rejected and the socket is shut down without draining.
 pub fn spawn_health(bind: SocketAddr, stats: Arc<DaemonStats>) -> io::Result<HealthHandle> {
     let listener = TcpListener::bind(bind)?;
     let local_addr = listener.local_addr()?;
+    let workers = Arc::new(AtomicUsize::new(0));
+    #[cfg(test)]
+    let live_workers = workers.clone();
     thread::Builder::new()
         .name("cid-health".into())
         .spawn(move || {
@@ -161,18 +171,58 @@ pub fn spawn_health(bind: SocketAddr, stats: Arc<DaemonStats>) -> io::Result<Hea
                 let Ok(stream) = incoming else {
                     continue;
                 };
+                let prev = workers.fetch_add(1, Ordering::AcqRel);
+                if prev >= MAX_HEALTH_WORKERS {
+                    workers.fetch_sub(1, Ordering::AcqRel);
+                    refuse_busy(stream);
+                    continue;
+                }
                 let stats = stats.clone();
-                let _ = thread::Builder::new()
+                let worker_slot = workers.clone();
+                match thread::Builder::new()
                     .name("cid-health-conn".into())
-                    .spawn(move || handle_stream(stream, &stats));
+                    .spawn(move || {
+                        let _guard = WorkerGuard(worker_slot);
+                        handle_stream(stream, &stats);
+                    }) {
+                    Ok(_) => {}
+                    Err(_) => {
+                        // Closure (and stream) dropped without running WorkerGuard.
+                        workers.fetch_sub(1, Ordering::AcqRel);
+                    }
+                }
             }
         })?;
-    Ok(HealthHandle { local_addr })
+    Ok(HealthHandle {
+        local_addr,
+        #[cfg(test)]
+        live_workers,
+    })
+}
+
+struct WorkerGuard(Arc<AtomicUsize>);
+
+impl Drop for WorkerGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn refuse_busy(mut stream: TcpStream) {
+    let _ = stream.set_nodelay(true);
+    let _ = stream.set_nonblocking(true);
+    write_http(
+        &mut stream,
+        503,
+        "Service Unavailable",
+        "text/plain; charset=utf-8",
+        b"busy\n",
+    );
+    close_stream(stream);
 }
 
 fn handle_stream(mut stream: TcpStream, stats: &DaemonStats) {
     let _ = stream.set_nodelay(true);
-    let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
     let parsed = match read_request_head(&mut stream) {
         Ok(p) => p,
@@ -256,9 +306,16 @@ enum HeadError {
 }
 
 fn read_request_head(stream: &mut TcpStream) -> Result<RequestHead, HeadError> {
+    let deadline = Instant::now() + IO_TIMEOUT;
     let mut buf = Vec::new();
     let mut tmp = [0u8; 512];
     loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        // SO_RCVTIMEO of zero means "wait forever" on some platforms.
+        if remaining.is_zero() {
+            return Err(HeadError::Timeout);
+        }
+        let _ = stream.set_read_timeout(Some(remaining));
         match stream.read(&mut tmp) {
             Ok(0) => return Err(HeadError::Closed),
             Ok(n) => {
@@ -345,7 +402,7 @@ mod tests {
     use cid_process_executor::{IntentionInput, PartialTx};
     use ckb_types::core::{ScriptHashType, TransactionView};
     use ckb_types::packed::Byte32;
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::net::TcpStream;
     use std::time::{Duration, Instant};
 
@@ -430,6 +487,124 @@ mod tests {
             "second /healthz stalled for {elapsed:?} behind an incomplete body"
         );
         drop(slow);
+    }
+
+    /// A client that drips header bytes slower than the *total* 2s deadline
+    /// (but faster than a naive per-read 2s timeout) must be closed with 408
+    /// without pinning a second `/healthz`.
+    #[test]
+    fn drip_feed_headers_past_deadline_does_not_stall_healthz() {
+        let stats = Arc::new(DaemonStats::new());
+        let h = spawn_health("127.0.0.1:0".parse().unwrap(), stats).expect("bind");
+        let mut slow = TcpStream::connect(h.local_addr).expect("slow connect");
+        let _ = slow.set_nodelay(true);
+        slow.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        slow.set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("write timeout");
+        let mut writer = slow.try_clone().expect("clone");
+        let started = Instant::now();
+        let drip = thread::spawn(move || {
+            // Interval is well under IO_TIMEOUT so a per-read reset would not
+            // fire; the absolute deadline must.
+            for &b in b"GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Slow: " {
+                if writer.write_all(&[b]).is_err() {
+                    return;
+                }
+                let _ = writer.flush();
+                thread::sleep(Duration::from_millis(400));
+            }
+        });
+
+        thread::sleep(Duration::from_millis(50));
+        let probe_start = Instant::now();
+        let (code, body) = get(&format!("http://{}/healthz", h.local_addr));
+        let probe_elapsed = probe_start.elapsed();
+        assert_eq!(code, 200, "second /healthz: {body}");
+        assert_eq!(body, "ok\n");
+        assert!(
+            probe_elapsed < Duration::from_millis(800),
+            "second /healthz stalled for {probe_elapsed:?} behind a drip-feed client"
+        );
+
+        let mut resp = Vec::new();
+        let read_res = slow.read_to_end(&mut resp);
+        let elapsed = started.elapsed();
+        let _ = drip.join();
+        let text = String::from_utf8_lossy(&resp);
+        assert!(
+            read_res.is_ok() && text.contains("408"),
+            "slow client should get 408 after the total deadline, got {read_res:?} {text:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(3500),
+            "worker hung for {elapsed:?} under drip-feed headers (absolute deadline is 2s)"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(500),
+            "408 arrived too fast ({elapsed:?}); drip should occupy the remaining-time budget"
+        );
+    }
+
+    #[test]
+    fn health_worker_cap_refuses_extra_connections() {
+        let stats = Arc::new(DaemonStats::new());
+        let h = spawn_health("127.0.0.1:0".parse().unwrap(), stats).expect("bind");
+        let mut held = Vec::with_capacity(MAX_HEALTH_WORKERS);
+        for i in 0..MAX_HEALTH_WORKERS {
+            let s = TcpStream::connect(h.local_addr).unwrap_or_else(|e| panic!("hold {i}: {e}"));
+            let _ = s.set_nodelay(true);
+            held.push(s);
+        }
+        let wait_cap = Instant::now() + Duration::from_secs(1);
+        while h.live_workers.load(Ordering::Acquire) < MAX_HEALTH_WORKERS {
+            assert!(
+                Instant::now() < wait_cap,
+                "workers did not reach cap ({}/{})",
+                h.live_workers.load(Ordering::Acquire),
+                MAX_HEALTH_WORKERS
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let mut extra = TcpStream::connect(h.local_addr).expect("extra connect");
+        let _ = extra.set_nodelay(true);
+        extra
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("extra read timeout");
+        extra
+            .set_write_timeout(Some(Duration::from_millis(500)))
+            .expect("extra write timeout");
+        let start = Instant::now();
+        let _ = extra.write_all(b"GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+        let _ = extra.flush();
+        let mut buf = [0u8; 256];
+        let n = extra
+            .read(&mut buf)
+            .expect("extra should be refused, not hang");
+        let elapsed = start.elapsed();
+        let text = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            text.contains("503"),
+            "over-cap connection should get 503, got {text:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "over-cap refuse stalled for {elapsed:?}"
+        );
+
+        drop(held);
+        let drain = Instant::now() + Duration::from_secs(1);
+        while h.live_workers.load(Ordering::Acquire) != 0 {
+            assert!(
+                Instant::now() < drain,
+                "workers did not drain after clients closed ({})",
+                h.live_workers.load(Ordering::Acquire)
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let (code, body) = get(&format!("http://{}/healthz", h.local_addr));
+        assert_eq!(code, 200, "healthz after cap drain: {body}");
     }
 
     #[test]
