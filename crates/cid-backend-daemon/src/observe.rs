@@ -655,6 +655,9 @@ mod tests {
         fn get_transaction_status(&self, _: &Byte32) -> Result<TxStatus, RpcError> {
             Ok(TxStatus::Dropped)
         }
+        fn tip_block_number(&self) -> Result<u64, RpcError> {
+            Ok(0)
+        }
     }
 
     struct DownRpc;
@@ -678,6 +681,9 @@ mod tests {
         fn get_transaction_status(&self, _: &Byte32) -> Result<TxStatus, RpcError> {
             Err(RpcError::Unavailable("down".into()))
         }
+        fn tip_block_number(&self) -> Result<u64, RpcError> {
+            Err(RpcError::Unavailable("down".into()))
+        }
     }
 
     struct NoopSsri;
@@ -696,6 +702,7 @@ mod tests {
             hash_type: ScriptHashType::Type,
             poll_interval: Duration::from_secs(1),
             extra_cell_deps: vec![],
+            confirmation_depth: 1,
         }
     }
 

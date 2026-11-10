@@ -47,6 +47,7 @@ Success prints `local-chain execution tx committed:` and `local-chain closure ok
 | `CID_PROCESS_CODE_HASH` | local-chain | Process ELF **data hash** used as indexer type-script prefix (CID args store `calc_script_hash`, not code hash) |
 | `CID_EXTRA_CELL_DEPS` | no | Extra `tx_hash:index` list |
 | `CID_HEALTH_BIND` | no | Opt-in health/stats HTTP (`docs/observability.md`) |
+| `CID_CONFIRMATION_DEPTH` | no | Blocks before a committed execution tx is settled (default 24; see `docs/confirmation.md`) |
 | `CID_LOG_FORMAT` / `RUST_LOG` | no | Structured logs (`docs/observability.md`) |
 
 State is memory-only. Restarting the daemon drops in-flight occupancy and full-rescans indexer `asc`.

@@ -1,4 +1,4 @@
-use cid_backend_core::digest_loop::LoopConfig;
+use cid_backend_core::digest_loop::{LoopConfig, DEFAULT_CONFIRMATION_DEPTH};
 use ckb_types::core::{DepType, ScriptHashType};
 use ckb_types::packed::{Byte32, CellDep, OutPoint};
 use ckb_types::prelude::*;
@@ -21,6 +21,8 @@ pub struct DaemonConfig {
     pub process_type_code_hashes: Vec<[u8; 32]>,
     /// Optional health/stats bind. Unset/empty disables the listener.
     pub health_bind: Option<SocketAddr>,
+    /// Confirmation depth for submitted execution txs. Default 24.
+    pub confirmation_depth: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +84,21 @@ impl DaemonConfig {
                 ConfigError::Invalid(format!("CID_HEALTH_BIND={s} (want host:port)"))
             })?),
         };
+        let confirmation_depth =
+            match get("CID_CONFIRMATION_DEPTH").filter(|s| !s.trim().is_empty()) {
+                None => DEFAULT_CONFIRMATION_DEPTH,
+                Some(s) => {
+                    let n: u64 = s.parse().map_err(|_| {
+                        ConfigError::Invalid("CID_CONFIRMATION_DEPTH not u64".into())
+                    })?;
+                    if n == 0 {
+                        return Err(ConfigError::Invalid(
+                            "CID_CONFIRMATION_DEPTH must be >= 1".into(),
+                        ));
+                    }
+                    n
+                }
+            };
         Ok(Self {
             node_url,
             indexer_url,
@@ -91,6 +108,7 @@ impl DaemonConfig {
             extra_cell_deps,
             process_type_code_hashes,
             health_bind,
+            confirmation_depth,
         })
     }
 
@@ -100,6 +118,7 @@ impl DaemonConfig {
             hash_type: self.hash_type,
             poll_interval: self.poll_interval,
             extra_cell_deps: self.extra_cell_deps.clone(),
+            confirmation_depth: self.confirmation_depth,
         }
     }
 }
@@ -199,6 +218,7 @@ mod tests {
         assert!(cfg.extra_cell_deps.is_empty());
         assert!(cfg.process_type_code_hashes.is_empty());
         assert!(cfg.health_bind.is_none());
+        assert_eq!(cfg.confirmation_depth, DEFAULT_CONFIRMATION_DEPTH);
     }
 
     #[test]
@@ -265,6 +285,33 @@ mod tests {
     fn missing_required_fails() {
         let err = DaemonConfig::from_vars(|_| None).unwrap_err();
         assert!(matches!(err, ConfigError::Missing(_)));
+    }
+
+    #[test]
+    fn from_vars_parses_confirmation_depth() {
+        let cfg = DaemonConfig::from_vars(|k| match k {
+            "CID_CKB_RPC_URL" => Some("http://n".into()),
+            "CID_LOCK_CODE_HASH" => Some("00".repeat(32)),
+            "CID_POLL_INTERVAL_SECS" => Some("1".into()),
+            "CID_CONFIRMATION_DEPTH" => Some("8".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(cfg.confirmation_depth, 8);
+        assert_eq!(cfg.to_loop_config().confirmation_depth, 8);
+    }
+
+    #[test]
+    fn zero_confirmation_depth_invalid() {
+        let err = DaemonConfig::from_vars(|k| match k {
+            "CID_CKB_RPC_URL" => Some("http://n".into()),
+            "CID_LOCK_CODE_HASH" => Some("00".repeat(32)),
+            "CID_POLL_INTERVAL_SECS" => Some("1".into()),
+            "CID_CONFIRMATION_DEPTH" => Some("0".into()),
+            _ => None,
+        })
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid(_)));
     }
 
     #[test]

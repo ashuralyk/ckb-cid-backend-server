@@ -2,15 +2,15 @@
 mod tests {
     use std::time::Duration;
 
-    use ckb_types::core::ScriptHashType;
-    use ckb_types::prelude::*;
     use cid_backend_core::digest_loop::{DigestLoop, LoopConfig, NopClock};
     use cid_backend_core::process::ProcessResolver;
     use cid_backend_core::rpc::{out_point_key, script_hash32};
+    use ckb_types::core::ScriptHashType;
+    use ckb_types::prelude::*;
 
+    use crate::fake_rpc::FakeRpc;
     use crate::helpers::{intention_cell, process_cell, process_type_script, CID_CODE};
     use crate::scripted_ssri::ScriptedSsri;
-    use crate::fake_rpc::FakeRpc;
 
     #[test]
     fn tick_n1_digest_ok_shape_accepted_by_fakerpc() {
@@ -31,6 +31,7 @@ mod tests {
                 hash_type: ScriptHashType::Type,
                 poll_interval: Duration::from_secs(1),
                 extra_cell_deps: vec![],
+                confirmation_depth: 1,
             },
             ProcessResolver::new(),
         );
@@ -80,7 +81,11 @@ mod tests {
         let hash = script_hash32(&ts);
         let intent = intention_cell(1, hash, 100_0000_0000);
         rpc.insert_cell(intent.clone());
-        rpc.insert_cell(process_cell(1, 200_0000_0000, vec![0x7f, b'E', b'L', b'F', 1]));
+        rpc.insert_cell(process_cell(
+            1,
+            200_0000_0000,
+            vec![0x7f, b'E', b'L', b'F', 1],
+        ));
 
         let mut loop_ = DigestLoop::new(
             rpc,
@@ -91,6 +96,7 @@ mod tests {
                 hash_type: ScriptHashType::Type,
                 poll_interval: Duration::from_secs(1),
                 extra_cell_deps: vec![],
+                confirmation_depth: 1,
             },
             ProcessResolver::new(),
         );
