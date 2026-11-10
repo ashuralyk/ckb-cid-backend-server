@@ -5,13 +5,18 @@
 
 use cid_backend_core::digest_loop::TickReport;
 use serde::Serialize;
-use std::io;
-use std::net::SocketAddr;
+use std::io::{self, Read, Write};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
-use tiny_http::{Header, Method, Response, Server, StatusCode};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Health is GET-only. Any declared request body is rejected without draining
+/// it (tiny_http 0.12 would block forever in `EqualReader::drop`).
+const MAX_BODY_BYTES: usize = 0;
+const MAX_HEADER_BYTES: usize = 8 * 1024;
+const IO_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug)]
 pub struct DaemonStats {
@@ -141,56 +146,193 @@ pub struct HealthHandle {
     pub local_addr: SocketAddr,
 }
 
-/// Start `/healthz`, `/readyz`, `/stats`, `/metrics` on `bind`. The caller
-/// keeps `HealthHandle`; the server thread owns the listener until process exit.
+/// Start `/healthz`, `/readyz`, `/stats`, `/metrics` on `bind`.
+///
+/// Accept runs on `cid-health`; each connection is a timeout-bounded worker so
+/// one slow/incomplete body cannot occupy the listener. Bodies over
+/// `MAX_BODY_BYTES` are rejected and the socket is shut down without draining.
 pub fn spawn_health(bind: SocketAddr, stats: Arc<DaemonStats>) -> io::Result<HealthHandle> {
-    let server = Server::http(bind).map_err(|e| io::Error::other(e.to_string()))?;
-    let local_addr = match server.server_addr().to_ip() {
-        Some(a) => a,
-        None => {
-            return Err(io::Error::new(
-                io::ErrorKind::AddrNotAvailable,
-                "health bind is not an IP socket",
-            ));
-        }
-    };
+    let listener = TcpListener::bind(bind)?;
+    let local_addr = listener.local_addr()?;
     thread::Builder::new()
         .name("cid-health".into())
         .spawn(move || {
-            for req in server.incoming_requests() {
-                handle_request(req, &stats);
+            for incoming in listener.incoming() {
+                let Ok(stream) = incoming else {
+                    continue;
+                };
+                let stats = stats.clone();
+                let _ = thread::Builder::new()
+                    .name("cid-health-conn".into())
+                    .spawn(move || handle_stream(stream, &stats));
             }
         })?;
     Ok(HealthHandle { local_addr })
 }
 
-fn handle_request(req: tiny_http::Request, stats: &DaemonStats) {
-    let path = req.url().split('?').next().unwrap_or("/");
-    let (status, ctype, body) = match (req.method(), path) {
-        (Method::Get, "/healthz") => (200, "text/plain; charset=utf-8", "ok\n".into()),
-        (Method::Get, "/readyz") => {
+fn handle_stream(mut stream: TcpStream, stats: &DaemonStats) {
+    let _ = stream.set_nodelay(true);
+    let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+    let parsed = match read_request_head(&mut stream) {
+        Ok(p) => p,
+        Err(HeadError::Timeout) => {
+            write_http(
+                &mut stream,
+                408,
+                "Request Timeout",
+                "text/plain; charset=utf-8",
+                b"timeout\n",
+            );
+            close_stream(stream);
+            return;
+        }
+        Err(_) => {
+            close_stream(stream);
+            return;
+        }
+    };
+    if parsed.body_len > MAX_BODY_BYTES || parsed.chunked {
+        // Do not read the declared body. Shutdown so a client that never
+        // sends it cannot pin this worker.
+        write_http(
+            &mut stream,
+            413,
+            "Payload Too Large",
+            "text/plain; charset=utf-8",
+            b"body not allowed\n",
+        );
+        close_stream(stream);
+        return;
+    }
+    let path = parsed.path.split('?').next().unwrap_or("/");
+    let (status, reason, ctype, body) = match (parsed.method.as_str(), path) {
+        ("GET", "/healthz") => (200, "OK", "text/plain; charset=utf-8", b"ok\n".to_vec()),
+        ("GET", "/readyz") => {
             if stats.is_ready() {
-                (200, "text/plain; charset=utf-8", "ready\n".into())
+                (200, "OK", "text/plain; charset=utf-8", b"ready\n".to_vec())
             } else {
-                (503, "text/plain; charset=utf-8", "not ready\n".into())
+                (
+                    503,
+                    "Service Unavailable",
+                    "text/plain; charset=utf-8",
+                    b"not ready\n".to_vec(),
+                )
             }
         }
-        (Method::Get, "/stats") => {
+        ("GET", "/stats") => {
             let json = serde_json::to_string(&stats.snapshot()).unwrap_or_else(|_| "{}".into());
-            (200, "application/json", json)
+            (200, "OK", "application/json", json.into_bytes())
         }
-        (Method::Get, "/metrics") => (
+        ("GET", "/metrics") => (
             200,
+            "OK",
             "text/plain; version=0.0.4; charset=utf-8",
-            stats.prometheus(),
+            stats.prometheus().into_bytes(),
         ),
-        _ => (404, "text/plain; charset=utf-8", "not found\n".into()),
+        _ => (
+            404,
+            "Not Found",
+            "text/plain; charset=utf-8",
+            b"not found\n".to_vec(),
+        ),
     };
-    let mut response = Response::from_string(body).with_status_code(StatusCode(status));
-    if let Ok(h) = Header::from_bytes(&b"Content-Type"[..], ctype.as_bytes()) {
-        response = response.with_header(h);
+    write_http(&mut stream, status, reason, ctype, &body);
+    close_stream(stream);
+}
+
+struct RequestHead {
+    method: String,
+    path: String,
+    body_len: usize,
+    chunked: bool,
+}
+
+enum HeadError {
+    Timeout,
+    Closed,
+    TooLarge,
+    Invalid,
+}
+
+fn read_request_head(stream: &mut TcpStream) -> Result<RequestHead, HeadError> {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 512];
+    loop {
+        match stream.read(&mut tmp) {
+            Ok(0) => return Err(HeadError::Closed),
+            Ok(n) => {
+                buf.extend_from_slice(&tmp[..n]);
+                if buf.len() > MAX_HEADER_BYTES {
+                    return Err(HeadError::TooLarge);
+                }
+                if let Some(pos) = find_headers_end(&buf) {
+                    return parse_head(&buf[..pos]);
+                }
+            }
+            Err(e)
+                if e.kind() == io::ErrorKind::TimedOut || e.kind() == io::ErrorKind::WouldBlock =>
+            {
+                return Err(HeadError::Timeout);
+            }
+            Err(_) => return Err(HeadError::Closed),
+        }
     }
-    let _ = req.respond(response);
+}
+
+fn find_headers_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+fn parse_head(head: &[u8]) -> Result<RequestHead, HeadError> {
+    let text = std::str::from_utf8(head).map_err(|_| HeadError::Invalid)?;
+    let mut lines = text.split("\r\n");
+    let req_line = lines.next().ok_or(HeadError::Invalid)?;
+    let mut parts = req_line.split_whitespace();
+    let method = parts.next().ok_or(HeadError::Invalid)?.to_string();
+    let path = parts.next().ok_or(HeadError::Invalid)?.to_string();
+    let mut body_len = 0usize;
+    let mut chunked = false;
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("Content-Length") {
+            body_len = value.parse().map_err(|_| HeadError::Invalid)?;
+        } else if name.eq_ignore_ascii_case("Transfer-Encoding") {
+            chunked = value
+                .to_ascii_lowercase()
+                .split(',')
+                .any(|t| t.trim() == "chunked");
+        }
+    }
+    Ok(RequestHead {
+        method,
+        path,
+        body_len,
+        chunked,
+    })
+}
+
+fn write_http(stream: &mut TcpStream, status: u16, reason: &str, ctype: &str, body: &[u8]) {
+    let header = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(header.as_bytes());
+    if !body.is_empty() {
+        let _ = stream.write_all(body);
+    }
+    let _ = stream.flush();
+}
+
+fn close_stream(stream: TcpStream) {
+    let _ = stream.shutdown(Shutdown::Both);
 }
 
 #[cfg(test)]
@@ -203,7 +345,9 @@ mod tests {
     use cid_process_executor::{IntentionInput, PartialTx};
     use ckb_types::core::{ScriptHashType, TransactionView};
     use ckb_types::packed::Byte32;
-    use std::time::Duration;
+    use std::io::Write;
+    use std::net::TcpStream;
+    use std::time::{Duration, Instant};
 
     fn get(url: &str) -> (u16, String) {
         let resp = ureq::get(url).call().map_err(|e| match e {
@@ -263,6 +407,29 @@ mod tests {
         assert!(body.contains("cid_backend_ticks_total 1"));
         assert!(body.contains("cid_backend_ready 1"));
         assert!(body.contains("cid_backend_pending_in_flight 2"));
+    }
+
+    /// A client that declares a body and never sends it must not pin `/healthz`.
+    #[test]
+    fn incomplete_request_body_does_not_stall_healthz() {
+        let stats = Arc::new(DaemonStats::new());
+        let h = spawn_health("127.0.0.1:0".parse().unwrap(), stats).expect("bind");
+        let mut slow = TcpStream::connect(h.local_addr).expect("slow connect");
+        let _ = slow.set_nodelay(true);
+        slow.write_all(b"GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2048\r\n\r\n")
+            .expect("slow headers");
+        let _ = slow.flush();
+
+        let start = Instant::now();
+        let (code, body) = get(&format!("http://{}/healthz", h.local_addr));
+        let elapsed = start.elapsed();
+        assert_eq!(code, 200, "second /healthz: {body}");
+        assert_eq!(body, "ok\n");
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "second /healthz stalled for {elapsed:?} behind an incomplete body"
+        );
+        drop(slow);
     }
 
     #[test]
