@@ -3,6 +3,7 @@ use ckb_types::core::{DepType, ScriptHashType};
 use ckb_types::packed::{Byte32, CellDep, OutPoint};
 use ckb_types::prelude::*;
 use std::fmt;
+use std::net::SocketAddr;
 use std::time::Duration;
 
 #[derive(Clone, Debug)]
@@ -18,6 +19,8 @@ pub struct DaemonConfig {
     /// `calc_script_hash` (the 32-byte value in CID args is a script hash, not
     /// a code hash). Local-chain sets this to the Process ELF data hash.
     pub process_type_code_hashes: Vec<[u8; 32]>,
+    /// Optional health/stats bind. Unset/empty disables the listener.
+    pub health_bind: Option<SocketAddr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +76,12 @@ impl DaemonConfig {
             get("CID_EXTRA_CELL_DEPS"),
         ])?;
         let process_type_code_hashes = parse_hash_list(get("CID_PROCESS_CODE_HASH"))?;
+        let health_bind = match get("CID_HEALTH_BIND").filter(|s| !s.trim().is_empty()) {
+            None => None,
+            Some(s) => Some(s.parse::<SocketAddr>().map_err(|_| {
+                ConfigError::Invalid(format!("CID_HEALTH_BIND={s} (want host:port)"))
+            })?),
+        };
         Ok(Self {
             node_url,
             indexer_url,
@@ -81,6 +90,7 @@ impl DaemonConfig {
             poll_interval: Duration::from_secs(secs),
             extra_cell_deps,
             process_type_code_hashes,
+            health_bind,
         })
     }
 
@@ -188,6 +198,33 @@ mod tests {
         assert_eq!(cfg.poll_interval, Duration::from_secs(5));
         assert!(cfg.extra_cell_deps.is_empty());
         assert!(cfg.process_type_code_hashes.is_empty());
+        assert!(cfg.health_bind.is_none());
+    }
+
+    #[test]
+    fn from_vars_parses_health_bind() {
+        let cfg = DaemonConfig::from_vars(|k| match k {
+            "CID_CKB_RPC_URL" => Some("http://127.0.0.1:8114".into()),
+            "CID_LOCK_CODE_HASH" => Some("11".repeat(32)),
+            "CID_POLL_INTERVAL_SECS" => Some("5".into()),
+            "CID_HEALTH_BIND" => Some("127.0.0.1:9100".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(cfg.health_bind.unwrap().to_string(), "127.0.0.1:9100");
+    }
+
+    #[test]
+    fn invalid_health_bind_fails() {
+        let err = DaemonConfig::from_vars(|k| match k {
+            "CID_CKB_RPC_URL" => Some("http://n".into()),
+            "CID_LOCK_CODE_HASH" => Some("00".repeat(32)),
+            "CID_POLL_INTERVAL_SECS" => Some("1".into()),
+            "CID_HEALTH_BIND" => Some("not-an-addr".into()),
+            _ => None,
+        })
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid(_)));
     }
 
     #[test]
