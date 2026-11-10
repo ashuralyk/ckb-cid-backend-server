@@ -8,6 +8,7 @@ This repository is independent of [`ckb-common-intention-dispatcher`](https://gi
 
 - Design: [`docs/superpowers/specs/2026-11-05-cid-backend-server-design.md`](docs/superpowers/specs/2026-11-05-cid-backend-server-design.md)
 - Implementation plan: [`docs/superpowers/plans/2026-11-05-cid-backend-server.md`](docs/superpowers/plans/2026-11-05-cid-backend-server.md)
+- Confirmation / reorg / retry: [`docs/confirmation.md`](docs/confirmation.md)
 
 v0 is the digest loop only. Optional health/metrics HTTP is opt-in (`CID_HEALTH_BIND`). No admin API or disk state. Restart = full rescan.
 
@@ -34,6 +35,7 @@ Upstream git pin: `d9ee77805f7ac930ab149648bed70f484a9886de` (`cid-process-execu
 | `CID_PROCESS_CODE_HASH` | local-chain | Process ELF data hash (indexer type-script prefix) |
 | `CID_EXTRA_CELL_DEPS` | no | extra `<tx_hash>:<index>` list |
 | `CID_HEALTH_BIND` | no | `host:port` for `/healthz` `/readyz` `/stats` `/metrics`; unset/empty disables |
+| `CID_CONFIRMATION_DEPTH` | no | blocks before a committed execution tx is settled (default `24`, min `1`) |
 | `CID_LOG_FORMAT` | no | `json` (default) or `pretty` |
 | `RUST_LOG` | no | tracing filter (default `info`) |
 
@@ -68,7 +70,7 @@ cargo test --locked -p cid-backend-daemon
 cargo test --locked -p cid-backend-tests
 ```
 
-Default `cargo test` does **not** start a CKB node. FakeRpc verticals: n=1 `digest_ok`, batch bounds, Incompatible refund, submit conflict retry. Daemon HTTP-mock tests cover adapter mapping, indexer lag, Pending/Dropped, and restart rescan. The ignored `local_chain_e2e` test is the only real local-chain evidence.
+Default `cargo test` does **not** start a CKB node. FakeRpc verticals: n=1 `digest_ok`, batch bounds, Incompatible refund, submit conflict retry, confirmation depth, reorg, Dropped/Unavailable retry, permanent `SubmitRejected`. Daemon HTTP-mock tests cover adapter mapping, indexer lag, Pending/Dropped, and restart rescan. The ignored `local_chain_e2e` test is the only real local-chain evidence.
 
 Default local `cargo test` **ignores** the real SSRI guest test (`real_example_binary_batch_bounds_and_assemble`) when `cid_process_example` is absent — that `ignored` count is **not** a real-SSRI pass.
 

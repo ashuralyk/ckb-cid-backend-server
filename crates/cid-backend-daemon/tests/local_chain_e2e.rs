@@ -189,7 +189,7 @@ fn wait_committed(rpc: &CkbRpc, hash: &Byte32, timeout: Duration) -> TxStatus {
     let start = Instant::now();
     loop {
         match rpc.get_transaction_status(hash) {
-            Ok(TxStatus::Committed) => return TxStatus::Committed,
+            Ok(st @ TxStatus::Committed { .. }) => return st,
             Ok(st) if start.elapsed() > timeout => return st,
             Ok(_) => thread::sleep(Duration::from_millis(400)),
             Err(_) if start.elapsed() > timeout => return TxStatus::Dropped,
@@ -203,9 +203,8 @@ fn submit_wait(rpc: &CkbRpc, tx: TransactionView) -> Byte32 {
         .submit_transaction(&tx)
         .unwrap_or_else(|e| panic!("submit {}: {e}", hex_bytes(tx.hash().as_slice())));
     let st = wait_committed(rpc, &hash, Duration::from_secs(60));
-    assert_eq!(
-        st,
-        TxStatus::Committed,
+    assert!(
+        matches!(st, TxStatus::Committed { .. }),
         "tx {} not committed ({st:?})",
         hex_bytes(hash.as_slice())
     );
@@ -457,6 +456,7 @@ fn scan_resolve_ssri_submit_confirms_on_local_dev_chain() {
         extra_cell_deps: vec![cell_dep(cid_op), cell_dep(proc_code_op), cell_dep(as_op)],
         process_type_code_hashes: vec![process_code_hash],
         health_bind: None,
+        confirmation_depth: 1,
     };
     let live_rpc = CkbRpc::from_config(&cfg);
     let mut loop_ = DigestLoop::new(
@@ -483,7 +483,7 @@ fn scan_resolve_ssri_submit_confirms_on_local_dev_chain() {
     }
     let hash = submitted_hash.expect("daemon did not submit an execution tx");
     let st = wait_committed(loop_.rpc(), &hash, Duration::from_secs(60));
-    assert_eq!(st, TxStatus::Committed);
+    assert!(matches!(st, TxStatus::Committed { .. }));
     eprintln!(
         "local-chain execution tx committed: {}",
         hex_bytes(hash.as_slice())

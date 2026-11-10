@@ -2,15 +2,13 @@
 mod tests {
     use std::time::Duration;
 
-    use ckb_types::core::ScriptHashType;
     use cid_backend_core::digest_loop::{DigestLoop, LoopConfig, NopClock};
     use cid_backend_core::process::ProcessResolver;
     use cid_backend_core::rpc::{out_point_key, script_hash32};
+    use ckb_types::core::ScriptHashType;
 
     use crate::fake_rpc::FakeRpc;
-    use crate::helpers::{
-        intention_cell, process_cell, process_type_script, CID_CODE,
-    };
+    use crate::helpers::{intention_cell, process_cell, process_type_script, CID_CODE};
     use crate::scripted_ssri::ScriptedSsri;
 
     #[test]
@@ -36,6 +34,7 @@ mod tests {
                 hash_type: ScriptHashType::Type,
                 poll_interval: Duration::from_secs(1),
                 extra_cell_deps: vec![],
+                confirmation_depth: 1,
             },
             ProcessResolver::new(),
         );

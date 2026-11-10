@@ -32,6 +32,7 @@ mod tests {
                 hash_type: ScriptHashType::Type,
                 poll_interval: Duration::from_secs(1),
                 extra_cell_deps: vec![],
+                confirmation_depth: 1,
             },
             ProcessResolver::new(),
         );
@@ -101,6 +102,7 @@ mod tests {
             hash_type: ScriptHashType::Type,
             poll_interval: Duration::from_secs(1),
             extra_cell_deps: vec![],
+            confirmation_depth: 1,
         }
     }
 

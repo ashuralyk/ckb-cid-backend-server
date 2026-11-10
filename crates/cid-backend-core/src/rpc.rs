@@ -27,7 +27,11 @@ impl LiveCell {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxStatus {
     Pending,
-    Committed,
+    /// Included in a block. `block_number` is that block's height; settlement
+    /// still waits for `LoopConfig::confirmation_depth`.
+    Committed {
+        block_number: u64,
+    },
     Dropped,
 }
 
@@ -73,4 +77,8 @@ pub trait Rpc {
     fn submit_transaction(&self, tx: &TransactionView) -> Result<Byte32, RpcError>;
 
     fn get_transaction_status(&self, tx_hash: &Byte32) -> Result<TxStatus, RpcError>;
+
+    /// Current chain tip height. Used for confirmation depth and tip-rewind
+    /// detection. Memory-only; a restart does not need the previous tip.
+    fn tip_block_number(&self) -> Result<u64, RpcError>;
 }

@@ -1,8 +1,7 @@
 use crate::rpc::{LiveCell, Rpc, RpcError};
 use std::collections::HashMap;
 
-pub type ProcessFallback =
-    Box<dyn Fn(&[u8; 32], &LiveCell) -> Option<Vec<u8>> + Send + Sync>;
+pub type ProcessFallback = Box<dyn Fn(&[u8; 32], &LiveCell) -> Option<Vec<u8>> + Send + Sync>;
 
 #[derive(Clone, Debug)]
 pub struct ResolvedProcess {
@@ -145,9 +144,12 @@ mod tests {
         fn get_transaction_status(&self, _tx_hash: &Byte32) -> Result<TxStatus, RpcError> {
             Err(RpcError::Unavailable("no".into()))
         }
+        fn tip_block_number(&self) -> Result<u64, RpcError> {
+            Ok(0)
+        }
     }
 
-    fn process_cell(data: Vec<u8>) -> ( [u8; 32], LiveCell ) {
+    fn process_cell(data: Vec<u8>) -> ([u8; 32], LiveCell) {
         let ts = Script::new_builder()
             .code_hash([0x51u8; 32].pack())
             .hash_type(ScriptHashType::Type.into())
@@ -277,7 +279,8 @@ mod tests {
         let rpc = TestRpc {
             cell: RefCell::new(Some(cell1.clone())),
         };
-        let mut resolver = ProcessResolver::with_fallback_binary(vec![0x7f, b'E', b'L', b'F', 0xFB]);
+        let mut resolver =
+            ProcessResolver::with_fallback_binary(vec![0x7f, b'E', b'L', b'F', 0xFB]);
         let first = resolver.resolve(&rpc, &hash).unwrap().unwrap();
         assert_eq!(first.binary, vec![0x7f, b'E', b'L', b'F', 0x01]);
 

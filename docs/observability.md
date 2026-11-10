@@ -25,7 +25,11 @@ Stable field `event` (target `cid_backend`):
 | `refund.path` | User-lock refund assemble (`path=user_lock`) |
 | `submit.ok` | `tx_hash` |
 | `submit.conflict` | Submit mapped as Conflict |
-| `pending.committed` / `pending.dropped` | Pending execution tx status |
+| `submit.rejected` | Permanent submit rejection (not retried this process) |
+| `pending.committed` | First sight of Committed (occupancy still held) |
+| `pending.settled` | Confirmation depth reached |
+| `pending.dropped` / `pending.reorg` | Pending/confirming tx gone |
+| `reorg.tip_rewind` | Tip height moved backwards |
 | `config.load_failed` | Illegal env / health bind failure (process exits) |
 
 ## Health HTTP
