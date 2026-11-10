@@ -213,12 +213,44 @@ impl Rpc for CkbRpc {
             .and_then(|s| s.as_str())
             .or_else(|| result.pointer("/status").and_then(|s| s.as_str()))
             .unwrap_or("unknown");
-        Ok(match status {
-            "pending" | "proposed" => TxStatus::Pending,
-            "committed" => TxStatus::Committed,
-            _ => TxStatus::Dropped,
-        })
+        match status {
+            "pending" | "proposed" => Ok(TxStatus::Pending),
+            "committed" => {
+                let block_number = committed_block_number(self, &result)?;
+                Ok(TxStatus::Committed { block_number })
+            }
+            _ => Ok(TxStatus::Dropped),
+        }
     }
+
+    fn tip_block_number(&self) -> Result<u64, RpcError> {
+        let result = self.rpc_call(&self.node_url, "get_tip_block_number", json!([]))?;
+        parse_uint(&result)
+    }
+}
+
+fn committed_block_number(rpc: &CkbRpc, tx: &Value) -> Result<u64, RpcError> {
+    if let Some(n) = tx.pointer("/tx_status/block_number") {
+        if let Ok(v) = parse_uint(n) {
+            return Ok(v);
+        }
+    }
+    let Some(hash) = tx.pointer("/tx_status/block_hash").and_then(|h| h.as_str()) else {
+        return Ok(0);
+    };
+    let bytes = match decode_hex(hash) {
+        Ok(b) if b.len() == 32 => b,
+        _ => return Ok(0),
+    };
+    let header = rpc.rpc_call(&rpc.node_url, "get_header", json!([hex_bytes(&bytes)]))?;
+    if header.is_null() {
+        return Ok(0);
+    }
+    header
+        .get("number")
+        .map(parse_uint)
+        .transpose()?
+        .ok_or_else(|| RpcError::Unavailable("get_header: missing number".into()))
 }
 
 fn map_rpc_error(method: &str, msg: &str) -> RpcError {
@@ -750,7 +782,7 @@ mod tests {
         );
         assert_eq!(
             rpc.get_transaction_status(&hash).unwrap(),
-            TxStatus::Committed
+            TxStatus::Committed { block_number: 0 }
         );
         assert_eq!(
             rpc.get_transaction_status(&hash).unwrap(),
@@ -764,6 +796,40 @@ mod tests {
             rpc.get_transaction_status(&hash).unwrap(),
             TxStatus::Dropped
         );
+    }
+
+    #[test]
+    fn committed_status_reads_block_number_and_header() {
+        let n = Arc::new(AtomicUsize::new(0));
+        let n2 = n.clone();
+        let url = spawn_mock(Arc::new(move |method, _| {
+            let i = n2.fetch_add(1, Ordering::SeqCst);
+            match (i, method) {
+                (0, "get_transaction") => Ok(json!({
+                    "tx_status": {"status": "committed", "block_number": "0xa"}
+                })),
+                (1, "get_transaction") => Ok(json!({
+                    "tx_status": {
+                        "status": "committed",
+                        "block_hash": format!("0x{}", "ab".repeat(32))
+                    }
+                })),
+                (2, "get_header") => Ok(json!({"number": "0x15"})),
+                (3, "get_tip_block_number") => Ok(json!("0x20")),
+                other => Err((-1, format!("unexpected {other:?}"))),
+            }
+        }));
+        let rpc = CkbRpc::new(&url, &url);
+        let hash = Byte32::from_slice(&[1u8; 32]).unwrap();
+        assert_eq!(
+            rpc.get_transaction_status(&hash).unwrap(),
+            TxStatus::Committed { block_number: 10 }
+        );
+        assert_eq!(
+            rpc.get_transaction_status(&hash).unwrap(),
+            TxStatus::Committed { block_number: 21 }
+        );
+        assert_eq!(rpc.tip_block_number().unwrap(), 32);
     }
 
     #[test]
@@ -854,6 +920,7 @@ mod tests {
                 Ok(Value::String(hex_bytes(&[n as u8; 32])))
             }
             "get_transaction" => Ok(json!({"tx_status":{"status":"pending"}})),
+            "get_tip_block_number" => Ok(json!("0x0")),
             other => Err((-1, format!("unexpected {other}"))),
         }));
 
@@ -865,6 +932,7 @@ mod tests {
             hash_type: ScriptHashType::Type,
             poll_interval: Duration::from_secs(1),
             extra_cell_deps: vec![],
+            confirmation_depth: 1,
         };
         let mut first = DigestLoop::new(
             CkbRpc::with_process_code_hashes(&url, &url, vec![PROC_CODE]),
@@ -888,6 +956,7 @@ mod tests {
                 hash_type: ScriptHashType::Type,
                 poll_interval: Duration::from_secs(1),
                 extra_cell_deps: vec![],
+                confirmation_depth: 1,
             },
             ProcessResolver::new(),
         );
@@ -1080,6 +1149,7 @@ mod tests {
                 Ok(Value::String(hex_bytes(&[0xab; 32])))
             }
             "get_transaction" => Ok(json!({"tx_status": {"status": "pending"}})),
+            "get_tip_block_number" => Ok(json!("0x0")),
             other => Err((-1, format!("unexpected {other}"))),
         }));
         let cfg = LoopConfig {
@@ -1087,6 +1157,7 @@ mod tests {
             hash_type: ScriptHashType::Type,
             poll_interval: Duration::from_secs(1),
             extra_cell_deps: vec![],
+            confirmation_depth: 1,
         };
         let mut loop_ = DigestLoop::new(
             CkbRpc::with_process_code_hashes(&url, &url, vec![PROC_CODE]),

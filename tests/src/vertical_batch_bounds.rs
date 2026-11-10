@@ -2,23 +2,25 @@
 mod tests {
     use std::time::Duration;
 
-    use ckb_types::core::ScriptHashType;
-    use ckb_types::prelude::*;
     use cid_backend_core::digest_loop::{DigestLoop, LoopConfig, NopClock};
     use cid_backend_core::process::ProcessResolver;
     use cid_backend_core::rpc::script_hash32;
+    use ckb_types::core::ScriptHashType;
+    use ckb_types::prelude::*;
 
     use crate::fake_rpc::FakeRpc;
-    use crate::helpers::{
-        intention_cell, process_cell, process_type_script, CID_CODE,
-    };
+    use crate::helpers::{intention_cell, process_cell, process_type_script, CID_CODE};
     use crate::scripted_ssri::ScriptedSsri;
 
     fn setup(n_intentions: u8) -> (FakeRpc, [u8; 32]) {
         let rpc = FakeRpc::new();
         let ts = process_type_script(2);
         let hash = script_hash32(&ts);
-        rpc.insert_cell(process_cell(2, 400_0000_0000, vec![0x7f, b'E', b'L', b'F', 2]));
+        rpc.insert_cell(process_cell(
+            2,
+            400_0000_0000,
+            vec![0x7f, b'E', b'L', b'F', 2],
+        ));
         for i in 1..=n_intentions {
             rpc.insert_cell(intention_cell(i, hash, 100_0000_0000));
         }
@@ -31,6 +33,7 @@ mod tests {
             hash_type: ScriptHashType::Type,
             poll_interval: Duration::from_secs(1),
             extra_cell_deps: vec![],
+            confirmation_depth: 1,
         }
     }
 
@@ -125,7 +128,11 @@ mod tests {
         assert_eq!(first.submitted, 1, "one digest_ok per tick");
         assert_eq!(first.conflicts, 0, "must not double-spend Process");
         let tx1 = &loop_.rpc().submitted()[0];
-        let process_in = tx1.inputs().get(tx1.inputs().len() - 1).unwrap().previous_output();
+        let process_in = tx1
+            .inputs()
+            .get(tx1.inputs().len() - 1)
+            .unwrap()
+            .previous_output();
         assert_eq!(process_in, proc.out_point);
         let remaining_intentions = loop_
             .rpc()

@@ -27,11 +27,21 @@ pub struct LoopConfig {
     pub hash_type: ScriptHashType,
     pub poll_interval: Duration,
     pub extra_cell_deps: Vec<CellDep>,
+    /// Blocks that must exist on top of a committed execution tx before
+    /// occupancy is released. `1` settles on first sight of Committed at the
+    /// tip. Daemon default is [`DEFAULT_CONFIRMATION_DEPTH`].
+    pub confirmation_depth: u64,
 }
+
+/// Conservative default: 24 CKB blocks (~3 minutes at ~8s). Overridable via
+/// `CID_CONFIRMATION_DEPTH`. Tests typically use `1`.
+pub const DEFAULT_CONFIRMATION_DEPTH: u64 = 24;
 
 pub struct LoopState {
     pub submit: SubmitState,
     pub resolver: ProcessResolver,
+    /// Last observed tip. Memory-only; used to log tip rewinds.
+    pub last_tip: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -82,6 +92,7 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
             state: LoopState {
                 submit: SubmitState::default(),
                 resolver,
+                last_tip: None,
             },
         }
     }
@@ -147,21 +158,20 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
             .iter()
             .map(|i| out_point_key(&i.out_point))
             .collect();
-        self.reconcile_pending();
+        let tip = self.refresh_tip();
+        self.reconcile_pending(tip);
         let pending_occupied = self.state.submit.pending_occupied_keys();
-        self.state
-            .submit
-            .in_flight
-            .retain(|k| live_keys.contains(k) || pending_occupied.contains(k));
+        self.state.submit.in_flight.retain(|k| {
+            (live_keys.contains(k) || pending_occupied.contains(k))
+                && !self.state.submit.rejected.contains(k)
+        });
 
         let eligible: Vec<ScannedIntention> = scanned
             .into_iter()
             .filter(|i| {
-                !self
-                    .state
-                    .submit
-                    .in_flight
-                    .contains(&out_point_key(&i.out_point))
+                let k = out_point_key(&i.out_point);
+                !self.state.submit.in_flight.contains(&k)
+                    && !self.state.submit.rejected.contains(&k)
             })
             .collect();
 
@@ -171,7 +181,35 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
         report
     }
 
-    fn reconcile_pending(&mut self) {
+    fn refresh_tip(&mut self) -> Option<u64> {
+        match self.rpc.tip_block_number() {
+            Ok(tip) => {
+                if let Some(prev) = self.state.last_tip {
+                    if tip < prev {
+                        tracing::warn!(
+                            target: LOG_TARGET,
+                            event = "reorg.tip_rewind",
+                            from = prev,
+                            to = tip,
+                        );
+                    }
+                }
+                self.state.last_tip = Some(tip);
+                Some(tip)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    event = "tip.unavailable",
+                    error = %e,
+                );
+                None
+            }
+        }
+    }
+
+    fn reconcile_pending(&mut self, tip: Option<u64>) {
+        let depth = self.config.confirmation_depth.max(1);
         let hashes: Vec<Vec<u8>> = self.state.submit.pending.keys().cloned().collect();
         for hash_bytes in hashes {
             let tx_hash = match Byte32::from_slice(&hash_bytes) {
@@ -184,24 +222,68 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
             let tx_hex = hex_pref(tx_hash.as_slice());
             match self.rpc.get_transaction_status(&tx_hash) {
                 Ok(TxStatus::Dropped) => {
-                    tracing::info!(
-                        target: LOG_TARGET,
-                        event = "pending.dropped",
-                        tx_hash = %tx_hex,
-                    );
-                    if let Some(ops) = self.state.submit.pending.remove(&hash_bytes) {
-                        for k in ops {
+                    let seen_committed = self
+                        .state
+                        .submit
+                        .pending
+                        .get(&hash_bytes)
+                        .map(|p| p.seen_committed)
+                        .unwrap_or(false);
+                    if seen_committed {
+                        tracing::info!(
+                            target: LOG_TARGET,
+                            event = "pending.reorg",
+                            tx_hash = %tx_hex,
+                        );
+                    } else {
+                        tracing::info!(
+                            target: LOG_TARGET,
+                            event = "pending.dropped",
+                            tx_hash = %tx_hex,
+                        );
+                    }
+                    if let Some(p) = self.state.submit.pending.remove(&hash_bytes) {
+                        for k in p.consumed {
                             self.state.submit.in_flight.remove(&k);
                         }
                     }
                 }
-                Ok(TxStatus::Committed) => {
-                    tracing::info!(
-                        target: LOG_TARGET,
-                        event = "pending.committed",
-                        tx_hash = %tx_hex,
-                    );
-                    self.state.submit.pending.remove(&hash_bytes);
+                Ok(TxStatus::Committed { block_number }) => {
+                    if let Some(p) = self.state.submit.pending.get_mut(&hash_bytes) {
+                        if !p.seen_committed {
+                            p.seen_committed = true;
+                            tracing::info!(
+                                target: LOG_TARGET,
+                                event = "pending.committed",
+                                tx_hash = %tx_hex,
+                                block_number,
+                            );
+                        }
+                    }
+                    let Some(tip) = tip else {
+                        continue;
+                    };
+                    let confirmations = confirmation_count(tip, block_number);
+                    if confirmations >= depth {
+                        tracing::info!(
+                            target: LOG_TARGET,
+                            event = "pending.settled",
+                            tx_hash = %tx_hex,
+                            confirmations,
+                            depth,
+                        );
+                        self.state.submit.pending.remove(&hash_bytes);
+                    } else {
+                        tracing::debug!(
+                            target: LOG_TARGET,
+                            event = "pending.confirming",
+                            tx_hash = %tx_hex,
+                            confirmations,
+                            depth,
+                            block_number,
+                            tip,
+                        );
+                    }
                 }
                 Ok(TxStatus::Pending) => {}
                 Err(e) => {
@@ -403,6 +485,16 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                 report.last_error = Some(format!("submit conflict: {m}"));
                 false
             }
+            Err(RpcError::SubmitRejected(m)) => {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    event = "submit.rejected",
+                    error = %m,
+                );
+                report.last_error = Some(format!("submit rejected: {m}"));
+                report.skipped += batch.len();
+                false
+            }
             Err(e) => {
                 tracing::warn!(
                     target: LOG_TARGET,
@@ -415,5 +507,25 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                 false
             }
         }
+    }
+}
+
+pub(crate) fn confirmation_count(tip: u64, commit_block: u64) -> u64 {
+    if tip < commit_block {
+        0
+    } else {
+        tip - commit_block + 1
+    }
+}
+
+#[cfg(test)]
+mod confirmation_math {
+    use super::confirmation_count;
+
+    #[test]
+    fn count_is_zero_when_tip_rewinds_below_commit() {
+        assert_eq!(confirmation_count(9, 10), 0);
+        assert_eq!(confirmation_count(10, 10), 1);
+        assert_eq!(confirmation_count(12, 10), 3);
     }
 }
