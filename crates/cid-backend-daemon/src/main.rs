@@ -1,11 +1,7 @@
-mod config;
-mod placeholder_rpc;
-
 use cid_backend_core::digest_loop::{DigestLoop, RealClock};
 use cid_backend_core::process::ProcessResolver;
 use cid_backend_core::ssri::EmbeddedSsri;
-use config::DaemonConfig;
-use placeholder_rpc::PlaceholderRpc;
+use cid_backend_daemon::{CkbRpc, DaemonConfig};
 
 fn main() {
     env_logger::init();
@@ -16,10 +12,7 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let rpc = PlaceholderRpc {
-        node_url: config.node_url.clone(),
-        indexer_url: config.indexer_url.clone(),
-    };
+    let rpc = CkbRpc::from_config(&config);
     let loop_config = config.to_loop_config();
     let mut digest = DigestLoop::new(
         rpc,

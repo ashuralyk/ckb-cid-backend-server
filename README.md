@@ -14,7 +14,7 @@ v0 is the digest loop only. No HTTP API, metrics, admin, or disk state. Restart 
 ## Workspace
 
 - `crates/cid-backend-core` — scan / process / ssri / assemble / submit / `digest_loop`
-- `crates/cid-backend-daemon` — env config + placeholder RPC + `loop.run()`
+- `crates/cid-backend-daemon` — env config + CKB JSON-RPC/Indexer adapter + `loop.run()`
 - `tests/` (`cid-backend-tests`) — FakeRpc verticals; no live network
 
 Upstream git pin: `d9ee77805f7ac930ab149648bed70f484a9886de` (`cid-process-executor`, `cid-protocol`).
@@ -28,14 +28,21 @@ Upstream git pin: `d9ee77805f7ac930ab149648bed70f484a9886de` (`cid-process-execu
 | `CID_LOCK_CODE_HASH` | yes | 32-byte hex (`0x` optional) |
 | `CID_LOCK_HASH_TYPE` | no | `type` |
 | `CID_POLL_INTERVAL_SECS` | yes | integer ≥ 1 |
+| `CID_LOCK_CELL_DEP` | local-chain | `<tx_hash>:<index>` CID lock code cell |
+| `CID_PROCESS_CODE_CELL_DEP` | local-chain | Process ELF code cell |
+| `CID_PROCESS_LOCK_CELL_DEP` | local-chain | always-success code cell |
+| `CID_PROCESS_CODE_HASH` | local-chain | Process ELF data hash (indexer type-script prefix) |
+| `CID_EXTRA_CELL_DEPS` | no | extra `<tx_hash>:<index>` list |
 
-The daemon does **not** install a Process-binary fallback. Production binaries come from live Process cell data. v0 ships `PlaceholderRpc` (methods return unavailable); FakeRpc covers tests.
+The daemon does **not** install a Process-binary fallback. Production binaries come from live Process cell data. `CkbRpc` talks JSON-RPC to `CID_CKB_RPC_URL` / `CID_INDEXER_URL` (FakeRpc remains the in-memory test double). State is memory-only: restart = full indexer rescan.
 
 ```bash
 cargo run -p cid-backend-daemon
 ```
 
 Illegal config (missing URL or CID lock code hash) exits immediately.
+
+Local isolated **dev** chain closure (no public network): see [`docs/local-dev-chain.md`](docs/local-dev-chain.md) and `./scripts/local-dev-chain.sh`.
 
 ## Tests
 
@@ -45,7 +52,7 @@ cargo test --locked -p cid-backend-daemon
 cargo test --locked -p cid-backend-tests
 ```
 
-Do not point these tests at a CKB node. Verticals: n=1 `digest_ok`, batch bounds, Incompatible refund, submit conflict retry.
+Default `cargo test` does **not** start a CKB node. FakeRpc verticals: n=1 `digest_ok`, batch bounds, Incompatible refund, submit conflict retry. Daemon HTTP-mock tests cover adapter mapping, indexer lag, Pending/Dropped, and restart rescan. The ignored `local_chain_e2e` test is the only real local-chain evidence.
 
 Default local `cargo test` **ignores** the real SSRI guest test (`real_example_binary_batch_bounds_and_assemble`) when `cid_process_example` is absent — that `ignored` count is **not** a real-SSRI pass.
 

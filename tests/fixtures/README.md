@@ -55,3 +55,7 @@ Lookup order: `CID_PROCESS_EXAMPLE_PATH`, then
 
 FakeRpc verticals (`cid-backend-tests`) use `ScriptedSsri` and do not need
 the ELF.
+
+Local-chain E2E also builds `ckb_common_intention_dispatcher` (CID lock) and
+a tiny `always_success` guest; those ELFs are gitignored. See
+`docs/local-dev-chain.md`.

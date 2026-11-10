@@ -1,4 +1,7 @@
 /target
 **/*.rs.bk
 tests/fixtures/cid_process_example
+tests/fixtures/ckb_common_intention_dispatcher
+tests/fixtures/always_success
 .cid-dispatcher-src/
+.local-ckb/
