@@ -6,5 +6,6 @@ edition = "2021"
 [dependencies]
 ckb-types = { workspace = true }
 log = { workspace = true }
+tracing = { workspace = true }
 cid-protocol = { workspace = true }
 cid-process-executor = { workspace = true }
