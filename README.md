@@ -9,7 +9,7 @@ This repository is independent of [`ckb-common-intention-dispatcher`](https://gi
 - Design: [`docs/superpowers/specs/2026-11-05-cid-backend-server-design.md`](docs/superpowers/specs/2026-11-05-cid-backend-server-design.md)
 - Implementation plan: [`docs/superpowers/plans/2026-11-05-cid-backend-server.md`](docs/superpowers/plans/2026-11-05-cid-backend-server.md)
 
-v0 is the digest loop only. No HTTP API, metrics, admin, or disk state. Restart = full rescan.
+v0 is the digest loop only. Optional health/metrics HTTP is opt-in (`CID_HEALTH_BIND`). No admin API or disk state. Restart = full rescan.
 
 ## Workspace
 
@@ -33,6 +33,9 @@ Upstream git pin: `d9ee77805f7ac930ab149648bed70f484a9886de` (`cid-process-execu
 | `CID_PROCESS_LOCK_CELL_DEP` | local-chain | always-success code cell |
 | `CID_PROCESS_CODE_HASH` | local-chain | Process ELF data hash (indexer type-script prefix) |
 | `CID_EXTRA_CELL_DEPS` | no | extra `<tx_hash>:<index>` list |
+| `CID_HEALTH_BIND` | no | `host:port` for `/healthz` `/readyz` `/stats` `/metrics`; unset/empty disables |
+| `CID_LOG_FORMAT` | no | `json` (default) or `pretty` |
+| `RUST_LOG` | no | tracing filter (default `info`) |
 
 The daemon does **not** install a Process-binary fallback. Production binaries come from live Process cell data. `CkbRpc` talks JSON-RPC to `CID_CKB_RPC_URL` / `CID_INDEXER_URL` (FakeRpc remains the in-memory test double). State is memory-only: restart = full indexer rescan.
 
@@ -40,7 +43,20 @@ The daemon does **not** install a Process-binary fallback. Production binaries c
 cargo run -p cid-backend-daemon
 ```
 
-Illegal config (missing URL or CID lock code hash) exits immediately.
+Illegal config (missing URL or CID lock code hash) exits immediately (structured `config.load_failed` log).
+
+Health (opt-in; does not block the digest loop):
+
+```bash
+export CID_HEALTH_BIND=127.0.0.1:9100
+cargo run -p cid-backend-daemon
+curl -s http://127.0.0.1:9100/healthz    # liveness
+curl -s http://127.0.0.1:9100/readyz    # 200 after a successful indexer scan
+curl -s http://127.0.0.1:9100/stats     # JSON counters
+curl -s http://127.0.0.1:9100/metrics   # Prometheus text
+```
+
+See [`docs/observability.md`](docs/observability.md).
 
 Local isolated **dev** chain closure (no public network): see [`docs/local-dev-chain.md`](docs/local-dev-chain.md) and `./scripts/local-dev-chain.sh`.
 

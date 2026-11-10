@@ -456,6 +456,7 @@ fn scan_resolve_ssri_submit_confirms_on_local_dev_chain() {
         poll_interval: Duration::from_secs(1),
         extra_cell_deps: vec![cell_dep(cid_op), cell_dep(proc_code_op), cell_dep(as_op)],
         process_type_code_hashes: vec![process_code_hash],
+        health_bind: None,
     };
     let live_rpc = CkbRpc::from_config(&cfg);
     let mut loop_ = DigestLoop::new(
