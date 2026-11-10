@@ -41,5 +41,8 @@ daemon logs `health.listen` with the bound address).
 | `GET /stats` | JSON: `ticks`, `scanned`, `skipped`, `submitted`, `conflicts`, `pending_in_flight`, `last_tick_at` (unix ms), `last_error`, `ready` |
 | `GET /metrics` | Prometheus text of the same counters/gauges |
 
-The listener is a `tiny_http` background thread. It does not take digest-loop
-locks beyond atomics/`Mutex` on the last error string.
+The listener is a `std::net` accept thread plus per-connection workers. Each
+socket has a 2s read/write deadline. Request bodies are not accepted (`413`,
+then `shutdown`); a slow or incomplete body cannot occupy `/healthz` /
+`/readyz` / `/stats` / `/metrics`. The digest loop is not blocked. Counters
+use atomics/`Mutex` only for the last error string.
