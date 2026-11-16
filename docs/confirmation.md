@@ -45,13 +45,37 @@ cells are live again.
 
 ## Retry vs permanent failure
 
+The adapter keeps the JSON-RPC `error.code` from `send_transaction` and
+classifies it. Core `SubmitRejected` still means **permanent for this process
+lifetime**; transient node/pool errors are mapped to `Unavailable` so they are
+not written to `rejected`.
+
 | Outcome | Retry? | Occupancy |
 |---------|--------|-----------|
 | `Dropped` (pool eviction / reorg) | yes, next tick if cells live | released |
 | RPC/indexer `Unavailable` | yes | held if already pending; not taken on a failed submit |
 | `Conflict` | yes, next tick if cells live | not taken (`failed` is informational) |
-| `SubmitRejected` (node refused a tx that is not a conflict) | **no** (this process lifetime) | not taken; outpoints go to `rejected` and are skipped so they cannot starve later Intentions in the bucket |
+| `SubmitRejected` (positively identified permanent send failure) | **no** (this process lifetime) | not taken; outpoints go to `rejected` and are skipped so they cannot starve later Intentions in the bucket |
 | SSRI `Incompatible` | refund via User Lock (unchanged) | — |
+
+`send_transaction` code mapping (`CkbRpc::map_rpc_error`):
+
+| Code | CKB error | Mapped to |
+|------|-----------|-----------|
+| `-301` | `TransactionFailedToResolve` | `Conflict` (also any message matching unknown-input / dead-cell / duplicate) |
+| `-1107` | `PoolRejectedDuplicatedTransaction` | `Conflict` |
+| `-302` | `TransactionFailedToVerify` | `SubmitRejected` |
+| `-1102` | `PoolRejectedTransactionByOutputsValidator` | `SubmitRejected` |
+| `-1108` | `PoolRejectedMalformedTransaction` | `SubmitRejected` |
+| `-1106` | `PoolIsFull` | `Unavailable` (retry) |
+| `-1105` | `PoolRejectedTransactionByMaxAncestorsCountLimit` | `Unavailable` (retry) |
+| `-1104` | `PoolRejectedTransactionByMinFeeRate` | `Unavailable` (node policy; same tx may succeed if the node config changes) |
+| other / missing code | — | `Unavailable` (do **not** blacklist an Intention on an unclassified error) |
+
+A committed execution tx with a **known** `tx_status.block_number` of `0` is
+genesis height and is used as-is. Missing/invalid `block_hash` or `get_header`
+returning null is `Unavailable`, not height 0: occupancy stays held until a
+real height is observed.
 
 `rejected` is memory-only. Restarting the daemon will try those Intentions
 again.
@@ -66,4 +90,4 @@ again.
 | `pending.dropped` | Pending tx gone before we saw Committed |
 | `pending.reorg` | A previously committed/confirming tx is now Dropped |
 | `reorg.tip_rewind` | Tip height moved backwards |
-| `submit.rejected` | Permanent submit rejection |
+| `submit.rejected` | Permanent send_transaction reject (`-302` / `-1102` / `-1108`) |
