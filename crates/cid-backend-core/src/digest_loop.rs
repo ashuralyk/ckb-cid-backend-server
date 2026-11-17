@@ -7,7 +7,7 @@ use crate::submit::{combo_fingerprint, submit_execution, SubmitState};
 use ckb_types::core::ScriptHashType;
 use ckb_types::packed::{Byte32, CellDep};
 use ckb_types::prelude::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::time::Duration;
 
@@ -42,6 +42,10 @@ pub struct LoopState {
     pub resolver: ProcessResolver,
     /// Last observed tip. Memory-only; used to log tip rewinds.
     pub last_tip: Option<u64>,
+    /// Memory-only per-Process-type-hash isolate resume (`out_point_key`).
+    /// Next tick starts at this Intention so a skip/send budget cut does not
+    /// restart at the same ASC head. Dropped on restart.
+    pub isolate_resume: HashMap<[u8; 32], Vec<u8>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -108,6 +112,7 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                 submit: SubmitState::default(),
                 resolver,
                 last_tip: None,
+                isolate_resume: HashMap::new(),
             },
         }
     }
@@ -366,7 +371,8 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
         }
         const MAX_ATTEMPTS: u32 = 64;
         let mut attempts = 0;
-        let _ = self.isolate_window(
+        let bucket = Self::rotate_bucket(bucket, self.state.isolate_resume.get(&hash));
+        let resume = self.isolate_window(
             &process,
             bucket,
             min,
@@ -375,10 +381,16 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
             &mut attempts,
             MAX_ATTEMPTS,
         );
+        if let Some(k) = resume {
+            self.state.isolate_resume.insert(hash, k);
+        } else {
+            self.state.isolate_resume.remove(&hash);
+        }
     }
 
     /// Split a `SubmitRejected` window into legal `[min, max]` sub-batches.
-    /// Returns true when a digest_ok submit consumed `process`.
+    /// Returns a resume `out_point_key` when leftover work should start there
+    /// next tick (budget cut or Process occupied/consumed with remainder).
     ///
     /// Iterative so a long poison prefix cannot grow the stack. Cached combos
     /// are isolated without charging `attempts` (new `send_transaction` only).
@@ -391,7 +403,7 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
         report: &mut TickReport,
         attempts: &mut u32,
         max_attempts: u32,
-    ) -> bool {
+    ) -> Option<Vec<u8>> {
         let mut stack = vec![items];
         while let Some(items) = stack.pop() {
             let items: Vec<ScannedIntention> = items
@@ -431,7 +443,7 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                     for leftover in stack.drain(..) {
                         report.skipped += leftover.len();
                     }
-                    return false;
+                    return items.first().map(|i| out_point_key(&i.out_point));
                 }
                 let outcome = self.process_batch(process, window.clone(), report);
                 // Charge new send/assemble work only. CachedRejected is a
@@ -443,11 +455,15 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
             };
             match outcome {
                 BatchOutcome::SubmittedProcess | BatchOutcome::ProcessOccupied => {
+                    let resume = rest
+                        .first()
+                        .or_else(|| stack.iter().find_map(|s| s.first()))
+                        .map(|i| out_point_key(&i.out_point));
                     report.skipped += rest.len();
                     for leftover in stack.drain(..) {
                         report.skipped += leftover.len();
                     }
-                    return true;
+                    return resume;
                 }
                 BatchOutcome::Submitted | BatchOutcome::Continue => {
                     if !rest.is_empty() {
@@ -471,7 +487,27 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                 }
             }
         }
-        false
+        None
+    }
+
+    fn rotate_bucket(
+        bucket: Vec<ScannedIntention>,
+        resume: Option<&Vec<u8>>,
+    ) -> Vec<ScannedIntention> {
+        let Some(key) = resume else {
+            return bucket;
+        };
+        match bucket
+            .iter()
+            .position(|i| out_point_key(&i.out_point) == *key)
+        {
+            Some(i) if i > 0 => {
+                let mut rotated = bucket[i..].to_vec();
+                rotated.extend_from_slice(&bucket[..i]);
+                rotated
+            }
+            _ => bucket,
+        }
     }
 
     /// True when this Intention set was `SubmitRejected` as digest_ok with
