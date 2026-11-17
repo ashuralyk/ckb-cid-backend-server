@@ -4,12 +4,15 @@ mod tests {
 
     use cid_backend_core::digest_loop::{DigestLoop, LoopConfig, NopClock};
     use cid_backend_core::process::ProcessResolver;
-    use cid_backend_core::rpc::{out_point_key, script_hash32};
+    use cid_backend_core::rpc::{out_point_key, script_hash32, LiveCell};
     use ckb_types::core::ScriptHashType;
 
     use crate::fake_rpc::FakeRpc;
-    use crate::helpers::{intention_cell, process_cell, process_type_script, CID_CODE};
-    use crate::scripted_ssri::ScriptedSsri;
+    use crate::helpers::{
+        cid_lock_args, intention_cell, live_cell, lock_script, out_point, process_cell,
+        process_type_script, CID_CODE,
+    };
+    use crate::scripted_ssri::{Mode, ScriptedSsri};
 
     fn cfg() -> LoopConfig {
         LoopConfig {
@@ -418,5 +421,150 @@ mod tests {
             .rejected
             .contains(&out_point_key(&good.out_point)));
         assert!(loop_.state().submit.pending_occupies(&good.out_point));
+    }
+
+    fn unbuildable_intention(fill: u8, process_type_hash: [u8; 32]) -> LiveCell {
+        live_cell(
+            out_point(fill, 0),
+            lock_script(
+                CID_CODE,
+                ScriptHashType::Type,
+                cid_lock_args(process_type_hash),
+            ),
+            Some(lock_script([0xFFu8; 32], ScriptHashType::Type, vec![])),
+            100_0000_0000,
+            vec![1, 2, 3],
+        )
+    }
+
+    #[test]
+    fn unbuildable_refund_prefix_does_not_starve_later_refundable_intention() {
+        let rpc = FakeRpc::new();
+        let ts = process_type_script(34);
+        let hash = script_hash32(&ts);
+        const POISON: u8 = 64;
+        let mut poison = Vec::new();
+        for fill in 1..=POISON {
+            let cell = unbuildable_intention(fill, hash);
+            rpc.insert_cell(cell.clone());
+            poison.push(cell);
+        }
+        let good = intention_cell(POISON + 1, hash, 110_0000_0000);
+        let proc = process_cell(34, 200_0000_0000, vec![0x7f, b'E', b'L', b'F', 34]);
+        rpc.insert_cell(good.clone());
+        rpc.insert_cell(proc.clone());
+        let mut loop_ = DigestLoop::new(
+            rpc,
+            NopClock,
+            ScriptedSsri {
+                bounds: (1, 1),
+                mode: Mode::AlwaysIncompatible(21),
+            },
+            cfg(),
+            ProcessResolver::new(),
+        );
+
+        let first = loop_.tick();
+        assert_eq!(first.submitted, 0, "budget stops at 64 unbuildable refunds");
+        assert_eq!(
+            loop_.rpc().submit_attempts(),
+            0,
+            "assemble skip must not send"
+        );
+
+        let second = loop_.tick();
+        assert_eq!(
+            second.submitted, 1,
+            "later refundable B must be reached after an unbuildable prefix"
+        );
+        assert_eq!(loop_.rpc().submit_attempts(), 1);
+        assert_eq!(loop_.rpc().submitted().len(), 1);
+        assert_eq!(
+            loop_.rpc().submitted()[0]
+                .inputs()
+                .get(0)
+                .unwrap()
+                .previous_output(),
+            good.out_point
+        );
+        assert!(
+            loop_.state().submit.pending_occupies(&good.out_point),
+            "refund occupies B until the next tick settles"
+        );
+        assert!(
+            !loop_.state().submit.pending_occupies(&proc.out_point),
+            "User Lock refund must not occupy Process"
+        );
+        for cell in &poison {
+            assert!(!loop_.state().submit.pending_occupies(&cell.out_point));
+            assert!(!loop_
+                .state()
+                .submit
+                .rejected
+                .contains(&out_point_key(&cell.out_point)));
+        }
+
+        let attempts = loop_.rpc().submit_attempts();
+        let third = loop_.tick();
+        let fourth = loop_.tick();
+        assert_eq!(third.submitted, 0);
+        assert_eq!(fourth.submitted, 0);
+        assert!(!loop_.state().submit.pending_occupies(&good.out_point));
+        assert_eq!(
+            loop_.rpc().submit_attempts(),
+            attempts,
+            "unbuildable skips must not send on later ticks"
+        );
+    }
+
+    #[test]
+    fn capacity_shortfall_prefix_does_not_starve_later_valid_intention() {
+        let rpc = FakeRpc::new();
+        let ts = process_type_script(35);
+        let hash = script_hash32(&ts);
+        const POISON: u8 = 64;
+        for fill in 1..=POISON {
+            rpc.insert_cell(intention_cell(fill, hash, 10_0000_0000));
+        }
+        let good = intention_cell(POISON + 1, hash, 500_0000_0000);
+        let proc = process_cell(35, 200_0000_0000, vec![0x7f, b'E', b'L', b'F', 35]);
+        rpc.insert_cell(good.clone());
+        rpc.insert_cell(proc.clone());
+        rpc.defer_commit();
+        let mut loop_ = DigestLoop::new(
+            rpc,
+            NopClock,
+            ScriptedSsri::fixed_beneficiary((1, 1), 400_0000_0000),
+            cfg(),
+            ProcessResolver::new(),
+        );
+
+        let first = loop_.tick();
+        assert_eq!(first.submitted, 0, "budget stops at 64 capacity shortfalls");
+        assert_eq!(loop_.rpc().submit_attempts(), 0);
+
+        let second = loop_.tick();
+        assert_eq!(
+            second.submitted, 1,
+            "later valid B must be reached after a capacity-shortfall prefix"
+        );
+        assert_eq!(loop_.rpc().submit_attempts(), 1);
+        assert_eq!(
+            loop_.rpc().submitted()[0]
+                .inputs()
+                .get(0)
+                .unwrap()
+                .previous_output(),
+            good.out_point
+        );
+        assert!(loop_.state().submit.pending_occupies(&good.out_point));
+        let attempts = loop_.rpc().submit_attempts();
+        let _ = loop_.tick();
+        let _ = loop_.tick();
+        assert_eq!(
+            loop_.rpc().submit_attempts(),
+            attempts,
+            "capacity-shortfall skips must not send on later ticks"
+        );
     }
 }

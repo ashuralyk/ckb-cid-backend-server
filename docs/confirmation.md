@@ -67,15 +67,25 @@ restart (or a new Process outpoint). Within the tick, the window is split
 into legal `[min, max]` sub-batches (shrink prefix; drop-first remainder)
 so a valid sibling can still submit when `min = 1`.
 
-At most 64 **new** `send_transaction` attempts per bucket per tick. Hits on
-`rejected_combos` do not consume that budget. Before SSRI assemble, the
-digest_ok fingerprint (Intention outpoints plus this Process outpoint) is
-looked up; a hit skips assemble and submit. After assemble, the actual
-fingerprint is checked (digest_ok includes Process; User Lock refunds omit
-it) so a cached refund does not skip a digest_ok combo and vice versa.
-Cache hits still walk/split so later Intentions can be reached on a later
-tick. Isolation is iterative (no recursion on long prefixes). Remaining
-work after the new-attempt budget is left for the next tick.
+At most 64 **new** `send_transaction` or assemble-skip attempts per bucket
+per tick (cached `rejected_combos` hits do not consume that budget). Before
+SSRI assemble, the digest_ok fingerprint (Intention outpoints plus this
+Process outpoint) is looked up; a hit skips assemble and submit. After
+assemble, the actual fingerprint is checked (digest_ok includes Process;
+User Lock refunds omit it) so a cached refund does not skip a digest_ok
+combo and vice versa. Cache hits still walk/split so later Intentions can
+be reached on a later tick. Isolation is iterative (no recursion on long
+prefixes).
+
+Uncached no-send skips (`RefundUnbuildable`, capacity shortfall, SSRI
+assemble Unusable) still count toward the per-tick work bound — they are
+not a `send_transaction` — and are **not** written to `rejected` or
+`rejected_combos`. When the bound cuts a bucket, a memory-only per-Process
+resume cursor starts the next tick at the first unprocessed Intention so a
+long persistently skippable prefix cannot starve later valid/refundable
+work. The cursor is dropped on restart (full rescan from the indexer
+head). A new Process outpoint is still a new combo; `SubmitRejected` is
+still combo-scoped, not a per-outpoint blacklist.
 
 A singleton `{A, Process}` failure is **not** treated as proof that A is
 permanently invalid (`-302` / `-1102` / `-1108` may come from Process, lock,
