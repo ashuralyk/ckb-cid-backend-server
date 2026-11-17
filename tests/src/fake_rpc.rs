@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use cid_backend_core::rpc::{out_point_key, script_hash32, LiveCell, Rpc, RpcError, TxStatus};
 use ckb_types::core::{ScriptHashType, TransactionView};
@@ -12,6 +12,8 @@ struct Inner {
     order: Vec<OutPoint>,
     fail_next_submit: bool,
     reject_next_submit: bool,
+    reject_inputs: HashSet<Vec<u8>>,
+    submit_attempts: usize,
     unavailable_next_submit: bool,
     defer_commit: bool,
     fail_status_queries: bool,
@@ -69,6 +71,19 @@ impl FakeRpc {
     /// Next `submit_transaction` returns `SubmitRejected` (permanent for those cells).
     pub fn inject_reject_once(&self) {
         self.inner.borrow_mut().reject_next_submit = true;
+    }
+
+    /// Every submit that spends `op` returns `SubmitRejected` (A-fails / B-succeeds).
+    pub fn reject_when_consuming(&self, op: &OutPoint) {
+        self.inner
+            .borrow_mut()
+            .reject_inputs
+            .insert(out_point_key(op));
+    }
+
+    /// Count of `submit_transaction` calls, including injected failures.
+    pub fn submit_attempts(&self) -> usize {
+        self.inner.borrow().submit_attempts
     }
 
     /// Next `submit_transaction` returns `Unavailable` (transient).
@@ -255,6 +270,7 @@ impl Rpc for FakeRpc {
 
     fn submit_transaction(&self, tx: &TransactionView) -> Result<Byte32, RpcError> {
         let mut inner = self.inner.borrow_mut();
+        inner.submit_attempts += 1;
         if inner.unavailable_next_submit {
             inner.unavailable_next_submit = false;
             return Err(RpcError::Unavailable("injected submit unavailable".into()));
@@ -262,6 +278,14 @@ impl Rpc for FakeRpc {
         if inner.reject_next_submit {
             inner.reject_next_submit = false;
             return Err(RpcError::SubmitRejected("injected reject".into()));
+        }
+        let hits_poison = tx.inputs().into_iter().any(|input| {
+            inner
+                .reject_inputs
+                .contains(&out_point_key(&input.previous_output()))
+        });
+        if hits_poison {
+            return Err(RpcError::SubmitRejected("injected input reject".into()));
         }
         if inner.fail_next_submit {
             inner.fail_next_submit = false;

@@ -3,7 +3,7 @@ use crate::process::{ProcessResolver, ResolvedProcess};
 use crate::rpc::{out_point_key, Rpc, RpcError, TxStatus};
 use crate::scan::{bucket_by_process_type_hash, scan_intentions, ScannedIntention};
 use crate::ssri::{to_intention_input, SsriError, SsriHost};
-use crate::submit::{submit_execution, SubmitState};
+use crate::submit::{combo_fingerprint, submit_execution, SubmitState};
 use ckb_types::core::ScriptHashType;
 use ckb_types::packed::{Byte32, CellDep};
 use ckb_types::prelude::*;
@@ -54,6 +54,19 @@ pub struct TickReport {
     pub scan_ok: bool,
     /// Last scan/submit error on this tick, if any.
     pub last_error: Option<String>,
+}
+
+enum BatchOutcome {
+    /// digest_ok submitted; Process input is occupied until settlement.
+    SubmittedProcess,
+    /// Submitted without spending Process (User Lock refund).
+    Submitted,
+    /// `SubmitRejected` for this exact Intention combo (caller isolates).
+    Rejected,
+    /// Conflict / Unavailable / assemble skip: remaining items may continue.
+    Continue,
+    /// Process recreate already occupied; stop digest_ok this tick.
+    ProcessOccupied,
 }
 
 pub trait Clock {
@@ -349,29 +362,113 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
             report.skipped += bucket.len();
             return;
         }
-        let mut remaining = bucket;
-        while remaining.len() >= min as usize {
-            let n = remaining.len().min(max as usize);
-            let batch: Vec<ScannedIntention> = remaining.drain(..n).collect();
-            let consumed_process = self.process_batch(&process, batch, report);
-            if consumed_process {
-                // digest_ok spends the resolved Process outpoint. Leave later
-                // batches for the next tick, which re-resolves the recreate.
-                break;
-            }
+        const MAX_ATTEMPTS: u32 = 64;
+        let mut attempts = 0;
+        let _ = self.isolate_window(
+            &process,
+            bucket,
+            min,
+            max,
+            report,
+            &mut attempts,
+            MAX_ATTEMPTS,
+        );
+    }
+
+    /// Split a `SubmitRejected` window into legal `[min, max]` sub-batches.
+    /// Returns true when a digest_ok submit consumed `process`.
+    fn isolate_window(
+        &mut self,
+        process: &ResolvedProcess,
+        items: Vec<ScannedIntention>,
+        min: u32,
+        max: u32,
+        report: &mut TickReport,
+        attempts: &mut u32,
+        max_attempts: u32,
+    ) -> bool {
+        let items: Vec<ScannedIntention> = items
+            .into_iter()
+            .filter(|i| {
+                !self
+                    .state
+                    .submit
+                    .in_flight
+                    .contains(&out_point_key(&i.out_point))
+            })
+            .collect();
+        if items.len() < min as usize {
+            report.skipped += items.len();
+            return false;
         }
-        if !remaining.is_empty() {
-            report.skipped += remaining.len();
+        if *attempts >= max_attempts {
+            tracing::warn!(
+                target: LOG_TARGET,
+                event = "tick.skip",
+                reason = "reject_isolate_budget",
+                attempts,
+            );
+            report.skipped += items.len();
+            return false;
+        }
+        let n = items.len().min(max as usize);
+        let window = items[..n].to_vec();
+        let rest = items[n..].to_vec();
+        *attempts += 1;
+        match self.process_batch(process, window.clone(), report) {
+            BatchOutcome::SubmittedProcess | BatchOutcome::ProcessOccupied => {
+                report.skipped += rest.len();
+                true
+            }
+            BatchOutcome::Submitted | BatchOutcome::Continue => {
+                self.isolate_window(process, rest, min, max, report, attempts, max_attempts)
+            }
+            BatchOutcome::Rejected => {
+                let mut drop_first = window[1..].to_vec();
+                drop_first.extend(rest);
+                if window.len() > min as usize {
+                    if self.isolate_window(
+                        process,
+                        window[..window.len() - 1].to_vec(),
+                        min,
+                        max,
+                        report,
+                        attempts,
+                        max_attempts,
+                    ) {
+                        return true;
+                    }
+                    self.isolate_window(
+                        process,
+                        drop_first,
+                        min,
+                        max,
+                        report,
+                        attempts,
+                        max_attempts,
+                    )
+                } else {
+                    report.skipped += 1;
+                    self.isolate_window(
+                        process,
+                        drop_first,
+                        min,
+                        max,
+                        report,
+                        attempts,
+                        max_attempts,
+                    )
+                }
+            }
         }
     }
 
-    /// Returns true when a digest_ok submit consumed `process`.
     fn process_batch(
         &mut self,
         process: &ResolvedProcess,
         batch: Vec<ScannedIntention>,
         report: &mut TickReport,
-    ) -> bool {
+    ) -> BatchOutcome {
         let inputs: Vec<_> = batch.iter().map(to_intention_input).collect();
         let assembled = self.ssri.assemble(&process.binary, &inputs);
         let skeleton = match assembled {
@@ -387,7 +484,7 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                         reason = "process_occupied",
                     );
                     report.skipped += batch.len();
-                    return true;
+                    return BatchOutcome::ProcessOccupied;
                 }
                 match assemble_digest_ok(&batch, process, &partial, &self.config.extra_cell_deps) {
                     Ok(s) => s,
@@ -400,7 +497,7 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                             outputs,
                         );
                         report.skipped += batch.len();
-                        return false;
+                        return BatchOutcome::Continue;
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -410,7 +507,7 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                             error = %e,
                         );
                         report.skipped += batch.len();
-                        return false;
+                        return BatchOutcome::Continue;
                     }
                 }
             }
@@ -439,7 +536,7 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                             error = %e,
                         );
                         report.skipped += batch.len();
-                        return false;
+                        return BatchOutcome::Continue;
                     }
                 }
             }
@@ -451,7 +548,7 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                     error = %m,
                 );
                 report.skipped += batch.len();
-                return false;
+                return BatchOutcome::Continue;
             }
         };
         let consumed_process = skeleton
@@ -459,6 +556,17 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
             .inputs()
             .into_iter()
             .any(|i| i.previous_output() == process.live_cell.out_point);
+        let intent_ops: Vec<_> = batch.iter().map(|i| i.out_point.clone()).collect();
+        let process_op = consumed_process.then(|| process.live_cell.out_point.clone());
+        let fp = combo_fingerprint(&intent_ops, process_op.as_ref());
+        if self.state.submit.rejected_combos.contains(&fp) {
+            tracing::debug!(
+                target: LOG_TARGET,
+                event = "submit.rejected_combo",
+                n = batch.len(),
+            );
+            return BatchOutcome::Rejected;
+        }
         let consumed: Vec<_> = skeleton
             .tx
             .inputs()
@@ -473,7 +581,11 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                     tx_hash = %hex_pref(hash.as_slice()),
                 );
                 report.submitted += 1;
-                consumed_process
+                if consumed_process {
+                    BatchOutcome::SubmittedProcess
+                } else {
+                    BatchOutcome::Submitted
+                }
             }
             Err(RpcError::Conflict(m)) => {
                 tracing::warn!(
@@ -483,17 +595,18 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                 );
                 report.conflicts += 1;
                 report.last_error = Some(format!("submit conflict: {m}"));
-                false
+                BatchOutcome::Continue
             }
             Err(RpcError::SubmitRejected(m)) => {
+                self.state.submit.rejected_combos.insert(fp);
                 tracing::warn!(
                     target: LOG_TARGET,
                     event = "submit.rejected",
                     error = %m,
+                    n = batch.len(),
                 );
                 report.last_error = Some(format!("submit rejected: {m}"));
-                report.skipped += batch.len();
-                false
+                BatchOutcome::Rejected
             }
             Err(e) => {
                 tracing::warn!(
@@ -504,7 +617,7 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                 );
                 report.last_error = Some(format!("submit failed: {e}"));
                 report.skipped += batch.len();
-                false
+                BatchOutcome::Continue
             }
         }
     }

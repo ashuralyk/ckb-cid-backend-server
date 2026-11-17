@@ -2,7 +2,7 @@
 
 Digest correctness of assemble/submit is unchanged. All of this bookkeeping is
 **memory-only**: a restart drops in-flight occupancy, confirmation tracking, and
-the permanent-reject set. The next tick is a full indexer rescan.
+rejected combos. The next tick is a full indexer rescan.
 
 ## Confirmation depth
 
@@ -46,17 +46,42 @@ cells are live again.
 ## Retry vs permanent failure
 
 The adapter keeps the JSON-RPC `error.code` from `send_transaction` and
-classifies it. Core `SubmitRejected` still means **permanent for this process
-lifetime**; transient node/pool errors are mapped to `Unavailable` so they are
-not written to `rejected`.
+classifies it. Transient node/pool errors are `Unavailable`. Core
+`SubmitRejected` is a **transaction-level** permanent failure of that exact
+Intention combo (plus Process outpoint when the tx spends Process). It does
+**not** prove any one Intention is invalid, so consumed outpoints are not
+written to `rejected`.
 
 | Outcome | Retry? | Occupancy |
 |---------|--------|-----------|
 | `Dropped` (pool eviction / reorg) | yes, next tick if cells live | released |
 | RPC/indexer `Unavailable` | yes | held if already pending; not taken on a failed submit |
 | `Conflict` | yes, next tick if cells live | not taken (`failed` is informational) |
-| `SubmitRejected` (positively identified permanent send failure) | **no** (this process lifetime) | not taken; outpoints go to `rejected` and are skipped so they cannot starve later Intentions in the bucket |
+| `SubmitRejected` (positively identified permanent send failure of this tx) | isolate / skip that **combo** this process lifetime | not taken; Process outpoint is not blacklisted |
 | SSRI `Incompatible` | refund via User Lock (unchanged) | — |
+
+**Combo isolation.** A `SubmitRejected` batch is recorded as a fingerprint of
+the Intention outpoints in order plus the Process outpoint if `digest_ok`
+spent it. The same combo is not submitted again until restart (or a new
+Process outpoint). Within the tick, the window is split into legal
+`[min, max]` sub-batches (shrink prefix; drop-first remainder) so a valid
+sibling can still submit when `min = 1`. At most 64 isolate attempts per
+bucket per tick.
+
+A singleton `{A, Process}` failure is **not** treated as proof that A is
+permanently invalid (`-302` / `-1102` / `-1108` may come from Process, lock,
+deps, or the combination). Only that combo is skipped. If the live Process
+cell changes, A may be tried again.
+
+**min > 1.** A rejected window is not written wholesale into `rejected`. If
+the window cannot be split below `min`, members stay eligible as cells but
+the **same combo** is not resubmitted. A valid B that only appears next to a
+failing A in every min-sized window stays unsubmitted until the partner set
+or Process outpoint changes, or the process restarts. That is accepted;
+blacklisting B would be worse.
+
+All of this is memory-only. Restarting the daemon drops combos and retries
+from a full indexer rescan.
 
 `send_transaction` code mapping (`CkbRpc::map_rpc_error`):
 
@@ -77,8 +102,8 @@ genesis height and is used as-is. Missing/invalid `block_hash` or `get_header`
 returning null is `Unavailable`, not height 0: occupancy stays held until a
 real height is observed.
 
-`rejected` is memory-only. Restarting the daemon will try those Intentions
-again.
+`rejected_combos` is memory-only. Restarting the daemon will try those
+Intentions again.
 
 ## Logs
 
@@ -90,4 +115,4 @@ again.
 | `pending.dropped` | Pending tx gone before we saw Committed |
 | `pending.reorg` | A previously committed/confirming tx is now Dropped |
 | `reorg.tip_rewind` | Tip height moved backwards |
-| `submit.rejected` | Permanent send_transaction reject (`-302` / `-1102` / `-1108`) |
+| `submit.rejected` | Transaction-level send_transaction reject (`-302` / `-1102` / `-1108`); combo skipped, sub-batches may still run |

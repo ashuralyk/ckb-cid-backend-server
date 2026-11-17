@@ -11,8 +11,13 @@ pub struct SubmitState {
     pub in_flight: HashSet<Vec<u8>>,
     /// Conflict (retry next tick if the cell is still live). Informational.
     pub failed: HashSet<Vec<u8>>,
-    /// Permanent submit rejection this process lifetime. Skipped, not occupied.
+    /// Legacy outpoint skip set. SubmitRejected no longer writes here: a
+    /// transaction-level reject cannot prove an individual Intention is invalid.
     pub rejected: HashSet<Vec<u8>>,
+    /// Intention-set (+ Process outpoint when the tx spends Process) that got
+    /// `SubmitRejected`. Identical combos are not resubmitted this process
+    /// lifetime. A new Process outpoint is a new combo.
+    pub rejected_combos: HashSet<Vec<u8>>,
     /// Submitted tx hash bytes → consumed outpoints still treated as in-flight
     /// until the tx is dropped or reaches confirmation depth.
     pub pending: HashMap<Vec<u8>, PendingTx>,
@@ -87,13 +92,31 @@ pub fn submit_execution<R: Rpc>(
             Err(e)
         }
         Err(e @ RpcError::SubmitRejected(_)) => {
+            // Transaction-level reject: do not blacklist consumed outpoints.
+            // DigestLoop records a combo fingerprint and isolates sub-batches.
             for op in consumed {
-                let k = out_point_key(op);
-                state.rejected.insert(k.clone());
-                state.in_flight.remove(&k);
+                state.in_flight.remove(&out_point_key(op));
             }
             Err(e)
         }
         Err(e) => Err(e),
     }
+}
+
+/// Ordered Intention outpoints plus optional Process. Used to skip resubmitting
+/// an identical combo after `SubmitRejected` without blaming one input.
+pub fn combo_fingerprint(intentions: &[OutPoint], process: Option<&OutPoint>) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&(intentions.len() as u32).to_le_bytes());
+    for op in intentions {
+        buf.extend(out_point_key(op));
+    }
+    match process {
+        Some(p) => {
+            buf.push(1);
+            buf.extend(out_point_key(p));
+        }
+        None => buf.push(0),
+    }
+    buf
 }

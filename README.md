@@ -70,7 +70,7 @@ cargo test --locked -p cid-backend-daemon
 cargo test --locked -p cid-backend-tests
 ```
 
-Default `cargo test` does **not** start a CKB node. FakeRpc verticals: n=1 `digest_ok`, batch bounds, Incompatible refund, submit conflict retry, confirmation depth, reorg, Dropped/Unavailable retry, permanent `SubmitRejected`. Daemon HTTP-mock tests cover adapter mapping (including PoolIsFull retry vs verify/malformed reject, and unknown committed height vs explicit genesis), indexer lag, Pending/Dropped, and restart rescan. The ignored `local_chain_e2e` test is the only real local-chain evidence.
+Default `cargo test` does **not** start a CKB node. FakeRpc verticals: n=1 `digest_ok`, batch bounds, Incompatible refund, submit conflict retry, confirmation depth, reorg, Dropped/Unavailable retry, `SubmitRejected` combo isolation (valid sibling still submits; min>1 does not blacklist the window). Daemon HTTP-mock tests cover adapter mapping (including PoolIsFull retry vs verify/malformed reject, and unknown committed height vs explicit genesis), indexer lag, Pending/Dropped, and restart rescan. The ignored `local_chain_e2e` test is the only real local-chain evidence.
 
 Default local `cargo test` **ignores** the real SSRI guest test (`real_example_binary_batch_bounds_and_assemble`) when `cid_process_example` is absent — that `ignored` count is **not** a real-SSRI pass.
 
