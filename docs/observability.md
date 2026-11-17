@@ -25,7 +25,7 @@ Stable field `event` (target `cid_backend`):
 | `refund.path` | User-lock refund assemble (`path=user_lock`) |
 | `submit.ok` | `tx_hash` |
 | `submit.conflict` | Submit mapped as Conflict |
-| `submit.rejected` | Permanent submit rejection (`TransactionFailedToVerify` / malformed / outputs-validator; not retried this process) |
+| `submit.rejected` | Transaction-level submit rejection (`TransactionFailedToVerify` / malformed / outputs-validator); that combo is skipped, not every consumed outpoint |
 | `pending.committed` | First sight of Committed (occupancy still held) |
 | `pending.settled` | Confirmation depth reached |
 | `pending.dropped` / `pending.reorg` | Pending/confirming tx gone |
