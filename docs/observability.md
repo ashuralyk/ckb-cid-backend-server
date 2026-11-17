@@ -26,6 +26,7 @@ Stable field `event` (target `cid_backend`):
 | `submit.ok` | `tx_hash` |
 | `submit.conflict` | Submit mapped as Conflict |
 | `submit.rejected` | Transaction-level submit rejection (`TransactionFailedToVerify` / malformed / outputs-validator); that combo is skipped, not every consumed outpoint |
+| `submit.rejected_combo` | Isolation skipped a combo already in `rejected_combos` (no new `send_transaction`) |
 | `pending.committed` | First sight of Committed (occupancy still held) |
 | `pending.settled` | Confirmation depth reached |
 | `pending.dropped` / `pending.reorg` | Pending/confirming tx gone |

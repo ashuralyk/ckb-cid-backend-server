@@ -63,6 +63,8 @@ enum BatchOutcome {
     Submitted,
     /// `SubmitRejected` for this exact Intention combo (caller isolates).
     Rejected,
+    /// Combo already in `rejected_combos`; isolate without a new submit.
+    CachedRejected,
     /// Conflict / Unavailable / assemble skip: remaining items may continue.
     Continue,
     /// Process recreate already occupied; stop digest_ok this tick.
@@ -377,6 +379,9 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
 
     /// Split a `SubmitRejected` window into legal `[min, max]` sub-batches.
     /// Returns true when a digest_ok submit consumed `process`.
+    ///
+    /// Iterative so a long poison prefix cannot grow the stack. Cached combos
+    /// are isolated without charging `attempts` (new `send_transaction` only).
     fn isolate_window(
         &mut self,
         process: &ResolvedProcess,
@@ -387,80 +392,97 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
         attempts: &mut u32,
         max_attempts: u32,
     ) -> bool {
-        let items: Vec<ScannedIntention> = items
-            .into_iter()
-            .filter(|i| {
-                !self
-                    .state
-                    .submit
-                    .in_flight
-                    .contains(&out_point_key(&i.out_point))
-            })
-            .collect();
-        if items.len() < min as usize {
-            report.skipped += items.len();
-            return false;
-        }
-        if *attempts >= max_attempts {
-            tracing::warn!(
-                target: LOG_TARGET,
-                event = "tick.skip",
-                reason = "reject_isolate_budget",
-                attempts,
-            );
-            report.skipped += items.len();
-            return false;
-        }
-        let n = items.len().min(max as usize);
-        let window = items[..n].to_vec();
-        let rest = items[n..].to_vec();
-        *attempts += 1;
-        match self.process_batch(process, window.clone(), report) {
-            BatchOutcome::SubmittedProcess | BatchOutcome::ProcessOccupied => {
-                report.skipped += rest.len();
-                true
+        let mut stack = vec![items];
+        while let Some(items) = stack.pop() {
+            let items: Vec<ScannedIntention> = items
+                .into_iter()
+                .filter(|i| {
+                    !self
+                        .state
+                        .submit
+                        .in_flight
+                        .contains(&out_point_key(&i.out_point))
+                })
+                .collect();
+            if items.len() < min as usize {
+                report.skipped += items.len();
+                continue;
             }
-            BatchOutcome::Submitted | BatchOutcome::Continue => {
-                self.isolate_window(process, rest, min, max, report, attempts, max_attempts)
-            }
-            BatchOutcome::Rejected => {
-                let mut drop_first = window[1..].to_vec();
-                drop_first.extend(rest);
-                if window.len() > min as usize {
-                    if self.isolate_window(
-                        process,
-                        window[..window.len() - 1].to_vec(),
-                        min,
-                        max,
-                        report,
+            let n = items.len().min(max as usize);
+            let window = items[..n].to_vec();
+            let rest = items[n..].to_vec();
+            let cached = self.window_combo_cached(&window, process);
+            let outcome = if cached {
+                tracing::debug!(
+                    target: LOG_TARGET,
+                    event = "submit.rejected_combo",
+                    n = window.len(),
+                );
+                BatchOutcome::CachedRejected
+            } else {
+                if *attempts >= max_attempts {
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        event = "tick.skip",
+                        reason = "reject_isolate_budget",
                         attempts,
-                        max_attempts,
-                    ) {
-                        return true;
+                    );
+                    report.skipped += items.len();
+                    for leftover in stack.drain(..) {
+                        report.skipped += leftover.len();
                     }
-                    self.isolate_window(
-                        process,
-                        drop_first,
-                        min,
-                        max,
-                        report,
-                        attempts,
-                        max_attempts,
-                    )
-                } else {
-                    report.skipped += 1;
-                    self.isolate_window(
-                        process,
-                        drop_first,
-                        min,
-                        max,
-                        report,
-                        attempts,
-                        max_attempts,
-                    )
+                    return false;
+                }
+                let outcome = self.process_batch(process, window.clone(), report);
+                // Charge new send/assemble work only. CachedRejected is a
+                // fingerprint hit (possibly after assemble chose refund).
+                if !matches!(outcome, BatchOutcome::CachedRejected) {
+                    *attempts += 1;
+                }
+                outcome
+            };
+            match outcome {
+                BatchOutcome::SubmittedProcess | BatchOutcome::ProcessOccupied => {
+                    report.skipped += rest.len();
+                    for leftover in stack.drain(..) {
+                        report.skipped += leftover.len();
+                    }
+                    return true;
+                }
+                BatchOutcome::Submitted | BatchOutcome::Continue => {
+                    if !rest.is_empty() {
+                        stack.push(rest);
+                    }
+                }
+                BatchOutcome::Rejected | BatchOutcome::CachedRejected => {
+                    let mut drop_first = window[1..].to_vec();
+                    drop_first.extend(rest);
+                    if window.len() > min as usize {
+                        if !drop_first.is_empty() {
+                            stack.push(drop_first);
+                        }
+                        stack.push(window[..window.len() - 1].to_vec());
+                    } else {
+                        report.skipped += 1;
+                        if !drop_first.is_empty() {
+                            stack.push(drop_first);
+                        }
+                    }
                 }
             }
         }
+        false
+    }
+
+    /// True when this Intention set was `SubmitRejected` as digest_ok with
+    /// this Process outpoint. Refund fingerprints omit Process and are
+    /// checked after assemble, once the SSRI path is known.
+    fn window_combo_cached(&self, batch: &[ScannedIntention], process: &ResolvedProcess) -> bool {
+        let ops: Vec<_> = batch.iter().map(|i| i.out_point.clone()).collect();
+        self.state
+            .submit
+            .rejected_combos
+            .contains(&combo_fingerprint(&ops, Some(&process.live_cell.out_point)))
     }
 
     fn process_batch(
@@ -469,6 +491,14 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
         batch: Vec<ScannedIntention>,
         report: &mut TickReport,
     ) -> BatchOutcome {
+        if self.window_combo_cached(&batch, process) {
+            tracing::debug!(
+                target: LOG_TARGET,
+                event = "submit.rejected_combo",
+                n = batch.len(),
+            );
+            return BatchOutcome::CachedRejected;
+        }
         let inputs: Vec<_> = batch.iter().map(to_intention_input).collect();
         let assembled = self.ssri.assemble(&process.binary, &inputs);
         let skeleton = match assembled {
@@ -565,7 +595,7 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                 event = "submit.rejected_combo",
                 n = batch.len(),
             );
-            return BatchOutcome::Rejected;
+            return BatchOutcome::CachedRejected;
         }
         let consumed: Vec<_> = skeleton
             .tx

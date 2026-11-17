@@ -62,11 +62,20 @@ written to `rejected`.
 
 **Combo isolation.** A `SubmitRejected` batch is recorded as a fingerprint of
 the Intention outpoints in order plus the Process outpoint if `digest_ok`
-spent it. The same combo is not submitted again until restart (or a new
-Process outpoint). Within the tick, the window is split into legal
-`[min, max]` sub-batches (shrink prefix; drop-first remainder) so a valid
-sibling can still submit when `min = 1`. At most 64 isolate attempts per
-bucket per tick.
+spent it (refunds omit Process). The same combo is not submitted again until
+restart (or a new Process outpoint). Within the tick, the window is split
+into legal `[min, max]` sub-batches (shrink prefix; drop-first remainder)
+so a valid sibling can still submit when `min = 1`.
+
+At most 64 **new** `send_transaction` attempts per bucket per tick. Hits on
+`rejected_combos` do not consume that budget. Before SSRI assemble, the
+digest_ok fingerprint (Intention outpoints plus this Process outpoint) is
+looked up; a hit skips assemble and submit. After assemble, the actual
+fingerprint is checked (digest_ok includes Process; User Lock refunds omit
+it) so a cached refund does not skip a digest_ok combo and vice versa.
+Cache hits still walk/split so later Intentions can be reached on a later
+tick. Isolation is iterative (no recursion on long prefixes). Remaining
+work after the new-attempt budget is left for the next tick.
 
 A singleton `{A, Process}` failure is **not** treated as proof that A is
 permanently invalid (`-302` / `-1102` / `-1108` may come from Process, lock,
@@ -115,4 +124,5 @@ Intentions again.
 | `pending.dropped` | Pending tx gone before we saw Committed |
 | `pending.reorg` | A previously committed/confirming tx is now Dropped |
 | `reorg.tip_rewind` | Tip height moved backwards |
+| `submit.rejected_combo` | Cached combo skipped without a new submit (`debug`) |
 | `submit.rejected` | Transaction-level send_transaction reject (`-302` / `-1102` / `-1108`); combo skipped, sub-batches may still run |
