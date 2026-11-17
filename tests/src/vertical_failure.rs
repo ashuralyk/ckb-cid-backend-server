@@ -286,4 +286,137 @@ mod tests {
             .iter()
             .any(|c| c.out_point == bad.out_point));
     }
+
+    #[test]
+    fn cached_reject_prefix_does_not_starve_later_valid_intention() {
+        let rpc = FakeRpc::new();
+        let ts = process_type_script(32);
+        let hash = script_hash32(&ts);
+        const POISON: u8 = 64;
+        let mut poison = Vec::new();
+        for fill in 1..=POISON {
+            let cell = intention_cell(fill, hash, 100_0000_0000);
+            rpc.reject_when_consuming(&cell.out_point);
+            rpc.insert_cell(cell.clone());
+            poison.push(cell);
+        }
+        let good = intention_cell(POISON + 1, hash, 110_0000_0000);
+        let proc = process_cell(32, 200_0000_0000, vec![0x7f, b'E', b'L', b'F', 32]);
+        rpc.insert_cell(good.clone());
+        rpc.insert_cell(proc.clone());
+        // Hold occupancy on the same Process so a recreate cannot mint a new
+        // combo and retry the poison prefix (that path is covered elsewhere).
+        rpc.defer_commit();
+        let mut loop_ = DigestLoop::new(
+            rpc,
+            NopClock,
+            ScriptedSsri::mimic((1, 1)),
+            cfg(),
+            ProcessResolver::new(),
+        );
+
+        let first = loop_.tick();
+        assert_eq!(first.submitted, 0, "budget stops at 64 poison combos");
+        assert_eq!(loop_.rpc().submit_attempts(), 64);
+
+        let second = loop_.tick();
+        assert_eq!(
+            second.submitted, 1,
+            "cached poison must not consume the next tick's new-attempt budget"
+        );
+        assert_eq!(loop_.rpc().submit_attempts(), 65);
+        assert_eq!(loop_.rpc().submitted().len(), 1);
+        assert_eq!(
+            loop_.rpc().submitted()[0]
+                .inputs()
+                .get(0)
+                .unwrap()
+                .previous_output(),
+            good.out_point
+        );
+        assert!(!loop_
+            .state()
+            .submit
+            .rejected
+            .contains(&out_point_key(&good.out_point)));
+        for cell in &poison {
+            assert!(!loop_.state().submit.pending_occupies(&cell.out_point));
+            assert!(!loop_
+                .state()
+                .submit
+                .rejected
+                .contains(&out_point_key(&cell.out_point)));
+        }
+        assert!(loop_.state().submit.pending_occupies(&good.out_point));
+
+        let attempts = loop_.rpc().submit_attempts();
+        let third = loop_.tick();
+        assert_eq!(third.submitted, 0);
+        assert_eq!(
+            loop_.rpc().submit_attempts(),
+            attempts,
+            "cached combos must not be resent"
+        );
+    }
+
+    #[test]
+    fn cached_reject_prefix_multi_bounds_reaches_valid_intention() {
+        let rpc = FakeRpc::new();
+        let ts = process_type_script(33);
+        let hash = script_hash32(&ts);
+        const POISON: u8 = 64;
+        for fill in 1..=POISON {
+            let cell = intention_cell(fill, hash, 100_0000_0000);
+            rpc.reject_when_consuming(&cell.out_point);
+            rpc.insert_cell(cell);
+        }
+        let good = intention_cell(POISON + 1, hash, 110_0000_0000);
+        let proc = process_cell(33, 200_0000_0000, vec![0x7f, b'E', b'L', b'F', 33]);
+        rpc.insert_cell(good.clone());
+        rpc.insert_cell(proc);
+        rpc.defer_commit();
+        let mut loop_ = DigestLoop::new(
+            rpc,
+            NopClock,
+            ScriptedSsri::mimic((1, 4)),
+            cfg(),
+            ProcessResolver::new(),
+        );
+
+        let mut saw_good = false;
+        for _ in 0..16 {
+            let _ = loop_.tick();
+            if loop_
+                .rpc()
+                .submitted()
+                .iter()
+                .any(|tx| tx.inputs().get(0).unwrap().previous_output() == good.out_point)
+            {
+                saw_good = true;
+                break;
+            }
+        }
+        assert!(
+            saw_good,
+            "valid B after a long (1,4) poison prefix must submit"
+        );
+        let attempts = loop_.rpc().submit_attempts();
+        assert!(
+            attempts > 64,
+            "isolation should try poison windows before B, got {attempts}"
+        );
+        let _ = loop_.tick();
+        let _ = loop_.tick();
+        assert_eq!(
+            loop_.rpc().submit_attempts(),
+            attempts,
+            "cached split-tree combos must not be resent"
+        );
+        assert!(!loop_
+            .state()
+            .submit
+            .rejected
+            .contains(&out_point_key(&good.out_point)));
+        assert!(loop_.state().submit.pending_occupies(&good.out_point));
+    }
 }
