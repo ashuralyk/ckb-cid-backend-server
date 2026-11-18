@@ -20,35 +20,35 @@ Isolated **dev** chain only. No testnet, mainnet, or public RPC.
 
 ## Run
 
+Default auto-download is **Linux x86_64** (`ckb_${version}_x86_64-unknown-linux-gnu.tar.gz`). Host tools: `curl`, `tar`, `python3`, `git`, `make`, plus `clang-18` (or `CLANG`) to build guests. If `$CKB_DIR/ckb` is already executable (default `CKB_DIR=.local-ckb`), the download is skipped — that is how macOS / ARM Linux should supply a matching `ckb` v0.119.0.
+
 ```bash
 ./scripts/local-dev-chain.sh
 ```
 
-The script downloads pinned `ckb`, inits `dev` with genesis miner lock, sets **`min_fee_rate = 0`** (D8: daemon never adds a fee input; without this the node rejects zero-fee txs), enables the Indexer RPC module, builds RISC-V guests, starts `ckb run` + `ckb miner` on `127.0.0.1:8114`, then runs:
-
-```bash
-CID_LOCAL_CHAIN_E2E=1 cargo test -p cid-backend-daemon --test local_chain_e2e -- --ignored --nocapture
-```
+The script inits `dev` with genesis miner lock, sets **`min_fee_rate = 0`** (D8: daemon never adds a fee input; without this the node rejects zero-fee txs), enables the Indexer RPC module, builds RISC-V guests, starts `ckb run` + `ckb miner` on `127.0.0.1:8114`, exports `CID_CKB_RPC_URL`, `CID_PROCESS_EXAMPLE_PATH`, `CID_LOCK_ELF_PATH`, `CID_ALWAYS_SUCCESS_PATH`, `CID_LOCAL_CHAIN_E2E=1`, then runs the ignored E2E. Setting only `CID_LOCAL_CHAIN_E2E=1` and invoking `cargo test` on a clean machine is **not** equivalent.
 
 Success prints `local-chain execution tx committed:` and `local-chain closure ok:`.
 
 ## Daemon env (production / local)
 
-| Variable | Required | Meaning |
-|----------|----------|---------|
-| `CID_CKB_RPC_URL` | yes | Node JSON-RPC |
-| `CID_INDEXER_URL` | no | Indexer JSON-RPC (default: node URL) |
-| `CID_LOCK_CODE_HASH` | yes | CID lock `code_hash` |
-| `CID_LOCK_HASH_TYPE` | no | `type` (default) / `data` / `data1` / `data2` |
-| `CID_POLL_INTERVAL_SECS` | yes | ≥ 1 |
-| `CID_LOCK_CELL_DEP` | local-chain | `<tx_hash>:<index>` CID lock code cell |
-| `CID_PROCESS_CODE_CELL_DEP` | local-chain | Process ELF code cell |
-| `CID_PROCESS_LOCK_CELL_DEP` | local-chain | always-success code cell |
-| `CID_PROCESS_CODE_HASH` | local-chain | Process ELF **data hash** used as indexer type-script prefix (CID args store `calc_script_hash`, not code hash) |
-| `CID_EXTRA_CELL_DEPS` | no | Extra `tx_hash:index` list |
-| `CID_HEALTH_BIND` | no | Opt-in health/stats HTTP (`docs/observability.md`) |
-| `CID_CONFIRMATION_DEPTH` | no | Blocks before a committed execution tx is settled (default 24; see `docs/confirmation.md`) |
-| `CID_LOG_FORMAT` / `RUST_LOG` | no | Structured logs (`docs/observability.md`) |
+| Variable | Config parser | Meaning |
+|----------|---------------|---------|
+| `CID_CKB_RPC_URL` | required | Node JSON-RPC |
+| `CID_INDEXER_URL` | optional | Indexer JSON-RPC (default: node URL) |
+| `CID_LOCK_CODE_HASH` | required | CID lock `code_hash` |
+| `CID_LOCK_HASH_TYPE` | optional | `type` (default) / `data` / `data1` / `data2` |
+| `CID_POLL_INTERVAL_SECS` | required | ≥ 1 |
+| `CID_LOCK_CELL_DEP` | optional; needed at run | `<tx_hash>:<index>` CID lock code cell (`DepType::Code`) |
+| `CID_PROCESS_CODE_CELL_DEP` | optional; needed at run | Process type code cell |
+| `CID_PROCESS_LOCK_CELL_DEP` | optional; needed at run | Process lock code cell (local-chain: always-success) |
+| `CID_PROCESS_CODE_HASH` | optional; needed at run | Process type script **code_hash** used as indexer type prefix (must match that type's `hash_type`; data1 local-chain uses ELF data hash). CID args store `calc_script_hash`, not this prefix |
+| `CID_EXTRA_CELL_DEPS` | optional | Extra `tx_hash:index` list |
+| `CID_HEALTH_BIND` | optional | Opt-in health/stats HTTP (`docs/observability.md`) |
+| `CID_CONFIRMATION_DEPTH` | optional | Blocks before a committed execution tx is settled (default 24; see `docs/confirmation.md`) |
+| `CID_LOG_FORMAT` / `RUST_LOG` | optional | Structured logs (`docs/observability.md`) |
+
+`assemble` uses `extra_cell_deps` as-is and does not auto-fill script deps. `CkbRpc` always uses `CID_PROCESS_CODE_HASH` as a type-script prefix, then filters `calc_script_hash`; the args hash alone is usually not a usable prefix.
 
 State is memory-only. Restarting the daemon drops in-flight occupancy and full-rescans indexer `asc`.
 
@@ -57,4 +57,4 @@ State is memory-only. Restarting the daemon drops in-flight occupancy and full-r
 - **`min_fee_rate = 0`** on the node. The digest tx has no extra fee input (D8).
 - Process cell **data is the RISC-V ELF** so `ProcessResolver` (D4) can SSRI it; the same ELF is also a code cell so the Process **type** script can execute (`hash_type = data1`).
 - Process **lock** is always-success so the daemon does not hold secp keys (no post-Intention signatures).
-- Lookup of live Process cells uses `CID_PROCESS_CODE_HASH` + indexer type prefix, then filters `calc_script_hash`.
+- Lookup of live Process cells uses `CID_PROCESS_CODE_HASH` as the Process type's `code_hash` indexer prefix, then filters `calc_script_hash`. On this local chain that prefix is the Process ELF data hash because the type uses `hash_type = data1`.
