@@ -7,7 +7,8 @@ rejected combos. The next tick is a full indexer rescan.
 ## Confirmation depth
 
 A `Committed` execution tx is **not** settled on first sight. Occupancy
-(Process + Intention `in_flight` / `pending`) stays held until:
+(Process + Intention `in_flight` / `pending`) stays held until the
+committed height is still canonical **and**:
 
 ```
 confirmations = 0                    if tip < commit_block
@@ -23,6 +24,13 @@ confirmations >= CID_CONFIRMATION_DEPTH
 use `1` so existing FakeRpc verticals keep settling on first `Committed` at the
 tip. The ignored local-chain E2E uses `1` as well.
 
+Before settling, the loop re-reads the tip after `get_transaction_status`
+returns `Committed`. If that tip query fails, the tip rewound relative to
+the start of the tick, or `tip < commit_block`, occupancy is kept
+(Unavailable-style) and no further digest_ok is attempted for that Process
+this tick. Settlement waits until a later tick where the committed block is
+still at sufficient depth.
+
 While confirming, occupancy covers both the spent inputs **and** the tx's
 outputs (the Process recreate). A later `digest_ok` that would spend that
 recreate is skipped until settlement (`process_occupied`). Incompatible User
@@ -33,6 +41,7 @@ Lock refunds still submit; they do not spend Process.
 | Observation | Action |
 |-------------|--------|
 | Tip rewinds (`tip < last_tip`) | Log `reorg.tip_rewind`. Confirmation count drops. Occupancy stays held until depth is met again. |
+| Tip rewinds while reading a Committed status (stale start-of-tick tip, or `tip < commit height`) | Re-read tip before settling. Keep occupancy this tick (`pending.tip_rewind` / confirming). Do not settle against the stale height. |
 | Confirming or committed tx becomes `Dropped` | Log `pending.reorg` (if we had seen Committed) or `pending.dropped`. Release occupancy. If cells are live, the next tick retries. |
 | Status or tip RPC unavailable | Keep occupancy. Do not settle. |
 
@@ -68,8 +77,17 @@ into legal `[min, max]` sub-batches (shrink prefix; drop-first remainder)
 so a valid sibling can still submit when `min = 1`.
 
 At most 64 **new** `send_transaction` or assemble-skip attempts per bucket
-per tick (cached `rejected_combos` hits do not consume that budget). Before
-SSRI assemble, the digest_ok fingerprint (Intention outpoints plus this
+per tick (cached `rejected_combos` hits do not consume that budget). A
+separate cap of 256 **cached splits** per bucket per tick bounds diamond
+re-expansion of already-rejected windows; it does not replace the send
+cap. Each window fingerprint is expanded at most once per isolate sweep
+(memory-only `isolate_expanded`). When either budget cuts the tick, that
+set is kept with the resume cursor so the next tick continues remaining
+unique windows instead of re-walking the tree from the ASC head (which
+would starve a later valid B). The set is dropped when the sweep
+completes, and on restart.
+
+Before SSRI assemble, the digest_ok fingerprint (Intention outpoints plus this
 Process outpoint) is looked up; a hit skips assemble and submit. After
 assemble, the actual fingerprint is checked (digest_ok includes Process;
 User Lock refunds omit it) so a cached refund does not skip a digest_ok
@@ -134,5 +152,6 @@ Intentions again.
 | `pending.dropped` | Pending tx gone before we saw Committed |
 | `pending.reorg` | A previously committed/confirming tx is now Dropped |
 | `reorg.tip_rewind` | Tip height moved backwards |
+| `pending.tip_rewind` | Committed status observed a tip rewind; occupancy kept this tick |
 | `submit.rejected_combo` | Cached combo skipped without a new submit (`debug`) |
 | `submit.rejected` | Transaction-level send_transaction reject (`-302` / `-1102` / `-1108`); combo skipped, sub-batches may still run |
