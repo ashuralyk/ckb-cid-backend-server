@@ -1,8 +1,8 @@
+use cid_backend_core::rpc::LiveCell;
+use cid_protocol::{CidArgs, Payload, Script as CidScript};
 use ckb_types::core::ScriptHashType;
 use ckb_types::packed::{Byte32, CellOutput, OutPoint, Script};
 use ckb_types::prelude::*;
-use cid_backend_core::rpc::LiveCell;
-use cid_protocol::{CidArgs, Payload, Script as CidScript};
 
 pub const CID_CODE: [u8; 32] = [0xC1; 32];
 
@@ -53,14 +53,16 @@ pub fn process_type_script(unique: u8) -> Script {
     lock_script([0x51; 32], ScriptHashType::Type, vec![unique; 32])
 }
 
+/// Process state type script bound to a Type-ID–deployed Process **code**
+/// (`hash_type=type`, `code_hash` = derived TYPE_ID script hash).
+pub fn process_type_script_for_code(code_hash: [u8; 32], unique: u8) -> Script {
+    lock_script(code_hash, ScriptHashType::Type, vec![unique; 32])
+}
+
 pub fn cid_lock_args(process_type_hash: [u8; 32]) -> Vec<u8> {
-    CidArgs::new(
-        process_type_hash,
-        user_lock(),
-        Payload { data: vec![0xAA] },
-    )
-    .encode()
-    .unwrap()
+    CidArgs::new(process_type_hash, user_lock(), Payload { data: vec![0xAA] })
+        .encode()
+        .unwrap()
 }
 
 pub fn intention_cell(fill: u8, process_type_hash: [u8; 32], capacity: u64) -> LiveCell {
@@ -82,6 +84,21 @@ pub fn process_cell(unique: u8, capacity: u64, data: Vec<u8>) -> LiveCell {
         out_point(0x50, unique as u32),
         lock_script([0u8; 32], ScriptHashType::Type, vec![]),
         Some(process_type_script(unique)),
+        capacity,
+        data,
+    )
+}
+
+pub fn process_cell_for_code(
+    unique: u8,
+    capacity: u64,
+    data: Vec<u8>,
+    code_hash: [u8; 32],
+) -> LiveCell {
+    live_cell(
+        out_point(0x50, unique as u32),
+        lock_script([0u8; 32], ScriptHashType::Type, vec![]),
+        Some(process_type_script_for_code(code_hash, unique)),
         capacity,
         data,
     )

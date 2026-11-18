@@ -4,15 +4,20 @@ mod tests {
 
     use cid_backend_core::code_deps::PROCESS_CODE_LABEL;
     use cid_backend_core::digest_loop::{DigestLoop, LoopConfig, NopClock};
-    use cid_backend_core::process::{ProcessResolver, SsriBinarySource};
+    use cid_backend_core::process::ProcessResolver;
     use cid_backend_core::rpc::{out_point_key, script_hash32};
-    use cid_backend_core::type_id::{type_id_script, TypeIdCodeDep, TypeIdIdentity};
+    use cid_backend_core::type_id::{
+        type_id_script, type_id_script_hash, TypeIdCodeDep, TypeIdIdentity,
+    };
     use ckb_types::core::{DepType, ScriptHashType};
     use ckb_types::packed::{Byte32, CellDep, CellOutput, OutPoint, Script};
     use ckb_types::prelude::*;
 
     use crate::fake_rpc::FakeRpc;
-    use crate::helpers::{intention_cell, process_cell, process_type_script, CID_CODE};
+    use crate::helpers::{
+        intention_cell, process_cell, process_cell_for_code, process_type_script,
+        process_type_script_for_code, CID_CODE,
+    };
     use crate::scripted_ssri::ScriptedSsri;
 
     fn code_cell(tx_byte: u8, args: [u8; 32], data: Vec<u8>) -> cid_backend_core::rpc::LiveCell {
@@ -48,8 +53,21 @@ mod tests {
         }
     }
 
-    fn process_code_resolver() -> ProcessResolver {
-        ProcessResolver::with_ssri_source(SsriBinarySource::TypeIdCodeCell)
+    fn process_code_resolver(args: [u8; 32]) -> ProcessResolver {
+        ProcessResolver::with_type_id_process_code(type_id_script_hash(&args))
+    }
+
+    fn process_for_type_id(
+        unique: u8,
+        capacity: u64,
+        data: Vec<u8>,
+        code_args: [u8; 32],
+    ) -> ([u8; 32], cid_backend_core::rpc::LiveCell) {
+        let code_hash = type_id_script_hash(&code_args);
+        let ts = process_type_script_for_code(code_hash, unique);
+        let hash = script_hash32(&ts);
+        let cell = process_cell_for_code(unique, capacity, data, code_hash);
+        (hash, cell)
     }
 
     #[test]
@@ -93,13 +111,11 @@ mod tests {
     fn type_id_outpoint_change_between_ticks_uses_new_dep() {
         let args = [0xa2; 32];
         let rpc = FakeRpc::new();
-        let ts = process_type_script(2);
-        let hash = script_hash32(&ts);
+        let (hash, proc) = process_for_type_id(2, 200_0000_0000, vec![0x00], args);
         let intent = intention_cell(2, hash, 100_0000_0000);
-        let proc = process_cell(2, 200_0000_0000, vec![0x7f, b'E', b'L', b'F', 2]);
         let code_v1 = code_cell(0x21, args, vec![0x7f, b'E', b'L', b'F', 1]);
         rpc.insert_cell(intent.clone());
-        rpc.insert_cell(proc.clone());
+        rpc.insert_cell(proc);
         rpc.insert_cell(code_v1.clone());
 
         let mut loop_ = DigestLoop::new(
@@ -113,7 +129,7 @@ mod tests {
                 }],
                 vec![],
             ),
-            process_code_resolver(),
+            process_code_resolver(args),
         );
         assert_eq!(
             loop_.tick().submitted,
@@ -126,9 +142,10 @@ mod tests {
         loop_.rpc().consume(&code_v1.out_point);
         let code_v2 = code_cell(0x22, args, vec![0x7f, b'E', b'L', b'F', 2]);
         loop_.rpc().insert_cell(code_v2.clone());
-        let intent2 = intention_cell(3, hash, 100_0000_0000);
-        let proc2 = process_cell(3, 200_0000_0000, vec![0x00]);
-        loop_.rpc().insert_cell(intent2);
+        let (hash2, proc2) = process_for_type_id(3, 200_0000_0000, vec![0x00], args);
+        loop_
+            .rpc()
+            .insert_cell(intention_cell(3, hash2, 100_0000_0000));
         loop_.rpc().insert_cell(proc2);
 
         assert_eq!(loop_.tick().submitted, 1);
@@ -389,10 +406,9 @@ mod tests {
         let state_elf = vec![0x7f, b'E', b'L', b'F', 0xAA];
         let code_elf = vec![0x7f, b'E', b'L', b'F', 0xBB];
         let rpc = FakeRpc::new();
-        let ts = process_type_script(13);
-        let hash = script_hash32(&ts);
+        let (hash, proc) = process_for_type_id(13, 200_0000_0000, state_elf.clone(), args);
         rpc.insert_cell(intention_cell(13, hash, 100_0000_0000));
-        rpc.insert_cell(process_cell(13, 200_0000_0000, state_elf.clone()));
+        rpc.insert_cell(proc);
         let code = code_cell(0x72, args, code_elf.clone());
         rpc.insert_cell(code.clone());
 
@@ -408,7 +424,7 @@ mod tests {
                 }],
                 vec![],
             ),
-            process_code_resolver(),
+            process_code_resolver(args),
         );
         let report = loop_.tick();
         assert_eq!(report.submitted, 1, "{:?}", report.last_error);
@@ -430,11 +446,9 @@ mod tests {
     fn process_code_upgrade_changes_ssri_binary_and_cell_dep() {
         let args = [0xb3; 32];
         let rpc = FakeRpc::new();
-        let ts = process_type_script(14);
-        let hash = script_hash32(&ts);
+        let (hash, proc) = process_for_type_id(14, 200_0000_0000, vec![0x00], args);
         rpc.insert_cell(intention_cell(14, hash, 100_0000_0000));
-        // Non-ELF state: Type-ID mode must not fall back to state data.
-        rpc.insert_cell(process_cell(14, 200_0000_0000, vec![0x00]));
+        rpc.insert_cell(proc);
         let code_v1 = code_cell(0x73, args, vec![0x7f, b'E', b'L', b'F', 0x01]);
         rpc.insert_cell(code_v1.clone());
 
@@ -450,7 +464,7 @@ mod tests {
                 }],
                 vec![],
             ),
-            process_code_resolver(),
+            process_code_resolver(args),
         );
         assert_eq!(loop_.tick().submitted, 1);
         assert!(loop_
@@ -463,12 +477,11 @@ mod tests {
         loop_.rpc().consume(&code_v1.out_point);
         let code_v2 = code_cell(0x74, args, vec![0x7f, b'E', b'L', b'F', 0x02]);
         loop_.rpc().insert_cell(code_v2.clone());
+        let (hash2, proc2) = process_for_type_id(15, 200_0000_0000, vec![0x00], args);
         loop_
             .rpc()
-            .insert_cell(intention_cell(15, hash, 100_0000_0000));
-        loop_
-            .rpc()
-            .insert_cell(process_cell(15, 200_0000_0000, vec![0x00]));
+            .insert_cell(intention_cell(15, hash2, 100_0000_0000));
+        loop_.rpc().insert_cell(proc2);
         loop_.ssri().seen_binaries.borrow_mut().clear();
 
         assert_eq!(loop_.tick().submitted, 1);
@@ -486,6 +499,103 @@ mod tests {
                 .out_point(),
             code_v2.out_point
         );
+    }
+
+    /// Rejected combo under old Process code must retry after Type-ID code upgrade;
+    /// unchanged code must keep the combo cached (no duplicate submit).
+    #[test]
+    fn rejected_combo_retries_after_process_code_upgrade_not_under_same_code() {
+        let args = [0xb5; 32];
+        let rpc = FakeRpc::new();
+        let (hash, proc) = process_for_type_id(17, 200_0000_0000, vec![0x00], args);
+        let intent = intention_cell(17, hash, 100_0000_0000);
+        rpc.insert_cell(intent.clone());
+        rpc.insert_cell(proc);
+        let code_v1 = code_cell(0x76, args, vec![0x7f, b'E', b'L', b'F', 0x01]);
+        rpc.insert_cell(code_v1.clone());
+
+        let mut loop_ = DigestLoop::new(
+            rpc,
+            NopClock,
+            ScriptedSsri::mimic((1, 1)),
+            cfg(
+                vec![TypeIdCodeDep {
+                    label: PROCESS_CODE_LABEL.into(),
+                    identity: TypeIdIdentity::new(args),
+                }],
+                vec![],
+            ),
+            process_code_resolver(args),
+        );
+        loop_.rpc().inject_reject_once();
+        let rejected = loop_.tick();
+        assert_eq!(rejected.submitted, 0);
+        assert_eq!(loop_.state().submit.rejected_combos.len(), 1);
+        assert_eq!(loop_.rpc().submit_attempts(), 1);
+
+        // Same code snapshot: cached reject, no new send.
+        let cached = loop_.tick();
+        assert_eq!(cached.submitted, 0);
+        assert_eq!(loop_.rpc().submit_attempts(), 1);
+        assert!(loop_.rpc().has_cell(&intent.out_point));
+
+        // Upgrade Process code outpoint/ELF; same state + Intention.
+        loop_.rpc().consume(&code_v1.out_point);
+        let code_v2 = code_cell(0x77, args, vec![0x7f, b'E', b'L', b'F', 0x02]);
+        loop_.rpc().insert_cell(code_v2.clone());
+        let after_upgrade = loop_.tick();
+        assert_eq!(
+            after_upgrade.submitted, 1,
+            "new code identity must allow retry; err={:?}",
+            after_upgrade.last_error
+        );
+        assert_eq!(loop_.rpc().submit_attempts(), 2);
+        assert_eq!(
+            loop_.rpc().submitted()[0]
+                .cell_deps()
+                .get(0)
+                .unwrap()
+                .out_point(),
+            code_v2.out_point
+        );
+    }
+
+    /// Process state type script must bind to derived Process code TYPE_ID.
+    #[test]
+    fn process_state_wrong_code_hash_skips_without_poison() {
+        let args = [0xb6; 32];
+        let rpc = FakeRpc::new();
+        // Legacy helper: type code_hash = [0x51;32] ≠ derived Type-ID.
+        let ts = process_type_script(18);
+        let hash = script_hash32(&ts);
+        let intent = intention_cell(18, hash, 100_0000_0000);
+        rpc.insert_cell(intent.clone());
+        rpc.insert_cell(process_cell(18, 200_0000_0000, vec![0x00]));
+        rpc.insert_cell(code_cell(0x78, args, vec![0x7f, b'E', b'L', b'F', 1]));
+
+        let mut loop_ = DigestLoop::new(
+            rpc,
+            NopClock,
+            ScriptedSsri::mimic((1, 4)),
+            cfg(
+                vec![TypeIdCodeDep {
+                    label: PROCESS_CODE_LABEL.into(),
+                    identity: TypeIdIdentity::new(args),
+                }],
+                vec![],
+            ),
+            process_code_resolver(args),
+        );
+        let report = loop_.tick();
+        assert_eq!(report.submitted, 0);
+        assert!(report.skipped >= 1 || report.scanned >= 1);
+        assert!(loop_.state().submit.rejected_combos.is_empty());
+        assert!(!loop_
+            .state()
+            .submit
+            .rejected
+            .contains(&out_point_key(&intent.out_point)));
+        assert!(loop_.rpc().has_cell(&intent.out_point));
     }
 
     /// Regression #3: same outpoint, conflicting dep_type fails closed (no submit).

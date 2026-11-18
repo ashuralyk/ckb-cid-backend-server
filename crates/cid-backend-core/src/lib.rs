@@ -24,7 +24,7 @@ pub use process::{ProcessResolver, ResolvedProcess, SsriBinarySource};
 pub use rpc::{out_point_key, script_hash32, LiveCell, Rpc, RpcError, TxStatus};
 pub use scan::{bucket_by_process_type_hash, decode_cells, scan_intentions, ScannedIntention};
 pub use ssri::{map_executor_error, to_intention_input, EmbeddedSsri, SsriError, SsriHost};
-pub use submit::{submit_execution, PendingTx, SubmitState};
+pub use submit::{combo_fingerprint, execution_code_key, submit_execution, PendingTx, SubmitState};
 pub use type_id::{
     type_id_script, type_id_script_hash, TypeIdCodeDep, TypeIdIdentity, TYPE_ID_CODE_HASH,
 };
