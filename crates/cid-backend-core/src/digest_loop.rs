@@ -1,5 +1,6 @@
 use crate::assemble::{assemble_digest_incompatible, assemble_digest_ok, AssembleError};
 use crate::code_deps::{resolve_execution_cell_deps, CodeDepError};
+use crate::fee::RefundFeeMode;
 use crate::process::{ProcessResolver, ResolvedProcess};
 use crate::rpc::{out_point_key, Rpc, RpcError, TxStatus};
 use crate::scan::{bucket_by_process_type_hash, scan_intentions, ScannedIntention};
@@ -39,8 +40,16 @@ pub struct LoopConfig {
     /// tip. Daemon default is [`DEFAULT_CONFIRMATION_DEPTH`].
     pub confirmation_depth: u64,
     /// Shannons per 1000 bytes (KW) charged on `digest_ok` by reducing the
-    /// Process recreate capacity. Default [`crate::fee::DEFAULT_FEE_RATE`].
+    /// Process recreate capacity, and on bounded Incompatible refunds when
+    /// [`Self::bounded_refund_fee`] is enabled. Default
+    /// [`crate::fee::DEFAULT_FEE_RATE`].
     pub fee_rate: u64,
+    /// When true, Incompatible User Lock refunds may burn ≤ `MAX_REFUND_FEE`
+    /// per Intention to fund the miner fee (requires OWNER-redeployed CID
+    /// lock that accepts the window). Default **false** — legacy exact
+    /// refund for currently deployed locks. Never enable against an
+    /// undeployed / unreviewed candidate hash in production.
+    pub bounded_refund_fee: bool,
 }
 
 /// Conservative default: 24 CKB blocks (~3 minutes at ~8s). Overridable via
@@ -800,11 +809,22 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                     event = "ssri.incompatible",
                     code,
                 );
-                match assemble_digest_incompatible(&batch, &self.state.tick_cell_deps) {
+                let refund_mode = if self.config.bounded_refund_fee {
+                    RefundFeeMode::Bounded
+                } else {
+                    RefundFeeMode::Exact
+                };
+                match assemble_digest_incompatible(
+                    &batch,
+                    &self.state.tick_cell_deps,
+                    refund_mode,
+                    self.config.fee_rate,
+                ) {
                     Ok(s) => {
-                        // Known public-net gap: refund txs pay fee 0 (exact
-                        // User Lock capacity; Process not spent). Nodes with
-                        // min_fee_rate > 0 reject them (-1104). Not fixed here.
+                        // Exact mode: fee 0 (legacy deployments; public nodes
+                        // with min_fee_rate > 0 reject -1104). Bounded mode:
+                        // fee funded from refund capacity cuts only — still
+                        // never spends Process; never co-bundles DigestOk.
                         let out_sum: u64 =
                             s.tx.outputs()
                                 .into_iter()
@@ -821,8 +841,9 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                             code,
                             path = "user_lock",
                             fee,
+                            bounded = self.config.bounded_refund_fee,
                         );
-                        if fee == 0 {
+                        if fee == 0 && !self.config.bounded_refund_fee {
                             tracing::warn!(
                                 target: LOG_TARGET,
                                 event = "refund.zero_fee",
@@ -833,6 +854,26 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                             );
                         }
                         s
+                    }
+                    Err(AssembleError::RefundFeeUnaffordable {
+                        fee,
+                        budget,
+                        tx_size,
+                        fee_rate,
+                        n,
+                    }) => {
+                        tracing::warn!(
+                            target: LOG_TARGET,
+                            event = "tick.skip",
+                            reason = "refund_fee_unaffordable",
+                            fee,
+                            budget,
+                            tx_size,
+                            fee_rate,
+                            n,
+                        );
+                        report.skipped += batch.len();
+                        return BatchOutcome::Continue;
                     }
                     Err(e) => {
                         tracing::warn!(

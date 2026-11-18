@@ -37,6 +37,11 @@ type_id = "<CID_LOCK_TYPE_ID_FULL_HASH_32>"   # optional verify; must match deri
 # Legacy / local data1 fixtures (no Type-ID discovery for this role):
 # code_hash = "<CID_LOCK_CODE_HASH_32>"
 # hash_type = "data1"
+# Bounded Incompatible refund fee (≤ 0.01 CKB / Intention). Default false =
+# exact refund for currently deployed locks. Enable ONLY after OWNER redeploy
+# of a lock that accepts the window; never against an undeployed candidate.
+# See docs/refund-fee-migration.md. Contract candidate is not final.
+# bounded_refund_fee = false
 
 [process]
 # Process CODE cell Type ID (not the live Process state cell).

@@ -22,6 +22,10 @@ mod tests {
     use crate::scripted_ssri::ScriptedSsri;
 
     fn cfg(fee_rate: u64) -> LoopConfig {
+        cfg_mode(fee_rate, false)
+    }
+
+    fn cfg_mode(fee_rate: u64, bounded_refund_fee: bool) -> LoopConfig {
         LoopConfig {
             cid_code_hash: CID_CODE,
             hash_type: ScriptHashType::Type,
@@ -30,6 +34,7 @@ mod tests {
             type_id_code_deps: vec![],
             confirmation_depth: 1,
             fee_rate,
+            bounded_refund_fee,
         }
     }
 
@@ -106,8 +111,8 @@ mod tests {
 
     #[test]
     fn incompatible_refund_keeps_exact_capacity_no_process_fee() {
-        // Known public-net gap: refund path does not spend Process; contract
-        // exact User Lock capacity ⇒ fee 0 (not fixed by loop.fee_rate).
+        // Legacy default: exact User Lock capacity ⇒ fee 0. Never auto-haircut
+        // without explicit bounded_refund_fee (existing deployments).
         let rpc = FakeRpc::new();
         let ts = process_type_script(3);
         let hash = script_hash32(&ts);
@@ -132,6 +137,7 @@ mod tests {
         assert_eq!(cap, intent_cap, "refund not reduced for fee");
         let code: [u8; 32] = tx.outputs().get(0).unwrap().lock().code_hash().unpack();
         assert_eq!(code, user_lock().code_hash);
+        assert!(tx.header_deps().is_empty(), "not TimeoutBurn");
         assert!(
             loop_
                 .rpc()
@@ -140,6 +146,69 @@ mod tests {
                 .any(|c| c.out_point == proc_op),
             "Process stays live on refund path"
         );
+    }
+
+    #[test]
+    fn incompatible_bounded_refund_pays_fee_without_process() {
+        let rpc = FakeRpc::new();
+        let ts = process_type_script(13);
+        let hash = script_hash32(&ts);
+        let intent_cap = 100_0000_0000u64;
+        let proc = process_cell(13, 200_0000_0000, vec![0x7f, b'E', b'L', b'F', 13]);
+        let proc_op = proc.out_point.clone();
+        rpc.insert_cell(intention_cell(1, hash, intent_cap));
+        rpc.insert_cell(proc);
+
+        let mut loop_ = DigestLoop::new(
+            rpc,
+            NopClock,
+            ScriptedSsri::incompatible(21),
+            cfg_mode(DEFAULT_FEE_RATE, true),
+            ProcessResolver::new(),
+        );
+        assert_eq!(loop_.tick().submitted, 1);
+        let tx = &loop_.rpc().submitted()[0];
+        assert_eq!(tx.inputs().len(), 1, "no Process; no DigestOk co-bundle");
+        assert_eq!(tx.outputs().len(), 1, "no siphon output");
+        assert!(tx.header_deps().is_empty(), "TimeoutBurn stays out of loop");
+        let cap: u64 = tx.outputs().get(0).unwrap().capacity().unpack();
+        let paid = intent_cap - cap;
+        let need = fee_for_size(tx_size_in_block(tx), DEFAULT_FEE_RATE);
+        assert_eq!(paid, need);
+        assert!(paid > 0);
+        assert!(
+            loop_
+                .rpc()
+                .live_cells()
+                .iter()
+                .any(|c| c.out_point == proc_op),
+            "Process stays live"
+        );
+    }
+
+    #[test]
+    fn incompatible_bounded_batch_fee_equals_sum_of_cuts() {
+        let rpc = FakeRpc::new();
+        let ts = process_type_script(14);
+        let hash = script_hash32(&ts);
+        rpc.insert_cell(process_cell(14, 200_0000_0000, vec![0x7f, b'E', b'L', b'F', 14]));
+        rpc.insert_cell(intention_cell(1, hash, 100_0000_0000));
+        rpc.insert_cell(intention_cell(2, hash, 100_0000_0000));
+
+        let mut loop_ = DigestLoop::new(
+            rpc,
+            NopClock,
+            ScriptedSsri::incompatible(21),
+            cfg_mode(DEFAULT_FEE_RATE, true),
+            ProcessResolver::new(),
+        );
+        assert_eq!(loop_.tick().submitted, 1);
+        let tx = &loop_.rpc().submitted()[0];
+        assert_eq!(tx.inputs().len(), 2);
+        assert_eq!(tx.outputs().len(), 2);
+        let caps = output_caps(tx);
+        let paid = 200_0000_0000u64 - caps[0] - caps[1];
+        assert_eq!(paid, fee_for_size(tx_size_in_block(tx), DEFAULT_FEE_RATE));
     }
 
     #[test]

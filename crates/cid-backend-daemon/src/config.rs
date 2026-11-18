@@ -33,6 +33,12 @@ pub struct DaemonConfig {
     /// Shannons per 1000 bytes (KW) for digest_ok fee from Process recreate.
     /// Default [`cid_backend_core::DEFAULT_FEE_RATE`].
     pub fee_rate: u64,
+    /// Explicit opt-in for bounded Incompatible refund fee cuts (≤
+    /// `MAX_REFUND_FEE` per Intention). Default **false** — legacy exact
+    /// refund for currently deployed CID locks. Enable only for an
+    /// OWNER-redeployed lock hash that accepts the window; do not point
+    /// testnet `code_hash` at an undeployed candidate.
+    pub bounded_refund_fee: bool,
     /// Human label for logs only. Never used to select RPC or contracts.
     pub network_name: Option<String>,
     /// Declared genesis block hash. File mode requires it. Not verified unless
@@ -121,6 +127,7 @@ impl DaemonConfig {
             type_id_code_deps: self.type_id_code_deps.clone(),
             confirmation_depth: self.confirmation_depth,
             fee_rate: self.fee_rate,
+            bounded_refund_fee: self.bounded_refund_fee,
         }
     }
 }
@@ -241,6 +248,10 @@ struct CidLockSection {
     /// Optional full type-script hash for fail-closed check. Not args.
     #[serde(default)]
     type_id: Option<String>,
+    /// Explicit protocol capability: allow bounded refund fee haircut for
+    /// this CID lock deployment. Default false (legacy exact refund).
+    #[serde(default)]
+    bounded_refund_fee: Option<bool>,
 }
 
 #[derive(Default, Deserialize)]
@@ -615,6 +626,11 @@ fn merge<F: Fn(&str) -> Option<String>>(
             None => DEFAULT_FEE_RATE,
         },
     };
+    // Capability gate: default legacy exact refund. Env overrides TOML.
+    let bounded_refund_fee = match nonempty(&get, "CID_BOUNDED_REFUND_FEE") {
+        Some(s) => parse_bool_flag(&s, "CID_BOUNDED_REFUND_FEE")?,
+        None => cid_lock.bounded_refund_fee.unwrap_or(false),
+    };
 
     let network_name = network.name.filter(|s| !s.trim().is_empty());
 
@@ -659,6 +675,7 @@ fn merge<F: Fn(&str) -> Option<String>>(
         health_bind,
         confirmation_depth,
         fee_rate,
+        bounded_refund_fee,
         network_name,
         genesis_hash,
         validate_genesis,
@@ -966,6 +983,11 @@ log_format = "pretty"
         assert!(cfg.health_bind.is_none());
         assert_eq!(cfg.confirmation_depth, DEFAULT_CONFIRMATION_DEPTH);
         assert_eq!(cfg.fee_rate, DEFAULT_FEE_RATE);
+        assert!(
+            !cfg.bounded_refund_fee,
+            "legacy exact refund must remain the default"
+        );
+        assert!(!cfg.to_loop_config().bounded_refund_fee);
         assert!(cfg.genesis_hash.is_none());
         assert!(!cfg.validate_genesis);
         assert_eq!(cfg.log_format, LogFormat::Json);
@@ -987,6 +1009,29 @@ log_format = "pretty"
         })
         .unwrap();
         assert_eq!(cfg.fee_rate, 4000);
+    }
+
+    #[test]
+    fn bounded_refund_fee_defaults_false_toml_and_env() {
+        let path = write_toml(&minimal_toml());
+        let cfg = DaemonConfig::from_file_and_vars(Some(&path), |_| None).unwrap();
+        assert!(!cfg.bounded_refund_fee);
+
+        let path = write_toml(&minimal_toml().replace(
+            "[cid_lock]",
+            "[cid_lock]\nbounded_refund_fee = true",
+        ));
+        let cfg = DaemonConfig::from_file_and_vars(Some(&path), |_| None).unwrap();
+        assert!(cfg.bounded_refund_fee);
+        assert!(cfg.to_loop_config().bounded_refund_fee);
+
+        // Env overrides TOML.
+        let cfg = DaemonConfig::from_file_and_vars(Some(&path), |k| match k {
+            "CID_BOUNDED_REFUND_FEE" => Some("false".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert!(!cfg.bounded_refund_fee);
     }
 
     #[test]

@@ -22,8 +22,9 @@ pub use digest_loop::{
     DEFAULT_CONFIRMATION_DEPTH,
 };
 pub use fee::{
-    fee_for_size, process_min_capacity, required_fee, tx_size_in_block, DEFAULT_FEE_RATE,
-    MAX_FEE_RATE,
+    allocate_refund_fee_cuts, cell_occupied_capacity, fee_for_size, process_min_capacity,
+    refund_capacity_allowed, refund_fee_budget, required_fee, tx_size_in_block, RefundFeeMode,
+    DEFAULT_FEE_RATE, MAX_FEE_RATE, MAX_REFUND_FEE,
 };
 pub use process::{ProcessResolver, ResolvedProcess, SsriBinarySource};
 pub use rpc::{out_point_key, script_hash32, LiveCell, Rpc, RpcError, TxStatus};

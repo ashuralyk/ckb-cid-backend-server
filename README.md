@@ -27,8 +27,11 @@ The daemon continuously digests CID Intentions:
 4. In-process SSRI: `Process.batch` yields `[min, max]`; `Process.assemble` yields a partial tx.
 5. Assemble an Execution Tx and `send_transaction`:
    - **`digest_ok`**: destroy this batch of Intentions; Process **1 in / 1 out** recreate. No extra fee / sponsor input; fee is `ceil(serialized_size_in_block * loop.fee_rate / 1000)` deducted from the Process recreate (default rate 1000). User Lock is not placed in inputs (no signature after Intention creation). Skip on capacity shortfall; on fee-unaffordable, isolate/shrink the batch window (non-permanent).
-   - **`digest_incompatible`**: when SSRI returns `Incompatible(code)`, refund to the **User Lock** in args (does not spend Process). Exact **capacity** is copied, and original cell **data** is kept. Supported assets: pure CKB (no type script), or **standard xUDT** (official Data1 `XUDT_CODE_HASH` + 16-byte amount) which also keeps the type script. Any other type script, or xUDT data that is not 16 bytes, is `RefundUnbuildable`: log and skip. See `assemble.rs::refund_output`.
-   - **Known public-net gap (not fixed):** Incompatible refunds pay **fee 0** (exact User Lock capacity; Process not spent — contracts `DigestIncompatible` / `refund_assets_match`). Public nodes with `min_fee_rate > 0` reject them (`-1104`). The daemon logs `refund.zero_fee`; local-dev uses `min_fee_rate = 0`.
+   - **`digest_incompatible`**: when SSRI returns `Incompatible(code)`, refund to the **User Lock** in args (**does not spend Process**; never co-bundles DigestOk / Process I/O — Process example `verify.rs` requires exact capacity when mixed with DigestOk). Original cell **data** / type / lock are kept. Supported assets: pure CKB (no type script), or **standard xUDT** (official Data1 `XUDT_CODE_HASH` + 16-byte amount). Any other type script, or xUDT data that is not 16 bytes, is `RefundUnbuildable`: log and skip. See `assemble.rs::refund_output`.
+   - **Refund fee modes** (explicit capability; default **legacy exact**):
+     - Default (`cid_lock.bounded_refund_fee = false` / unset): exact Intention capacity → paid fee **0**. Required for currently deployed CID locks. Public nodes with `min_fee_rate > 0` reject these (`-1104`); daemon logs `refund.zero_fee`; local-dev uses `min_fee_rate = 0`. **Do not claim existing deployments are fixed** by this daemon alone.
+     - Opt-in (`cid_lock.bounded_refund_fee = true` / `CID_BOUNDED_REFUND_FEE=true`): after an **OWNER redeploy** of a CID lock that accepts ≤ `MAX_REFUND_FEE` (1_000_000 shannons / 0.01 CKB) shortfall per Intention, deduct `ceil(size * fee_rate / 1000)` from refund outputs only (occupied ≤ refund ≤ intention; sum of cuts == miner fee; no siphon outputs). Fail closed / non-permanent if the budget is insufficient. **Contract candidate is not final** (siphon finding under independent review) — keep the gate off against undeployed hashes; do not replace current testnet `code_hash` with a candidate binary.
+   - **TimeoutBurn** remains exact and out of this keyless loop (no refund fee window).
 6. After a successful submit, occupy spent inputs (and the `digest_ok` Process recreate) until confirmation depth is met.
 
 Out of scope: timeout-burn proxy, multi-sig fee sponsor, official ssri-server, multi-instance coordination, testnet/mainnet ops scripts.
@@ -214,7 +217,7 @@ flowchart TD
   peek -->|cache hit| split["CachedRejected: split window, no send"]
   peek --> assemble["SSRI Process.assemble"]
   assemble -->|ok| dok["assemble_digest_ok<br/>Intention + Process 1in/1out"]
-  assemble -->|Incompatible| dinc["assemble_digest_incompatible<br/>User Lock refund, do not spend Process"]
+  assemble -->|Incompatible| dinc["assemble_digest_incompatible<br/>User Lock refund; no Process; exact by default"]
   assemble -->|Unusable| skip["log + skip"]
   dok --> send["send_transaction"]
   dinc --> send
