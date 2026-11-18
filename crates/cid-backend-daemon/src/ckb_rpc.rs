@@ -105,10 +105,11 @@ impl CkbRpc {
             .post(url)
             .set("Content-Type", "application/json")
             .send_json(body)
-            .map_err(|e| RpcError::Unavailable(format!("{method}: {e}")))?;
-        let v: Value = resp
-            .into_json()
-            .map_err(|e| RpcError::Unavailable(format!("{method} decode: {e}")))?;
+            .map_err(|e| RpcError::Unavailable(format_rpc_transport_error(method, e)))?;
+        let v: Value = resp.into_json().map_err(|_e| {
+            // Decode failures must not echo body/URL fragments via Display.
+            RpcError::Unavailable(format!("{method}: response decode failed"))
+        })?;
         if let Some(err) = v.get("error") {
             let msg = err
                 .get("message")
@@ -352,6 +353,15 @@ impl Rpc for CkbRpc {
     fn tip_block_number(&self) -> Result<u64, RpcError> {
         let result = self.rpc_call(&self.node_url, "get_tip_block_number", json!([]))?;
         parse_uint(&result)
+    }
+}
+
+/// Map ureq failures to log-safe text. ureq `Display` embeds the full request URL
+/// (userinfo / query tokens); never forward that into `RpcError` / tick logs.
+fn format_rpc_transport_error(method: &str, err: ureq::Error) -> String {
+    match err {
+        ureq::Error::Status(code, _) => format!("{method}: HTTP {code}"),
+        ureq::Error::Transport(t) => format!("{method}: transport ({})", t.kind()),
     }
 }
 
@@ -1088,6 +1098,73 @@ mod tests {
             TxStatus::Committed { block_number: 21 }
         );
         assert_eq!(rpc.tip_block_number().unwrap(), 32);
+    }
+
+    fn free_localhost_port() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        port
+    }
+
+    #[test]
+    fn rpc_transport_error_omits_url_credentials_and_query_tokens() {
+        let port = free_localhost_port();
+        let secret_url = format!(
+            "http://user:SECRET_MARKER@127.0.0.1:{port}/v1?api_key=prefix@TOKEN_MARKER"
+        );
+        let rpc = CkbRpc::new(&secret_url, &secret_url);
+        let err = rpc.tip_block_number().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("get_tip_block_number"),
+            "method should remain: {msg}"
+        );
+        assert!(
+            msg.contains("transport") || msg.contains("HTTP"),
+            "expected transport/HTTP category: {msg}"
+        );
+        for leak in [
+            "SECRET_MARKER",
+            "TOKEN_MARKER",
+            "user:",
+            "api_key",
+            "prefix@",
+            &format!("127.0.0.1:{port}"),
+        ] {
+            assert!(!msg.contains(leak), "RpcError must not embed {leak:?}: {msg}");
+        }
+    }
+
+    #[test]
+    fn rpc_http_status_error_omits_url() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 512];
+                let _ = stream.read(&mut buf);
+                let body = b"nope";
+                let header = format!(
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+        let secret_url = format!(
+            "http://user:SECRET_MARKER@{addr}/v1?api_key=prefix@TOKEN_MARKER"
+        );
+        // Brief settle for accept thread.
+        thread::sleep(Duration::from_millis(20));
+        let rpc = CkbRpc::new(&secret_url, &secret_url);
+        let err = rpc.tip_block_number().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("HTTP 500") || msg.contains("transport"), "{msg}");
+        assert!(!msg.contains("SECRET_MARKER"), "{msg}");
+        assert!(!msg.contains("TOKEN_MARKER"), "{msg}");
+        assert!(!msg.contains("user:"), "{msg}");
     }
 
     #[test]

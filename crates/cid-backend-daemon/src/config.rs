@@ -296,17 +296,47 @@ fn read_file_config(path: &Path) -> Result<FileConfig, ConfigError> {
     toml::from_str(&raw).map_err(|e| format_toml_parse_error(path, &raw, e))
 }
 
-/// Build a TOML parse diagnostic that never echoes the offending source line.
+/// Build a fail-closed TOML diagnostic: category + line/column only.
 ///
-/// `toml::de::Error`'s `Display` embeds the raw document line (and caret), which
-/// can contain secret-bearing values. Use `message()` plus line/column only.
+/// Never emit `toml::de::Error` Display (raw line + caret) or `message()` text.
+/// Serde messages embed typed string values (`invalid type: string "…"`) and
+/// attacker-controlled unknown field names; both must stay out of logs/stderr.
 fn format_toml_parse_error(path: &Path, raw: &str, err: toml::de::Error) -> ConfigError {
-    let mut msg = format!("TOML {}: {}", path.display(), err.message());
+    let category = toml_error_category(err.message());
+    let mut msg = format!("TOML {}: {category}", path.display());
     if let Some(span) = err.span() {
         let (line, col) = line_col_of(raw, span.start);
         msg.push_str(&format!(" (line {line}, column {col})"));
     }
     ConfigError::Invalid(msg)
+}
+
+/// Map serde/toml message keywords to a fixed safe label. Message text is only
+/// classified — never copied into the returned diagnostic.
+fn toml_error_category(message: &str) -> &'static str {
+    let m = message.to_ascii_lowercase();
+    if m.contains("unknown field") {
+        "unknown field"
+    } else if m.contains("missing field") {
+        "missing field"
+    } else if m.contains("duplicate") {
+        "duplicate key"
+    } else if m.contains("invalid type")
+        || m.contains("invalid value")
+        || (m.contains("expected")
+            && (m.contains("u64")
+                || m.contains("u32")
+                || m.contains("i64")
+                || m.contains("bool")
+                || m.contains("integer")
+                || m.contains("string")
+                || m.contains("map")
+                || m.contains("sequence")))
+    {
+        "invalid value type"
+    } else {
+        "parse error"
+    }
 }
 
 /// 1-based line and column for `byte_index` into `raw` (UTF-8 safe for column).
@@ -1212,6 +1242,18 @@ poll_interval_secs = 1
         assert!(matches!(err, ConfigError::Missing(ref m) if m.contains("genesis_hash")));
     }
 
+    fn assert_toml_diag_safe(msg: &str, secret: &str) {
+        assert!(msg.contains("TOML"), "{msg}");
+        assert!(
+            !msg.contains(secret),
+            "TOML diagnostic must not echo secret: {msg}"
+        );
+        assert!(
+            !msg.contains(" | "),
+            "TOML diagnostic must not embed source gutter: {msg}"
+        );
+    }
+
     #[test]
     fn unknown_key_rejected() {
         let p = write_toml(
@@ -1219,14 +1261,14 @@ poll_interval_secs = 1
         );
         let err = DaemonConfig::from_file_and_vars(Some(&p), |_| None).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("TOML") || msg.contains("unknown"), "{msg}");
+        assert_toml_diag_safe(&msg, "SECRET_MARKER");
         assert!(
-            msg.to_ascii_lowercase().contains("unknown") || msg.contains("private_key"),
-            "{msg}"
+            msg.contains("unknown field"),
+            "expected unknown-field category: {msg}"
         );
         assert!(
-            !msg.contains("SECRET_MARKER"),
-            "TOML diagnostic must not echo secret value: {msg}"
+            !msg.contains("private_key"),
+            "unknown field name must not be echoed: {msg}"
         );
     }
 
@@ -1235,20 +1277,18 @@ poll_interval_secs = 1
         let p = write_toml("secret = \"SECRET_MARKER\"\n");
         let err = DaemonConfig::from_file_and_vars(Some(&p), |_| None).unwrap_err();
         let msg = err.to_string();
+        assert_toml_diag_safe(&msg, "SECRET_MARKER");
+        assert!(msg.contains("unknown field"), "{msg}");
         assert!(
-            msg.to_ascii_lowercase().contains("unknown") || msg.contains("TOML"),
-            "{msg}"
-        );
-        assert!(
-            !msg.contains("SECRET_MARKER"),
-            "TOML diagnostic must not echo secret value: {msg}"
+            !msg.contains("secret =") && !msg.contains("`secret`"),
+            "unknown field name must not be echoed: {msg}"
         );
     }
 
     #[test]
     fn malformed_toml_diagnostic_omits_secret_bearing_line() {
         // Trailing garbage after a credential-looking URL value: toml Display would
-        // reprint the line; we must keep only message + line/column.
+        // reprint the line; we must keep only category + line/column.
         let body = format!(
             r#"
 [network]
@@ -1267,24 +1307,98 @@ poll_interval_secs = 1
         let p = write_toml(&body);
         let err = DaemonConfig::from_file_and_vars(Some(&p), |_| None).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("TOML"), "{msg}");
+        assert_toml_diag_safe(&msg, "SECRET_MARKER");
         assert!(
             msg.contains("line") && msg.contains("column"),
             "expected safe location hint: {msg}"
         );
         assert!(
-            !msg.contains("SECRET_MARKER"),
-            "TOML diagnostic must not echo secret value: {msg}"
-        );
-        assert!(
             !msg.contains("user:"),
             "TOML diagnostic must not echo userinfo: {msg}"
         );
-        // Must not look like toml's pretty Display (raw line + caret gutter).
         assert!(
-            !msg.contains(" | "),
-            "TOML diagnostic must not embed source gutter: {msg}"
+            msg.contains("parse error") || msg.contains("invalid value type"),
+            "expected safe category: {msg}"
         );
+    }
+
+    #[test]
+    fn typed_string_value_mismatches_omit_secret_from_diagnostic() {
+        let cases = [
+            (
+                "u64",
+                format!(
+                    r#"
+[network]
+genesis_hash = "0x{g}"
+[rpc]
+url = "http://127.0.0.1:8114"
+[cid_lock]
+code_hash = "0x{lock}"
+[loop]
+poll_interval_secs = "SECRET_MARKER_U64"
+"#,
+                    g = "11".repeat(32),
+                    lock = "22".repeat(32),
+                ),
+                "SECRET_MARKER_U64",
+            ),
+            (
+                "bool",
+                format!(
+                    r#"
+[network]
+genesis_hash = "0x{g}"
+validate_genesis = "SECRET_MARKER_BOOL"
+[rpc]
+url = "http://127.0.0.1:8114"
+[cid_lock]
+code_hash = "0x{lock}"
+[loop]
+poll_interval_secs = 1
+"#,
+                    g = "11".repeat(32),
+                    lock = "22".repeat(32),
+                ),
+                "SECRET_MARKER_BOOL",
+            ),
+            (
+                "u32_index",
+                format!(
+                    r#"
+[network]
+genesis_hash = "0x{g}"
+[rpc]
+url = "http://127.0.0.1:8114"
+[cid_lock]
+code_hash = "0x{lock}"
+[[cell_deps]]
+tx_hash = "0x{dep}"
+index = "SECRET_MARKER_U32"
+[loop]
+poll_interval_secs = 1
+"#,
+                    g = "11".repeat(32),
+                    lock = "22".repeat(32),
+                    dep = "33".repeat(32),
+                ),
+                "SECRET_MARKER_U32",
+            ),
+        ];
+        for (label, body, secret) in cases {
+            let p = write_toml(&body);
+            let err = DaemonConfig::from_file_and_vars(Some(&p), |_| None).unwrap_err();
+            let msg = err.to_string();
+            assert_toml_diag_safe(&msg, secret);
+            assert!(
+                msg.contains("invalid value type"),
+                "{label}: expected invalid value type category: {msg}"
+            );
+            assert!(
+                msg.contains("line") && msg.contains("column"),
+                "{label}: expected location: {msg}"
+            );
+        }
     }
 
     #[test]
