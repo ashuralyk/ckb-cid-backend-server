@@ -88,4 +88,67 @@ mod tests {
             "after settlement, next digest_ok spends Process recreate"
         );
     }
+
+    #[test]
+    fn stale_tip_after_status_does_not_settle_committed_tx() {
+        let rpc = FakeRpc::new();
+        rpc.defer_commit();
+        let ts = process_type_script(22);
+        let hash = script_hash32(&ts);
+        let proc = process_cell(22, 400_0000_0000, vec![0x7f, b'E', b'L', b'F', 22]);
+        rpc.insert_cell(proc.clone());
+        for i in 1..=4 {
+            rpc.insert_cell(intention_cell(i, hash, 100_0000_0000));
+        }
+        let mut loop_ = DigestLoop::new(
+            rpc,
+            NopClock,
+            ScriptedSsri::mimic((2, 2)),
+            cfg(10),
+            ProcessResolver::new(),
+        );
+
+        let first = loop_.tick();
+        assert_eq!(first.submitted, 1);
+        let tx_hash = loop_.rpc().submitted()[0].hash();
+        loop_.rpc().set_tip(89);
+        loop_.rpc().commit_pending(&tx_hash);
+        assert!(matches!(
+            loop_.rpc().get_transaction_status(&tx_hash).unwrap(),
+            TxStatus::Committed { block_number: 89 }
+        ));
+        loop_.rpc().set_tip(100);
+        loop_.rpc().rewind_tip_on_next_status(90);
+
+        let attempts_before = loop_.rpc().submit_attempts();
+        let orig_key = tx_hash.as_slice().to_vec();
+        let rewind_tick = loop_.tick();
+        assert_eq!(
+            rewind_tick.submitted, 0,
+            "stale tip 100 vs rewind-to-90 must not release occupancy for another digest"
+        );
+        assert!(
+            loop_.state().submit.pending.contains_key(&orig_key),
+            "Committed(89) with tip 90 and depth 10 must stay pending"
+        );
+        assert!(
+            loop_.state().submit.pending_occupies(&proc.out_point),
+            "Process occupancy must be held (Unavailable-style) across a tip rewind"
+        );
+        assert_eq!(
+            loop_.rpc().submit_attempts(),
+            attempts_before,
+            "no extra digest may be submitted on the rewind tick"
+        );
+        assert_eq!(loop_.rpc().tip(), 90);
+
+        loop_.rpc().set_tip(98);
+        let settled = loop_.tick();
+        assert_eq!(
+            settled.submitted, 1,
+            "once confirmations reach depth, occupancy releases and leftover work submits"
+        );
+        assert!(!loop_.state().submit.pending.contains_key(&orig_key));
+        assert_eq!(loop_.rpc().submitted().len(), 2);
+    }
 }

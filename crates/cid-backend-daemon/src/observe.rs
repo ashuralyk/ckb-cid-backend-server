@@ -442,6 +442,7 @@ mod tests {
                 submitted: 1,
                 conflicts: 0,
                 last_error: None,
+                isolate_windows: 0,
             },
             2,
         );

@@ -517,6 +517,110 @@ mod tests {
         );
     }
 
+    /// Unique contiguous windows are O(n²). Without a visited-set the isolate
+    /// tree revisits diamonds exponentially (`2^n - 1` for min=1, max=n).
+    fn isolate_expansion_bound(n: usize) -> usize {
+        n * n + 256 + 64
+    }
+
+    fn all_rejected_max_window_other_process_progresses(n: u8, poison_unique: u8, good_unique: u8) {
+        let rpc = FakeRpc::new();
+        let poison_ts = process_type_script(poison_unique);
+        let poison_hash = script_hash32(&poison_ts);
+        for fill in 1..=n {
+            let cell = intention_cell(fill, poison_hash, 100_0000_0000);
+            rpc.reject_when_consuming(&cell.out_point);
+            rpc.insert_cell(cell);
+        }
+        let later = intention_cell(n.saturating_add(1), poison_hash, 110_0000_0000);
+        rpc.insert_cell(later.clone());
+        rpc.insert_cell(process_cell(
+            poison_unique,
+            200_0000_0000,
+            vec![0x7f, b'E', b'L', b'F', poison_unique],
+        ));
+
+        let good_ts = process_type_script(good_unique);
+        let good_hash = script_hash32(&good_ts);
+        let good = intention_cell(n.saturating_add(2), good_hash, 110_0000_0000);
+        let good_proc = process_cell(
+            good_unique,
+            200_0000_0000,
+            vec![0x7f, b'E', b'L', b'F', good_unique],
+        );
+        rpc.insert_cell(good.clone());
+        rpc.insert_cell(good_proc.clone());
+        rpc.defer_commit();
+
+        let mut loop_ = DigestLoop::new(
+            rpc,
+            NopClock,
+            ScriptedSsri::mimic((1, n as u32)),
+            cfg(),
+            ProcessResolver::new(),
+        );
+
+        let bound = isolate_expansion_bound(n as usize);
+        let mut saw_other = false;
+        let mut saw_later = false;
+        for tick in 0..8 {
+            let before = loop_.rpc().submit_attempts();
+            let report = loop_.tick();
+            assert!(
+                report.isolate_windows <= bound,
+                "tick {tick}: isolate expansions {} exceeded polynomial/budget bound {bound} (n={n})",
+                report.isolate_windows
+            );
+            let sent = loop_.rpc().submit_attempts() - before;
+            assert!(
+                sent <= 66,
+                "tick {tick}: poison send cap is 64; +2 are later/other valid Intentions, sent {sent}"
+            );
+            for tx in loop_.rpc().submitted() {
+                let first = tx.inputs().get(0).unwrap().previous_output();
+                if first == good.out_point {
+                    saw_other = true;
+                }
+                if first == later.out_point {
+                    saw_later = true;
+                }
+            }
+            if saw_other && saw_later {
+                break;
+            }
+        }
+        assert!(
+            saw_other,
+            "valid Intention on another Process must still progress under max={n} all-rejected live cells"
+        );
+        assert!(
+            saw_later,
+            "later valid Intention in the poison bucket must still progress under max={n}"
+        );
+        assert!(loop_.state().submit.pending_occupies(&good.out_point));
+        assert!(loop_.state().submit.pending_occupies(&later.out_point));
+        assert!(!loop_
+            .state()
+            .submit
+            .rejected
+            .contains(&out_point_key(&good.out_point)));
+        assert!(!loop_
+            .state()
+            .submit
+            .rejected
+            .contains(&out_point_key(&later.out_point)));
+    }
+
+    #[test]
+    fn cached_reject_max16_expansions_are_bounded_and_other_process_progresses() {
+        all_rejected_max_window_other_process_progresses(16, 36, 37);
+    }
+
+    #[test]
+    fn cached_reject_max20_expansions_are_bounded_and_other_process_progresses() {
+        all_rejected_max_window_other_process_progresses(20, 38, 39);
+    }
+
     #[test]
     fn capacity_shortfall_prefix_does_not_starve_later_valid_intention() {
         let rpc = FakeRpc::new();

@@ -18,6 +18,7 @@ struct Inner {
     defer_commit: bool,
     fail_status_queries: bool,
     fail_tip_queries: bool,
+    rewind_tip_on_status: Option<u64>,
     submitted: Vec<TransactionView>,
     consumed_by_tx: HashMap<Vec<u8>, Vec<LiveCell>>,
     tx_status: HashMap<Vec<u8>, TxStatus>,
@@ -110,6 +111,11 @@ impl FakeRpc {
 
     pub fn restore_tip_queries(&self) {
         self.inner.borrow_mut().fail_tip_queries = false;
+    }
+
+    /// Next `get_transaction_status` rewinds the tip first (stale-tip settle).
+    pub fn rewind_tip_on_next_status(&self, new_tip: u64) {
+        self.inner.borrow_mut().rewind_tip_on_status = Some(new_tip);
     }
 
     pub fn live_cells(&self) -> Vec<LiveCell> {
@@ -325,7 +331,10 @@ impl Rpc for FakeRpc {
     }
 
     fn get_transaction_status(&self, tx_hash: &Byte32) -> Result<TxStatus, RpcError> {
-        let inner = self.inner.borrow();
+        let mut inner = self.inner.borrow_mut();
+        if let Some(t) = inner.rewind_tip_on_status.take() {
+            inner.tip = t;
+        }
         if inner.fail_status_queries {
             return Err(RpcError::Unavailable("injected status unavailable".into()));
         }

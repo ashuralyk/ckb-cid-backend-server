@@ -46,6 +46,9 @@ pub struct LoopState {
     /// Next tick starts at this Intention so a skip/send budget cut does not
     /// restart at the same ASC head. Dropped on restart.
     pub isolate_resume: HashMap<[u8; 32], Vec<u8>>,
+    /// Fingerprints already split this isolate sweep (memory-only). Prevents
+    /// re-expanding the same cached window; cleared when a sweep completes.
+    pub isolate_expanded: HashMap<[u8; 32], HashSet<Vec<u8>>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -58,6 +61,8 @@ pub struct TickReport {
     pub scan_ok: bool,
     /// Last scan/submit error on this tick, if any.
     pub last_error: Option<String>,
+    /// Isolate windows considered this tick (including cached splits).
+    pub isolate_windows: usize,
 }
 
 enum BatchOutcome {
@@ -113,6 +118,7 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                 resolver,
                 last_tip: None,
                 isolate_resume: HashMap::new(),
+                isolate_expanded: HashMap::new(),
             },
         }
     }
@@ -143,6 +149,7 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
             submitted = report.submitted,
             conflicts = report.conflicts,
             scan_ok = report.scan_ok,
+            isolate_windows = report.isolate_windows,
         );
         report
     }
@@ -280,10 +287,37 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                             );
                         }
                     }
-                    let Some(tip) = tip else {
+                    // Re-read tip after status: a rewind during get_transaction_status
+                    // (or a stale start-of-tick tip) must not settle against a height
+                    // that is no longer canonical. Missing tip is Unavailable-style.
+                    let start_tip = tip;
+                    let Some(fresh_tip) = self.refresh_tip() else {
                         continue;
                     };
-                    let confirmations = confirmation_count(tip, block_number);
+                    if start_tip.map(|s| fresh_tip < s).unwrap_or(false) {
+                        tracing::warn!(
+                            target: LOG_TARGET,
+                            event = "pending.tip_rewind",
+                            tx_hash = %tx_hex,
+                            from = start_tip.unwrap_or(fresh_tip),
+                            to = fresh_tip,
+                            block_number,
+                        );
+                        continue;
+                    }
+                    if fresh_tip < block_number {
+                        tracing::debug!(
+                            target: LOG_TARGET,
+                            event = "pending.confirming",
+                            tx_hash = %tx_hex,
+                            confirmations = 0,
+                            depth,
+                            block_number,
+                            tip = fresh_tip,
+                        );
+                        continue;
+                    }
+                    let confirmations = confirmation_count(fresh_tip, block_number);
                     if confirmations >= depth {
                         tracing::info!(
                             target: LOG_TARGET,
@@ -301,7 +335,7 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                             confirmations,
                             depth,
                             block_number,
-                            tip,
+                            tip = fresh_tip,
                         );
                     }
                 }
@@ -371,9 +405,13 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
         }
         const MAX_ATTEMPTS: u32 = 64;
         let mut attempts = 0;
+        if !self.state.isolate_resume.contains_key(&hash) {
+            self.state.isolate_expanded.remove(&hash);
+        }
         let bucket = Self::rotate_bucket(bucket, self.state.isolate_resume.get(&hash));
         let resume = self.isolate_window(
             &process,
+            hash,
             bucket,
             min,
             max,
@@ -385,6 +423,7 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
             self.state.isolate_resume.insert(hash, k);
         } else {
             self.state.isolate_resume.remove(&hash);
+            self.state.isolate_expanded.remove(&hash);
         }
     }
 
@@ -394,9 +433,13 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
     ///
     /// Iterative so a long poison prefix cannot grow the stack. Cached combos
     /// are isolated without charging `attempts` (new `send_transaction` only).
+    /// Each window fingerprint is expanded at most once per sweep; a separate
+    /// cached-split budget stops diamond explosion. Progress persists in
+    /// `isolate_expanded` until the sweep completes.
     fn isolate_window(
         &mut self,
         process: &ResolvedProcess,
+        hash: [u8; 32],
         items: Vec<ScannedIntention>,
         min: u32,
         max: u32,
@@ -404,6 +447,8 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
         attempts: &mut u32,
         max_attempts: u32,
     ) -> Option<Vec<u8>> {
+        const MAX_CACHED_SPLITS: u32 = 256;
+        let mut cached_splits = 0u32;
         let mut stack = vec![items];
         while let Some(items) = stack.pop() {
             let items: Vec<ScannedIntention> = items
@@ -420,9 +465,28 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                 report.skipped += items.len();
                 continue;
             }
+            report.isolate_windows += 1;
             let n = items.len().min(max as usize);
             let window = items[..n].to_vec();
             let rest = items[n..].to_vec();
+            let fp = Self::window_fingerprint(&window, process);
+            let already = self
+                .state
+                .isolate_expanded
+                .get(&hash)
+                .map(|s| s.contains(&fp))
+                .unwrap_or(false);
+            if already {
+                // Do not prefix-split again (that is the exponential diamond).
+                // Linear-advance so a budget cut can resume remaining unique
+                // suffixes without re-walking the expanded tree.
+                if !rest.is_empty() {
+                    stack.push(rest);
+                } else if window.len() > min as usize {
+                    stack.push(window[1..].to_vec());
+                }
+                continue;
+            }
             let cached = self.window_combo_cached(&window, process);
             let outcome = if cached {
                 tracing::debug!(
@@ -453,6 +517,22 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                 }
                 outcome
             };
+            if matches!(outcome, BatchOutcome::CachedRejected) {
+                if cached_splits >= MAX_CACHED_SPLITS {
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        event = "tick.skip",
+                        reason = "cached_split_budget",
+                        cached_splits,
+                    );
+                    report.skipped += items.len();
+                    for leftover in stack.drain(..) {
+                        report.skipped += leftover.len();
+                    }
+                    return items.first().map(|i| out_point_key(&i.out_point));
+                }
+                cached_splits += 1;
+            }
             match outcome {
                 BatchOutcome::SubmittedProcess | BatchOutcome::ProcessOccupied => {
                     let resume = rest
@@ -471,6 +551,11 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                     }
                 }
                 BatchOutcome::Rejected | BatchOutcome::CachedRejected => {
+                    self.state
+                        .isolate_expanded
+                        .entry(hash)
+                        .or_default()
+                        .insert(fp);
                     let mut drop_first = window[1..].to_vec();
                     drop_first.extend(rest);
                     if window.len() > min as usize {
@@ -488,6 +573,11 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
             }
         }
         None
+    }
+
+    fn window_fingerprint(batch: &[ScannedIntention], process: &ResolvedProcess) -> Vec<u8> {
+        let ops: Vec<_> = batch.iter().map(|i| i.out_point.clone()).collect();
+        combo_fingerprint(&ops, Some(&process.live_cell.out_point))
     }
 
     fn rotate_bucket(
