@@ -31,9 +31,13 @@ impl LogFormat {
 /// Install the process-wide subscriber. Safe to call once from `main`.
 /// Subsequent calls are no-ops (`try_init`).
 pub fn init_tracing() {
+    init_tracing_with(LogFormat::from_env());
+}
+
+pub fn init_tracing_with(format: LogFormat) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = tracing_log::LogTracer::init();
-    match LogFormat::from_env() {
+    match format {
         LogFormat::Json => {
             let _ = tracing_subscriber::fmt()
                 .with_env_filter(filter)

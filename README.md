@@ -23,7 +23,7 @@ The daemon continuously digests CID Intentions:
 
 1. Fetch live Intentions from the indexer by CID lock `code_hash` / `hash_type` (`get_cells`, `order=asc`, paginate until exhausted).
 2. Decode lock args to get `process_type_hash` and bucket by that hash.
-3. Resolve the matching live Process cell: production uses only the RISC-V **ELF in cell data** (the daemon does **not** install a Process-binary fallback).
+3. Resolve the matching live Process cell. SSRI binary source: **Type-ID Process code** (when `process.type_id_args` is set) uses that code-cell ELF for the tick; otherwise legacy **state-cell data** ELF (local data1). The daemon does **not** install a Process-binary fallback.
 4. In-process SSRI: `Process.batch` yields `[min, max]`; `Process.assemble` yields a partial tx.
 5. Assemble an Execution Tx and `send_transaction`:
    - **`digest_ok`**: destroy this batch of Intentions; Process **1 in / 1 out** recreate. No extra fee / sponsor input; User Lock is not placed in inputs (no signature after Intention creation). Skip on capacity shortfall.
@@ -51,30 +51,58 @@ Upstream git pin (`cid-process-executor` / `cid-protocol`): `d9ee77805f7ac930ab1
 cargo build --locked -p cid-backend-daemon
 ```
 
-### Configuration (env vars the daemon actually reads)
+### Configuration
 
-`DaemonConfig::from_env()` ([`crates/cid-backend-daemon/src/config.rs`](crates/cid-backend-daemon/src/config.rs)). Missing required values or illegal config logs `config.load_failed` and **exits 1**.
+The daemon is **keyless** (no signing, no dotenv / `.env`). Public network, contract, and runtime settings go in a TOML file; legacy `CID_*` process environment variables still work and **override** the file when set and non-empty.
+
+```bash
+cargo run -p cid-backend-daemon -- --config examples/cid.network.toml.example
+# or: CID_CONFIG=/path/to/cid.toml cargo run -p cid-backend-daemon
+```
+
+`--config PATH` wins over `CID_CONFIG`. If neither is set, behaviour is the previous env-only load (`DaemonConfig::from_vars`). Precedence: **built-in defaults < TOML file < explicit non-empty `CID_*` env**. Copy [`examples/cid.network.toml.example`](examples/cid.network.toml.example) and replace every `<PLACEHOLDER>` — that example is **not** valid hex/URLs and will not start.
+
+`network.name` is a **log label only**. `network.genesis_hash` is the declared chain identity (that node’s `get_block_hash("0x0")`). File mode **requires** it (or `CID_GENESIS_HASH`). It is **not** verified unless `network.validate_genesis = true` (or `CID_VALIDATE_GENESIS=true`), in which case the daemon fail-closes on RPC error or mismatch. Logs use `genesis_status=declared_unverified` or `genesis.verified` accordingly.
+
+**Type-ID code cells (preferred for `hash_type=type`):** configure `cid_lock.type_id_args` / `process.type_id_args` (and optional `process_lock.type_id_args`) — the 32-byte TYPE_ID **type-script args** on each **code** cell. Optional `type_id` is the full type-script hash for fail-closed verification; it is **not** args. The daemon derives `code_hash` for `hash_type=type`, finds the live code cell via indexer **exact** type-script search each tick (bounded uniqueness walk), and merges those CellDeps into assemble. When `process.type_id_args` is set, SSRI executes that Process **code** cell’s ELF for the tick (same outpoint as the CellDep)—not the Process **state** cell data. Legacy / local data1 mode (no Process Type-ID) still uses state-cell ELF. Missing / ambiguous / mismatched / transport / dep_type-conflict errors skip **new** assembly (retry next poll) and do **not** permanently reject Intentions; already-submitted txs still confirm/reorg-reconcile. Dispatcher deployment JSON is never auto-loaded. Live Process **state** cells are matched by CID args `process_type_hash` (full type script hash), distinct from the Process **code** cell TYPE_ID.
+
+Static `[[cell_deps]]` / `CID_*_CELL_DEP` remain for **unrelated** extras (secp, xUDT, always-success). Configuring a Type-ID identity for a role **rejects** the matching static role dep (`CID_LOCK_CELL_DEP` / labeled `cid_lock`, etc.) so stale outpoints cannot survive upgrades. Unlabeled extras cannot be inferred as role code cells—do not put Type-ID role outpoints there unlabeled.
+
+`config.loaded` logs `rpc` / `indexer` as scheme+host+port only (userinfo and path/query stripped).
+
+`DaemonConfig` lives in [`crates/cid-backend-daemon/src/config.rs`](crates/cid-backend-daemon/src/config.rs). Missing required values or illegal config logs `config.load_failed` and **exits 1**.
+
+#### Env vars (legacy; also file overrides)
 
 | Variable | Config parser | Default / meaning |
 |----------|---------------|-------------------|
 | `CID_CKB_RPC_URL` | required | Node JSON-RPC |
 | `CID_INDEXER_URL` | optional | Indexer JSON-RPC; empty uses `CID_CKB_RPC_URL` |
-| `CID_LOCK_CODE_HASH` | required | CID lock `code_hash`, 32-byte hex (`0x` optional) |
-| `CID_LOCK_HASH_TYPE` | optional | `type` (default) / `data` / `data1` / `data2` |
+| `CID_LOCK_CODE_HASH` | required unless Type-ID | CID lock `code_hash`, 32-byte hex (`0x` optional); derived when `CID_LOCK_TYPE_ID_ARGS` is set |
+| `CID_LOCK_HASH_TYPE` | optional | `type` (default) / `data` / `data1` / `data2`; Type-ID mode requires `type` |
+| `CID_LOCK_TYPE_ID_ARGS` | optional | 32-byte TYPE_ID args for CID lock **code** cell |
+| `CID_LOCK_TYPE_ID` | optional | Full type-script hash verify (not args) |
+| `CID_PROCESS_TYPE_ID_ARGS` | optional | TYPE_ID args for Process **code** cell |
+| `CID_PROCESS_TYPE_ID` | optional | Full type-script hash verify for Process code |
+| `CID_PROCESS_LOCK_TYPE_ID_ARGS` | optional | TYPE_ID args for Process lock code cell |
+| `CID_PROCESS_LOCK_TYPE_ID` | optional | Full type-script hash verify for Process lock code |
 | `CID_POLL_INTERVAL_SECS` | required | Seconds between ticks, integer **≥ 1** |
-| `CID_LOCK_CELL_DEP` | optional; **needed at run** to execute CID lock | `<tx_hash>:<index>` CID lock code cell (`DepType::Code`) |
-| `CID_PROCESS_CODE_CELL_DEP` | optional; **needed at run** to execute Process type | Process ELF (or other Process type) code cell |
-| `CID_PROCESS_LOCK_CELL_DEP` | optional; **needed at run** to spend Process lock | Process lock code cell (local-chain uses always-success) |
+| `CID_LOCK_CELL_DEP` | optional static | `<tx_hash>:<index>` when not using Type-ID discovery |
+| `CID_PROCESS_CODE_CELL_DEP` | optional static | Process type code cell outpoint (static mode) |
+| `CID_PROCESS_LOCK_CELL_DEP` | optional static | Process lock code cell (local-chain: always-success) |
 | `CID_EXTRA_CELL_DEPS` | optional | Extra `<tx_hash>:<index>` list, comma-separated |
-| `CID_PROCESS_CODE_HASH` | optional; **needed at run** to find Process cells | Indexer type-script **code_hash prefix** for the Process type. Must match that type script's `hash_type` (data1 local-chain: ELF **data** hash; type: Type-ID code hash — not always an ELF hash). CID args store `calc_script_hash`, which is **not** this prefix. Comma-separated list allowed |
+| `CID_PROCESS_CODE_HASH` | optional | Indexer type-script **code_hash prefix** for live Process cells; with Process Type-ID only the derived `type_id` is allowed (auto-set) |
 | `CID_HEALTH_BIND` | optional | `host:port` (e.g. `127.0.0.1:9100`); unset or empty **disables** HTTP |
 | `CID_CONFIRMATION_DEPTH` | optional | Blocks after a committed Execution Tx before settle; default **24**, must be **≥ 1** |
 | `CID_LOG_FORMAT` | optional | `json` (default) or `pretty` (`text` is an alias for pretty) |
+| `CID_CONFIG` | optional | TOML path if `--config` is omitted |
+| `CID_GENESIS_HASH` | optional | Overrides `network.genesis_hash` |
+| `CID_VALIDATE_GENESIS` | optional | `true`/`false`; overrides `network.validate_genesis` |
 | `RUST_LOG` | optional | `tracing` EnvFilter, default `info` |
 
-Cell-dep format: `<tx_hash>:<index>`; index may be decimal or `0x` hex. The four cell-dep variables are merged into `LoopConfig.extra_cell_deps`. `assemble` uses that list as-is and **does not** auto-fill script deps.
+Cell-dep format: `<tx_hash>:<index>`; index may be decimal or `0x` hex. Static cell-dep variables merge into `LoopConfig.extra_cell_deps`. Type-ID deps are resolved each tick and merged first (deduped by outpoint).
 
-`CID_PROCESS_CODE_HASH` is not a local-chain-only switch. `CkbRpc::get_live_process_by_type_hash` always searches indexer type prefixes from that list (plus a prefix search on the args `process_type_hash` itself), then filters `calc_script_hash`. The args hash is a full script hash, so using it as a type `code_hash` prefix usually finds nothing — set the Process type's actual `code_hash`.
+`CID_PROCESS_CODE_HASH` is not a local-chain-only switch. `CkbRpc::get_live_process_by_type_hash` always searches indexer type prefixes from that list (plus a prefix search on the args `process_type_hash` itself), then filters `calc_script_hash`. The args hash is a full script hash, so using it as a type `code_hash` prefix usually finds nothing — set the Process type's actual `code_hash` (or use Process `type_id_args` so it is derived).
 
 The daemon does **not** read `CID_PROCESS_EXAMPLE_PATH` / `CID_LOCAL_CHAIN_E2E` (test fixture / local-chain E2E switch). Production Process binaries come only from live Process cell data. `CkbRpc` talks JSON-RPC to `CID_CKB_RPC_URL` / `CID_INDEXER_URL`; tests use in-memory `FakeRpc`.
 
@@ -82,14 +110,16 @@ The daemon does **not** read `CID_PROCESS_EXAMPLE_PATH` / `CID_LOCAL_CHAIN_E2E` 
 
 ```bash
 export CID_CKB_RPC_URL=http://127.0.0.1:8114
-export CID_LOCK_CODE_HASH=   # 32-byte hex
 export CID_POLL_INTERVAL_SECS=5
-# By deployment: CID_LOCK_CELL_DEP / CID_PROCESS_*_CELL_DEP / CID_PROCESS_CODE_HASH
-# (query prefix + script deps; assemble does not invent them). See docs/local-dev-chain.md
+# Type-ID (preferred on hash_type=type networks):
+#   CID_LOCK_TYPE_ID_ARGS / CID_PROCESS_TYPE_ID_ARGS (+ optional *_TYPE_ID)
+# Or legacy static: CID_LOCK_CODE_HASH + CID_*_CELL_DEP + CID_PROCESS_CODE_HASH
+# See docs/local-dev-chain.md for the local data1 fixture path.
 cargo run -p cid-backend-daemon
+# same settings in TOML: cargo run -p cid-backend-daemon -- --config path/to/cid.toml
 ```
 
-`main` sleeps `poll_interval` after each `tick()`. Illegal config exits immediately.
+`main` sleeps `poll_interval` after each `tick()`. Illegal config exits immediately. `--help` prints the flag list.
 
 ### Isolated local dev chain
 
@@ -169,15 +199,17 @@ The SSRI host is in-process `EmbeddedSsri` (`cid-process-executor`), not an exte
 
 ```mermaid
 flowchart TD
-  start["tick.start"] --> scan["scan_intentions: indexer get_cells ASC"]
-  scan -->|Unavailable| endTick["tick.end / keep occupancy"]
-  scan --> tip["refresh_tip + reconcile_pending"]
-  tip --> filter["filter in_flight / rejected"]
+  start["tick.start"] --> tip["refresh_tip + reconcile_pending"]
+  tip --> deps["refresh Type-ID code CellDeps"]
+  deps -->|Unavailable| endEarly["tick.end / no new assembly"]
+  deps --> scan["scan_intentions: indexer get_cells ASC"]
+  scan -->|Unavailable| endScan["tick.end / keep occupancy"]
+  scan --> filter["filter in_flight / rejected"]
   filter --> bucket["bucket by process_type_hash"]
-  bucket --> resolve["ProcessResolver: live cell data = ELF"]
+  bucket --> resolve["ProcessResolver SSRI source:<br/>Type-ID code ELF or legacy state ELF"]
   resolve --> bounds["SSRI Process.batch → min,max"]
   bounds --> isolate["isolate_window legal sub-batches"]
-  isolate --> peek["lookup rejected_combos fingerprint"]
+  isolate --> peek["lookup rejected_combos fingerprint<br/>incl. Type-ID code identity"]
   peek -->|cache hit| split["CachedRejected: split window, no send"]
   peek --> assemble["SSRI Process.assemble"]
   assemble -->|ok| dok["assemble_digest_ok<br/>Intention + Process 1in/1out"]
@@ -194,10 +226,11 @@ flowchart TD
 
 Each tick ([`digest_loop.rs`](crates/cid-backend-core/src/digest_loop.rs)):
 
-1. Scan live Intentions; skip cells whose lock args fail to decode.
-2. Refresh tip; ask `get_transaction_status` for txs in `pending`. After `Committed`, re-read tip: if the tip rewound, header/tip is unavailable, or `tip < commit_height`, do **not** settle this tick (see [`docs/confirmation.md`](docs/confirmation.md)).
-3. Bucket by Process; `isolate_window` splits into legal `[min, max]` sub-batches.
-4. `digest_ok` occupies the Process recreate until settle; User Lock refunds in the same tick may still submit.
+1. Refresh tip and reconcile `pending` (confirmation / reorg) **before** Type-ID code-dep refresh, so unavailable code deps never stall settlement.
+2. Resolve Type-ID code cells (bounded exact search); merge with static extras. On Process Type-ID, SSRI uses that code-cell ELF and requires the Process **state** type script `hash_type=type` + `code_hash` = derived TYPE_ID. Legacy mode uses state-cell ELF.
+3. Scan live Intentions; skip cells whose lock args fail to decode.
+4. Bucket by Process; `isolate_window` splits into legal `[min, max]` sub-batches. Reject/isolate fingerprints include Type-ID code outpoints so code upgrades clear stale `CachedRejected` without dropping `pending` / `in_flight`.
+5. `digest_ok` occupies the Process recreate until settle; User Lock refunds in the same tick may still submit.
 
 ### Memory-only state and restart
 

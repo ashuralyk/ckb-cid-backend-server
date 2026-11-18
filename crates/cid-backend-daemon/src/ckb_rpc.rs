@@ -6,7 +6,7 @@
 //! (`CID_PROCESS_CODE_HASH`) then filtered to `calc_script_hash ==
 //! process_type_hash` from CID args.
 
-use crate::config::DaemonConfig;
+use crate::config::{ConfigError, DaemonConfig};
 use cid_backend_core::rpc::{script_hash32, LiveCell, Rpc, RpcError, TxStatus};
 use ckb_types::core::{DepType, ScriptHashType, TransactionView};
 use ckb_types::packed::{Byte32, CellInput, CellOutput, OutPoint, Script};
@@ -67,6 +67,32 @@ impl CkbRpc {
         self.rpc_call(&self.node_url, method, params)
     }
 
+    /// Fail-closed genesis identity: `get_block_hash("0x0")`.
+    pub fn genesis_block_hash(&self) -> Result<[u8; 32], RpcError> {
+        let result = self.call_node("get_block_hash", json!(["0x0"]))?;
+        let hex = result
+            .as_str()
+            .ok_or_else(|| RpcError::Unavailable("get_block_hash: result not hex".into()))?;
+        let bytes = decode_hex(hex)?;
+        <[u8; 32]>::try_from(bytes.as_slice())
+            .map_err(|_| RpcError::Unavailable("get_block_hash: not 32 bytes".into()))
+    }
+
+    /// Compare declared genesis to the node. RPC errors and mismatches both fail.
+    pub fn verify_declared_genesis(&self, expected: &[u8; 32]) -> Result<(), ConfigError> {
+        match self.genesis_block_hash() {
+            Ok(got) if &got == expected => Ok(()),
+            Ok(got) => Err(ConfigError::Invalid(format!(
+                "genesis hash mismatch (fail-closed): declared 0x{} node 0x{}",
+                hex::encode(expected),
+                hex::encode(got)
+            ))),
+            Err(e) => Err(ConfigError::Invalid(format!(
+                "genesis hash check failed (fail-closed): {e}"
+            ))),
+        }
+    }
+
     fn rpc_call(&self, url: &str, method: &str, params: Value) -> Result<Value, RpcError> {
         let body = json!({
             "id": 1,
@@ -79,10 +105,11 @@ impl CkbRpc {
             .post(url)
             .set("Content-Type", "application/json")
             .send_json(body)
-            .map_err(|e| RpcError::Unavailable(format!("{method}: {e}")))?;
-        let v: Value = resp
-            .into_json()
-            .map_err(|e| RpcError::Unavailable(format!("{method} decode: {e}")))?;
+            .map_err(|e| RpcError::Unavailable(format_rpc_transport_error(method, e)))?;
+        let v: Value = resp.into_json().map_err(|_e| {
+            // Decode failures must not echo body/URL fragments via Display.
+            RpcError::Unavailable(format!("{method}: response decode failed"))
+        })?;
         if let Some(err) = v.get("error") {
             let msg = err
                 .get("message")
@@ -149,7 +176,98 @@ impl CkbRpc {
         });
         self.get_cells(&key)
     }
+
+    /// Exact TYPE_ID / type-script lookup with early stop and page bound.
+    ///
+    /// `with_data = true` so a unique Process code cell carries ELF bytes for
+    /// SSRI in the same snapshot as the CellDep. Stops once `max_results`
+    /// matches are collected (use 2 for unique-vs-ambiguous). Full pages
+    /// without an advancing cursor, or exceeding `MAX_TYPE_ID_PAGES` before
+    /// the set is exhausted while still under `max_results`, fail closed —
+    /// never report a unique cell from a truncated walk.
+    fn find_cells_by_exact_type_script(
+        &self,
+        type_script: &Script,
+        max_results: usize,
+    ) -> Result<Vec<LiveCell>, RpcError> {
+        let ht: ScriptHashType = type_script
+            .hash_type()
+            .try_into()
+            .map_err(|_| RpcError::Unavailable("type script hash_type".into()))?;
+        let code: [u8; 32] = type_script.code_hash().unpack();
+        let args: Vec<u8> = type_script.args().unpack();
+        let search_key = json!({
+            "script": json_script(&code, ht, &args),
+            "script_type": "type",
+            "script_search_mode": "exact",
+            "with_data": true,
+        });
+        let mut after = Value::Null;
+        let mut out = Vec::new();
+        let mut pages = 0usize;
+        loop {
+            if out.len() >= max_results {
+                out.truncate(max_results);
+                return Ok(out);
+            }
+            if pages >= MAX_TYPE_ID_PAGES {
+                return Err(RpcError::Unavailable(format!(
+                    "get_cells exact type-id: exceeded {MAX_TYPE_ID_PAGES} pages before \
+                     uniqueness settled; refusing truncated live-set"
+                )));
+            }
+            let result = self.rpc_call(
+                &self.indexer_url,
+                "get_cells",
+                json!([&search_key, "asc", PAGE_LIMIT_HEX, after.clone()]),
+            )?;
+            pages += 1;
+            let objects = result
+                .get("objects")
+                .and_then(|o| o.as_array())
+                .ok_or_else(|| RpcError::Unavailable("get_cells: missing objects".into()))?;
+            let want = script_hash32(type_script);
+            for obj in objects {
+                let cell = live_cell_from_indexer(obj)?;
+                // Local exact filter even if indexer "exact" is loose.
+                if cell
+                    .type_script()
+                    .map(|ts| script_hash32(&ts) == want)
+                    .unwrap_or(false)
+                {
+                    out.push(cell);
+                    if out.len() >= max_results {
+                        out.truncate(max_results);
+                        return Ok(out);
+                    }
+                }
+            }
+            if objects.len() < PAGE_LIMIT {
+                break;
+            }
+            let cursor = result
+                .get("last_cursor")
+                .and_then(|c| c.as_str())
+                .unwrap_or("");
+            if cursor_is_empty(cursor) {
+                return Err(RpcError::Unavailable(format!(
+                    "get_cells: full page of {PAGE_LIMIT} without last_cursor; refusing truncated live-set"
+                )));
+            }
+            let next = Value::String(cursor.to_string());
+            if next == after {
+                return Err(RpcError::Unavailable(
+                    "get_cells: last_cursor did not advance; refusing truncated live-set".into(),
+                ));
+            }
+            after = next;
+        }
+        Ok(out)
+    }
 }
+
+/// Safety bound for Type-ID uniqueness walks (not for intention live-set scans).
+const MAX_TYPE_ID_PAGES: usize = 16;
 
 impl Rpc for CkbRpc {
     fn list_live_intentions(
@@ -183,6 +301,14 @@ impl Rpc for CkbRpc {
                 .map(|ts| &script_hash32(&ts) == process_type_hash)
                 .unwrap_or(false)
         }))
+    }
+
+    fn find_live_cells_by_type_script(
+        &self,
+        type_script: &Script,
+        max_results: usize,
+    ) -> Result<Vec<LiveCell>, RpcError> {
+        self.find_cells_by_exact_type_script(type_script, max_results)
     }
 
     fn submit_transaction(&self, tx: &TransactionView) -> Result<Byte32, RpcError> {
@@ -227,6 +353,15 @@ impl Rpc for CkbRpc {
     fn tip_block_number(&self) -> Result<u64, RpcError> {
         let result = self.rpc_call(&self.node_url, "get_tip_block_number", json!([]))?;
         parse_uint(&result)
+    }
+}
+
+/// Map ureq failures to log-safe text. ureq `Display` embeds the full request URL
+/// (userinfo / query tokens); never forward that into `RpcError` / tick logs.
+fn format_rpc_transport_error(method: &str, err: ureq::Error) -> String {
+    match err {
+        ureq::Error::Status(code, _) => format!("{method}: HTTP {code}"),
+        ureq::Error::Transport(t) => format!("{method}: transport ({})", t.kind()),
     }
 }
 
@@ -692,7 +827,7 @@ mod tests {
         Script::new_builder()
             .code_hash(PROC_CODE.pack())
             .hash_type(ScriptHashType::Type.into())
-            .args(vec![unique; 32].pack())
+            .args([unique; 32].to_vec().pack())
             .build()
     }
 
@@ -746,6 +881,105 @@ mod tests {
         assert_eq!(cells[1].capacity(), 200);
         let i0: u32 = cells[0].out_point.index().unpack();
         assert_eq!(i0, 0);
+    }
+
+    #[test]
+    fn finds_code_cell_by_exact_type_id_script_with_pagination() {
+        use cid_backend_core::type_id::{type_id_script, TYPE_ID_CODE_HASH};
+        let args = [0x7eu8; 32];
+        let ts = type_id_script(&args);
+        let type_json = script_json(&ts);
+        let type_json_full = type_json.clone();
+        let page = Arc::new(AtomicUsize::new(0));
+        let page2 = page.clone();
+        let url = spawn_mock(Arc::new(move |method, params| {
+            assert_eq!(method, "get_cells");
+            let key = &params[0];
+            assert_eq!(key["script_type"], "type");
+            assert_eq!(key["script_search_mode"], "exact");
+            assert_eq!(key["script"]["hash_type"], "type");
+            assert_eq!(
+                key["script"]["code_hash"].as_str().unwrap(),
+                hex_bytes(&TYPE_ID_CODE_HASH)
+            );
+            assert_eq!(key["script"]["args"].as_str().unwrap(), hex_bytes(&args));
+            let n = page2.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                // Full page then a short page — must not truncate.
+                let mut objs = Vec::new();
+                for i in 0..100 {
+                    objs.push(indexer_cell(
+                        0x10,
+                        i as u32,
+                        lock_json([0; 32], &[]),
+                        Some(type_json.clone()),
+                        1,
+                        &[0x7f],
+                    ));
+                }
+                Ok(json!({"objects": objs, "last_cursor": "0xc0ffee"}))
+            } else {
+                Ok(cells_result(vec![indexer_cell(
+                    0x11,
+                    0,
+                    lock_json([0; 32], &[]),
+                    Some(type_json.clone()),
+                    42,
+                    &[0x7f, b'E', b'L', b'F'],
+                )]))
+            }
+        }));
+        let rpc = CkbRpc::new(&url, &url);
+        // Uniqueness walk stops at 2 matches (ambiguous) without draining pages.
+        let cells = rpc
+            .find_live_cells_by_type_script(&ts, 2)
+            .expect("exact type-id search");
+        assert_eq!(cells.len(), 2);
+        assert_eq!(
+            page.load(Ordering::SeqCst),
+            1,
+            "must not fetch page 2 once ambiguous"
+        );
+
+        // Explicit larger bound still paginates and includes cell data.
+        let page_full = Arc::new(AtomicUsize::new(0));
+        let page_full2 = page_full.clone();
+        let url2 = spawn_mock(Arc::new(move |method, params| {
+            assert_eq!(method, "get_cells");
+            assert_eq!(params[0]["script_search_mode"], "exact");
+            assert_eq!(params[0]["with_data"], true);
+            let n = page_full2.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                let mut objs = Vec::new();
+                for i in 0..100 {
+                    objs.push(indexer_cell(
+                        0x10,
+                        i as u32,
+                        lock_json([0; 32], &[]),
+                        Some(type_json_full.clone()),
+                        1,
+                        &[0x7f],
+                    ));
+                }
+                Ok(json!({"objects": objs, "last_cursor": "0xc0ffee"}))
+            } else {
+                Ok(cells_result(vec![indexer_cell(
+                    0x11,
+                    0,
+                    lock_json([0; 32], &[]),
+                    Some(type_json_full.clone()),
+                    42,
+                    &[0x7f, b'E', b'L', b'F'],
+                )]))
+            }
+        }));
+        let rpc2 = CkbRpc::new(&url2, &url2);
+        let all = rpc2
+            .find_live_cells_by_type_script(&ts, 200)
+            .expect("paged exact search");
+        assert_eq!(all.len(), 101);
+        assert_eq!(all[100].capacity(), 42);
+        assert_eq!(&all[100].data, &[0x7f, b'E', b'L', b'F']);
     }
 
     #[test]
@@ -864,6 +1098,73 @@ mod tests {
             TxStatus::Committed { block_number: 21 }
         );
         assert_eq!(rpc.tip_block_number().unwrap(), 32);
+    }
+
+    fn free_localhost_port() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        port
+    }
+
+    #[test]
+    fn rpc_transport_error_omits_url_credentials_and_query_tokens() {
+        let port = free_localhost_port();
+        let secret_url = format!(
+            "http://user:SECRET_MARKER@127.0.0.1:{port}/v1?api_key=prefix@TOKEN_MARKER"
+        );
+        let rpc = CkbRpc::new(&secret_url, &secret_url);
+        let err = rpc.tip_block_number().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("get_tip_block_number"),
+            "method should remain: {msg}"
+        );
+        assert!(
+            msg.contains("transport") || msg.contains("HTTP"),
+            "expected transport/HTTP category: {msg}"
+        );
+        for leak in [
+            "SECRET_MARKER",
+            "TOKEN_MARKER",
+            "user:",
+            "api_key",
+            "prefix@",
+            &format!("127.0.0.1:{port}"),
+        ] {
+            assert!(!msg.contains(leak), "RpcError must not embed {leak:?}: {msg}");
+        }
+    }
+
+    #[test]
+    fn rpc_http_status_error_omits_url() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 512];
+                let _ = stream.read(&mut buf);
+                let body = b"nope";
+                let header = format!(
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+        let secret_url = format!(
+            "http://user:SECRET_MARKER@{addr}/v1?api_key=prefix@TOKEN_MARKER"
+        );
+        // Brief settle for accept thread.
+        thread::sleep(Duration::from_millis(20));
+        let rpc = CkbRpc::new(&secret_url, &secret_url);
+        let err = rpc.tip_block_number().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("HTTP 500") || msg.contains("transport"), "{msg}");
+        assert!(!msg.contains("SECRET_MARKER"), "{msg}");
+        assert!(!msg.contains("TOKEN_MARKER"), "{msg}");
+        assert!(!msg.contains("user:"), "{msg}");
     }
 
     #[test]
@@ -1016,6 +1317,7 @@ mod tests {
             hash_type: ScriptHashType::Type,
             poll_interval: Duration::from_secs(1),
             extra_cell_deps: vec![],
+            type_id_code_deps: vec![],
             confirmation_depth: depth,
         }
     }
@@ -1265,6 +1567,7 @@ mod tests {
             hash_type: ScriptHashType::Type,
             poll_interval: Duration::from_secs(1),
             extra_cell_deps: vec![],
+            type_id_code_deps: vec![],
             confirmation_depth: 1,
         };
         let mut first = DigestLoop::new(
@@ -1289,6 +1592,7 @@ mod tests {
                 hash_type: ScriptHashType::Type,
                 poll_interval: Duration::from_secs(1),
                 extra_cell_deps: vec![],
+                type_id_code_deps: vec![],
                 confirmation_depth: 1,
             },
             ProcessResolver::new(),
@@ -1490,6 +1794,7 @@ mod tests {
             hash_type: ScriptHashType::Type,
             poll_interval: Duration::from_secs(1),
             extra_cell_deps: vec![],
+            type_id_code_deps: vec![],
             confirmation_depth: 1,
         };
         let mut loop_ = DigestLoop::new(
@@ -1516,5 +1821,40 @@ mod tests {
             r2.submitted, 0,
             "pending occupancy holds; sticky cells must not hide it from scan"
         );
+    }
+
+    #[test]
+    fn verify_declared_genesis_matches() {
+        let url = spawn_mock(Arc::new(|method, _| {
+            assert_eq!(method, "get_block_hash");
+            Ok(Value::String(format!("0x{}", "ab".repeat(32))))
+        }));
+        let rpc = CkbRpc::new(&url, &url);
+        rpc.verify_declared_genesis(&[0xabu8; 32]).unwrap();
+    }
+
+    #[test]
+    fn verify_declared_genesis_mismatch_fails_closed() {
+        let url = spawn_mock(Arc::new(|method, _| {
+            assert_eq!(method, "get_block_hash");
+            Ok(Value::String(format!("0x{}", "ab".repeat(32))))
+        }));
+        let rpc = CkbRpc::new(&url, &url);
+        let err = rpc.verify_declared_genesis(&[0xcdu8; 32]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("fail-closed"), "{msg}");
+        assert!(msg.contains("mismatch"), "{msg}");
+    }
+
+    #[test]
+    fn verify_declared_genesis_rpc_error_fails_closed() {
+        let url = spawn_mock(Arc::new(|method, _| {
+            assert_eq!(method, "get_block_hash");
+            Err((-1, "unavailable".into()))
+        }));
+        let rpc = CkbRpc::new(&url, &url);
+        let err = rpc.verify_declared_genesis(&[0xabu8; 32]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("fail-closed"), "{msg}");
     }
 }
