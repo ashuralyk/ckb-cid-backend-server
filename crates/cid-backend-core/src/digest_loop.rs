@@ -799,8 +799,12 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
             }
         }
 
-        if unaffordable && !submitted {
-            // Homogeneous (or only bounded left) unaffordable: isolate/shrink.
+        // Prefer FeeUnaffordable even if Exact already submitted: isolate_window
+        // must shrink the Bounded group. Submitted Exact inputs are in_flight
+        // and filtered out of subsequent windows (no double-spend). Returning
+        // Submitted here would only push `rest` and leave unaffordable
+        // allowlisted Intentions stranded while legacy Exact keeps arriving.
+        if unaffordable {
             return BatchOutcome::FeeUnaffordable;
         }
         if submitted {
