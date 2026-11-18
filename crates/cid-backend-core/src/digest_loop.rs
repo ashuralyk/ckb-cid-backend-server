@@ -38,6 +38,9 @@ pub struct LoopConfig {
     /// occupancy is released. `1` settles on first sight of Committed at the
     /// tip. Daemon default is [`DEFAULT_CONFIRMATION_DEPTH`].
     pub confirmation_depth: u64,
+    /// Shannons per 1000 bytes (KW) charged on `digest_ok` by reducing the
+    /// Process recreate capacity. Default [`crate::fee::DEFAULT_FEE_RATE`].
+    pub fee_rate: u64,
 }
 
 /// Conservative default: 24 CKB blocks (~3 minutes at ~8s). Overridable via
@@ -728,7 +731,13 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                     report.skipped += batch.len();
                     return BatchOutcome::ProcessOccupied;
                 }
-                match assemble_digest_ok(&batch, process, &partial, &self.state.tick_cell_deps) {
+                match assemble_digest_ok(
+                    &batch,
+                    process,
+                    &partial,
+                    &self.state.tick_cell_deps,
+                    self.config.fee_rate,
+                ) {
                     Ok(s) => s,
                     Err(AssembleError::CapacityShortfall { inputs, outputs }) => {
                         tracing::warn!(
@@ -737,6 +746,28 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                             reason = "capacity_shortfall",
                             inputs,
                             outputs,
+                        );
+                        report.skipped += batch.len();
+                        return BatchOutcome::Continue;
+                    }
+                    Err(AssembleError::FeeUnaffordable {
+                        process_capacity,
+                        min_capacity,
+                        fee,
+                        tx_size,
+                        fee_rate,
+                    }) => {
+                        // Non-permanent: Process may gain capacity later, or
+                        // fee_rate / tx size may change. Do not combo-reject.
+                        tracing::warn!(
+                            target: LOG_TARGET,
+                            event = "tick.skip",
+                            reason = "fee_unaffordable",
+                            process_capacity,
+                            min_capacity,
+                            fee,
+                            tx_size,
+                            fee_rate,
                         );
                         report.skipped += batch.len();
                         return BatchOutcome::Continue;

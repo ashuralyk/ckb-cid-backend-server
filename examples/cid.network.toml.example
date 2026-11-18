@@ -65,6 +65,9 @@ type_id = "<PROCESS_CODE_TYPE_ID_FULL_HASH_32>"  # optional verify
 [loop]
 poll_interval_secs = 5
 confirmation_depth = 24
+# Shannons per 1000 bytes (KW). digest_ok pays by reducing Process recreate
+# capacity (no fee input). Default 1000. Must be > 0 and <= 10000000.
+# fee_rate = 1000
 
 [observe]
 # health_bind = "127.0.0.1:9100"           # omit/empty disables HTTP

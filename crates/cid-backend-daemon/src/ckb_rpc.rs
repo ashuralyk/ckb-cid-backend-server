@@ -1110,9 +1110,8 @@ mod tests {
     #[test]
     fn rpc_transport_error_omits_url_credentials_and_query_tokens() {
         let port = free_localhost_port();
-        let secret_url = format!(
-            "http://user:SECRET_MARKER@127.0.0.1:{port}/v1?api_key=prefix@TOKEN_MARKER"
-        );
+        let secret_url =
+            format!("http://user:SECRET_MARKER@127.0.0.1:{port}/v1?api_key=prefix@TOKEN_MARKER");
         let rpc = CkbRpc::new(&secret_url, &secret_url);
         let err = rpc.tip_block_number().unwrap_err();
         let msg = err.to_string();
@@ -1132,7 +1131,10 @@ mod tests {
             "prefix@",
             &format!("127.0.0.1:{port}"),
         ] {
-            assert!(!msg.contains(leak), "RpcError must not embed {leak:?}: {msg}");
+            assert!(
+                !msg.contains(leak),
+                "RpcError must not embed {leak:?}: {msg}"
+            );
         }
     }
 
@@ -1153,15 +1155,16 @@ mod tests {
                 let _ = stream.write_all(body);
             }
         });
-        let secret_url = format!(
-            "http://user:SECRET_MARKER@{addr}/v1?api_key=prefix@TOKEN_MARKER"
-        );
+        let secret_url = format!("http://user:SECRET_MARKER@{addr}/v1?api_key=prefix@TOKEN_MARKER");
         // Brief settle for accept thread.
         thread::sleep(Duration::from_millis(20));
         let rpc = CkbRpc::new(&secret_url, &secret_url);
         let err = rpc.tip_block_number().unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("HTTP 500") || msg.contains("transport"), "{msg}");
+        assert!(
+            msg.contains("HTTP 500") || msg.contains("transport"),
+            "{msg}"
+        );
         assert!(!msg.contains("SECRET_MARKER"), "{msg}");
         assert!(!msg.contains("TOKEN_MARKER"), "{msg}");
         assert!(!msg.contains("user:"), "{msg}");
@@ -1319,6 +1322,7 @@ mod tests {
             extra_cell_deps: vec![],
             type_id_code_deps: vec![],
             confirmation_depth: depth,
+            fee_rate: 1000,
         }
     }
 
@@ -1569,6 +1573,7 @@ mod tests {
             extra_cell_deps: vec![],
             type_id_code_deps: vec![],
             confirmation_depth: 1,
+            fee_rate: 1000,
         };
         let mut first = DigestLoop::new(
             CkbRpc::with_process_code_hashes(&url, &url, vec![PROC_CODE]),
@@ -1594,6 +1599,7 @@ mod tests {
                 extra_cell_deps: vec![],
                 type_id_code_deps: vec![],
                 confirmation_depth: 1,
+                fee_rate: 1000,
             },
             ProcessResolver::new(),
         );
@@ -1796,6 +1802,7 @@ mod tests {
             extra_cell_deps: vec![],
             type_id_code_deps: vec![],
             confirmation_depth: 1,
+            fee_rate: 1000,
         };
         let mut loop_ = DigestLoop::new(
             CkbRpc::with_process_code_hashes(&url, &url, vec![PROC_CODE]),

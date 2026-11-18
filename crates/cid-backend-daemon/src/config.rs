@@ -1,6 +1,7 @@
 use crate::logging::LogFormat;
 use cid_backend_core::digest_loop::{LoopConfig, DEFAULT_CONFIRMATION_DEPTH};
 use cid_backend_core::type_id::{TypeIdCodeDep, TypeIdIdentity};
+use cid_backend_core::{DEFAULT_FEE_RATE, MAX_FEE_RATE};
 use ckb_types::core::{DepType, ScriptHashType};
 use ckb_types::packed::{Byte32, CellDep, OutPoint};
 use ckb_types::prelude::*;
@@ -29,6 +30,9 @@ pub struct DaemonConfig {
     pub health_bind: Option<SocketAddr>,
     /// Confirmation depth for submitted execution txs. Default 24.
     pub confirmation_depth: u64,
+    /// Shannons per 1000 bytes (KW) for digest_ok fee from Process recreate.
+    /// Default [`cid_backend_core::DEFAULT_FEE_RATE`].
+    pub fee_rate: u64,
     /// Human label for logs only. Never used to select RPC or contracts.
     pub network_name: Option<String>,
     /// Declared genesis block hash. File mode requires it. Not verified unless
@@ -116,6 +120,7 @@ impl DaemonConfig {
             extra_cell_deps: self.extra_cell_deps.clone(),
             type_id_code_deps: self.type_id_code_deps.clone(),
             confirmation_depth: self.confirmation_depth,
+            fee_rate: self.fee_rate,
         }
     }
 }
@@ -279,6 +284,8 @@ struct LoopSection {
     poll_interval_secs: Option<u64>,
     #[serde(default)]
     confirmation_depth: Option<u64>,
+    #[serde(default)]
+    fee_rate: Option<u64>,
 }
 
 #[derive(Default, Deserialize)]
@@ -601,6 +608,14 @@ fn merge<F: Fn(&str) -> Option<String>>(
         },
     };
 
+    let fee_rate = match nonempty(&get, "CID_FEE_RATE") {
+        Some(s) => parse_fee_rate(&s, "CID_FEE_RATE")?,
+        None => match digest.fee_rate {
+            Some(n) => validate_fee_rate(n, "loop.fee_rate")?,
+            None => DEFAULT_FEE_RATE,
+        },
+    };
+
     let network_name = network.name.filter(|s| !s.trim().is_empty());
 
     let genesis_hash = match nonempty(&get, "CID_GENESIS_HASH") {
@@ -643,6 +658,7 @@ fn merge<F: Fn(&str) -> Option<String>>(
         process_type_code_hashes,
         health_bind,
         confirmation_depth,
+        fee_rate,
         network_name,
         genesis_hash,
         validate_genesis,
@@ -759,6 +775,26 @@ fn parse_poll_secs(raw: &str) -> Result<u64, ConfigError> {
         ));
     }
     Ok(secs)
+}
+
+fn parse_fee_rate(s: &str, label: &str) -> Result<u64, ConfigError> {
+    let n = s
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| ConfigError::Invalid(format!("{label} not u64")))?;
+    validate_fee_rate(n, label)
+}
+
+fn validate_fee_rate(n: u64, label: &str) -> Result<u64, ConfigError> {
+    if n == 0 {
+        return Err(ConfigError::Invalid(format!("{label} must be > 0")));
+    }
+    if n > MAX_FEE_RATE {
+        return Err(ConfigError::Invalid(format!(
+            "{label} must be <= {MAX_FEE_RATE}"
+        )));
+    }
+    Ok(n)
 }
 
 fn parse_confirmation_depth(s: &str) -> Result<u64, ConfigError> {
@@ -929,9 +965,52 @@ log_format = "pretty"
         assert!(cfg.process_type_code_hashes.is_empty());
         assert!(cfg.health_bind.is_none());
         assert_eq!(cfg.confirmation_depth, DEFAULT_CONFIRMATION_DEPTH);
+        assert_eq!(cfg.fee_rate, DEFAULT_FEE_RATE);
         assert!(cfg.genesis_hash.is_none());
         assert!(!cfg.validate_genesis);
         assert_eq!(cfg.log_format, LogFormat::Json);
+    }
+
+    #[test]
+    fn fee_rate_defaults_and_toml_env_override() {
+        let path = write_toml(&minimal_toml().replace(
+            "confirmation_depth = 8",
+            "confirmation_depth = 8\nfee_rate = 2500",
+        ));
+        let cfg = DaemonConfig::from_file_and_vars(Some(&path), |_| None).unwrap();
+        assert_eq!(cfg.fee_rate, 2500);
+        assert_eq!(cfg.to_loop_config().fee_rate, 2500);
+
+        let cfg = DaemonConfig::from_file_and_vars(Some(&path), |k| match k {
+            "CID_FEE_RATE" => Some("4000".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(cfg.fee_rate, 4000);
+    }
+
+    #[test]
+    fn fee_rate_zero_and_too_large_rejected() {
+        let err = DaemonConfig::from_vars(|k| match k {
+            "CID_FEE_RATE" => Some("0".into()),
+            other => required_env(other),
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("must be > 0"), "{err}");
+
+        let err = DaemonConfig::from_vars(|k| match k {
+            "CID_FEE_RATE" => Some((MAX_FEE_RATE + 1).to_string()),
+            other => required_env(other),
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("must be <="), "{err}");
+
+        let path = write_toml(&minimal_toml().replace(
+            "confirmation_depth = 8",
+            "confirmation_depth = 8\nfee_rate = 0",
+        ));
+        let err = DaemonConfig::from_file_and_vars(Some(&path), |_| None).unwrap_err();
+        assert!(err.to_string().contains("must be > 0"), "{err}");
     }
 
     #[test]
@@ -1256,9 +1335,7 @@ poll_interval_secs = 1
 
     #[test]
     fn unknown_key_rejected() {
-        let p = write_toml(
-            "[network]\ngenesis_hash = \"aa\"\nprivate_key = \"SECRET_MARKER\"\n",
-        );
+        let p = write_toml("[network]\ngenesis_hash = \"aa\"\nprivate_key = \"SECRET_MARKER\"\n");
         let err = DaemonConfig::from_file_and_vars(Some(&p), |_| None).unwrap_err();
         let msg = err.to_string();
         assert_toml_diag_safe(&msg, "SECRET_MARKER");

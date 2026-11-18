@@ -22,6 +22,7 @@ mod tests {
             extra_cell_deps: vec![],
             type_id_code_deps: vec![],
             confirmation_depth: 1,
+            fee_rate: 1000,
         }
     }
 
