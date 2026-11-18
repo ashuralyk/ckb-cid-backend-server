@@ -8,26 +8,30 @@ Backend can opt into **bounded** Incompatible refund fee cuts
 
 Reviewed contract rules live in
 [ckb-common-intention-dispatcher PR #12](https://github.com/ashuralyk/ckb-common-intention-dispatcher/pull/12)
-at head **`d6c5a86`** (or newer): per-Intention ceiling via
+at head **`9bc8193`** (or newer): per-Intention ceiling via
 `refund_capacity_allowed`, plus **tx-wide** `F >= S`
 (`fee_covers_shortfalls`) so shortfalls cannot fund other outputs.
 `S` / DigestOk counting is scoped to the executing lock's
-`code_hash` + `hash_type` (not across deployments). A contracts PR #12
-follow-up rejects **mixed CID identities** in one DigestIncompatible tx —
-that on-chain rule is the real defense against cross-identity `S` undercount;
-assembler partitioning is defense-in-depth only. TimeoutBurn stays exact.
+`code_hash` + `hash_type` (not across deployments). DigestIncompatible
+now rejects **mixed CID identities** (`MixedCidLock`) even at zero
+shortfall — that on-chain rule is the real protocol defense against
+cross-version fee reuse. The daemon's per-`(code_hash, hash_type)`
+partition is defense-in-depth so an honest assembler never submits a
+mixed-identity tx. TimeoutBurn stays exact.
 
 Do **not** treat undeployed candidate hashes as production defaults; do **not**
-replace current testnet `code_hash` with an undeployed binary (including
-provisional data hashes such as `0x2edb827f…` — document as example only,
-never as an active allowlist entry).
+replace current testnet `code_hash` with an undeployed binary. Operators
+fill in the deployed identity after redeploy. Never list unpublished /
+provisional data hashes as allowlist entries (examples only, not defaults:
+`0x2edb827f…`, `0x9897167b…`).
 
 ### Historical note
 
 An earlier candidate (`fcd33d9`) allowed capacity shortfall without tx-wide
 fee binding; review found arbitrary outputs could siphon the haircut. PR #12
 (`e0e7f18` → `d6c5a86`) binds haircuts to miner fee (`F >= S`) and restores
-TimeoutBurn exact capacity.
+TimeoutBurn exact capacity. Head `9bc8193` adds on-chain `MixedCidLock`
+rejection for mixed CID identities in one DigestIncompatible tx.
 
 ## Defaults (safe for existing deployments)
 
@@ -64,8 +68,9 @@ demands exact capacity.
 - **Never** mix allowlisted and legacy locks in one bounded refund tx.
 - **Never** co-bundle two different bounded-capable lock identities in one
   Execution tx — the loop partitions DigestIncompatible assembly by
-  `(code_hash, hash_type)`. The allowlist may list multiple verified
-  deployed identities after migration, but they must not share a refund tx.
+  `(code_hash, hash_type)` (defense-in-depth; on-chain `MixedCidLock` is
+  the real defense). The allowlist may list multiple verified deployed
+  identities after migration, but they must not share a refund tx.
 - **Never** co-bundle fee-shaved Incompatible refunds with Process /
   DigestOk.
 - **TimeoutBurn** stays exact; this daemon does not assemble it.

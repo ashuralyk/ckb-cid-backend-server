@@ -27,17 +27,18 @@
 //!
 //! ## Contract rules (PR #12 reviewed)
 //!
-//! Reviewed contract head (or newer): `d6c5a86` on
+//! Reviewed contract head (or newer): `9bc8193` on
 //! `ckb-common-intention-dispatcher` PR #12. On-chain DigestIncompatible
 //! requires per-Intention ceiling via [`refund_capacity_allowed`] and
 //! **tx-wide** `F >= S` (`fee_covers_shortfalls`: miner fee covers aggregate
 //! shortfall so shortfalls cannot fund other outputs). `S` / DigestOk
 //! counting is scoped to the executing lock's `code_hash` + `hash_type`
-//! (not cross-deployment). A contracts PR #12 follow-up rejects mixed CID
-//! identities in one DigestIncompatible tx (the real defense); assembler
-//! per-identity partitioning is defense-in-depth. TimeoutBurn stays exact.
-//! Backend assembly uses the stronger `sum(cuts) == F` with no extra
-//! outputs, which implies `F >= S`.
+//! (not cross-deployment). DigestIncompatible rejects mixed CID identities
+//! (`MixedCidLock`) even at zero shortfall — the real protocol defense
+//! against cross-version fee reuse. Assembler per-`(code_hash, hash_type)`
+//! partitioning is defense-in-depth so an honest assembler never submits a
+//! mixed-identity tx. TimeoutBurn stays exact. Backend assembly uses the
+//! stronger `sum(cuts) == F` with no extra outputs, which implies `F >= S`.
 //!
 //! ### Historical note
 //!
@@ -45,7 +46,9 @@
 //! tx-wide fee binding; review found arbitrary outputs could siphon the
 //! haircut. That finding is addressed by PR #12's `fee_covers_shortfalls`.
 //! Do **not** treat undeployed candidate hashes as production defaults
-//! (including provisional data hashes such as `0x2edb827f…`).
+//! (including provisional / unpublished data hashes such as `0x2edb827f…`
+//! and `0x9897167b…`). Operators fill in the deployed identity after
+//! redeploy.
 //!
 //! ## Process example / DigestOk co-bundling
 //!

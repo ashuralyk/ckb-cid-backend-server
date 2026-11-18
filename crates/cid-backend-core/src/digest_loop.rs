@@ -757,7 +757,8 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
     /// Partition DigestIncompatible refunds by lock identity
     /// (`code_hash` + `hash_type`), keeping Exact vs Bounded separation.
     /// Never co-bundle two different bounded-capable locks in one Execution
-    /// tx (contract `S` is scoped per executing identity; assembler DiD).
+    /// tx (defense-in-depth; on-chain `MixedCidLock` at contract head
+    /// `9bc8193`+ is the real protocol defense).
     /// `RefundFeeUnaffordable` → [`BatchOutcome::FeeUnaffordable`] so
     /// isolate_window shrinks.
     fn handle_incompatible_refunds(
