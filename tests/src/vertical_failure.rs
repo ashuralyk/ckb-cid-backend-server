@@ -20,6 +20,7 @@ mod tests {
             hash_type: ScriptHashType::Type,
             poll_interval: Duration::from_secs(1),
             extra_cell_deps: vec![],
+            type_id_code_deps: vec![],
             confirmation_depth: 1,
         }
     }
@@ -459,6 +460,7 @@ mod tests {
             ScriptedSsri {
                 bounds: (1, 1),
                 mode: Mode::AlwaysIncompatible(21),
+                seen_binaries: Default::default(),
             },
             cfg(),
             ProcessResolver::new(),

@@ -74,6 +74,21 @@ pub trait Rpc {
         process_type_hash: &[u8; 32],
     ) -> Result<Option<LiveCell>, RpcError>;
 
+    /// Live cells whose **type** script exactly matches `type_script`
+    /// (code_hash + hash_type + args). Used for TYPE_ID code-cell discovery;
+    /// hash-only prefix search is insufficient.
+    ///
+    /// Callers that only need uniqueness should pass `max_results = 2` so the
+    /// adapter can stop after two matches (unique vs ambiguous) without
+    /// paging the entire indexer set. Implementations must not treat a
+    /// truncated page window as a unique match. Returned cells include data
+    /// when available (Process code SSRI needs the ELF bytes).
+    fn find_live_cells_by_type_script(
+        &self,
+        type_script: &Script,
+        max_results: usize,
+    ) -> Result<Vec<LiveCell>, RpcError>;
+
     fn submit_transaction(&self, tx: &TransactionView) -> Result<Byte32, RpcError>;
 
     fn get_transaction_status(&self, tx_hash: &Byte32) -> Result<TxStatus, RpcError>;

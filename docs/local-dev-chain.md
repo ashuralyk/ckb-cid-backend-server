@@ -47,8 +47,13 @@ Success prints `local-chain execution tx committed:` and `local-chain closure ok
 | `CID_HEALTH_BIND` | optional | Opt-in health/stats HTTP (`docs/observability.md`) |
 | `CID_CONFIRMATION_DEPTH` | optional | Blocks before a committed execution tx is settled (default 24; see `docs/confirmation.md`) |
 | `CID_LOG_FORMAT` / `RUST_LOG` | optional | Structured logs (`docs/observability.md`) |
+| `CID_CONFIG` | optional | TOML path (`--config` wins). See `examples/cid.network.toml.example`. No keys. |
 
-`assemble` uses `extra_cell_deps` as-is and does not auto-fill script deps. `CkbRpc` always uses `CID_PROCESS_CODE_HASH` as a type-script prefix, then filters `calc_script_hash`; the args hash alone is usually not a usable prefix.
+Production/dev operators may put the same public RPC / Type-ID / static cell-dep values in a TOML file. `network.genesis_hash` is declared identity only unless `validate_genesis = true`.
+
+**Local-chain fixture stays static `data1` cell deps** (CID lock ELF / Process ELF / always-success outpoints) with `ProcessResolver` SSRI source = state-cell ELF. Type-ID discovery (`*_TYPE_ID_ARGS`) is for `hash_type=type` networks; it is optional here and does not replace the local data1 path. On Type-ID networks, code CellDeps are resolved each tick from configured `type_id_args` (bounded exact TYPE_ID type-script search with cell data); when Process Type-ID is set, SSRI binds to that code-cell ELF snapshot. Static `[[cell_deps]]` remain for unlabeled extras; labeled role deps conflict with Type-ID for the same role.
+
+`assemble` uses the tick's merged CellDeps (Type-ID resolved + static; same-outpoint dep_type conflicts fail closed). Confirmation/reorg reconciliation runs even if Type-ID refresh fails. `CkbRpc` uses `CID_PROCESS_CODE_HASH` (and auto-derived Process code `type_id` when configured) as a type-script prefix, then filters `calc_script_hash`.
 
 State is memory-only. Restarting the daemon drops in-flight occupancy and full-rescans indexer `asc`.
 

@@ -31,7 +31,9 @@ Stable field `event` (target `cid_backend`):
 | `pending.settled` | Confirmation depth reached |
 | `pending.dropped` / `pending.reorg` | Pending/confirming tx gone |
 | `reorg.tip_rewind` | Tip height moved backwards |
-| `config.load_failed` | Illegal env / health bind failure (process exits) |
+| `config.load_failed` | Illegal env / TOML / health bind failure (process exits) |
+| `config.loaded` | Successful load: path, `network_name`, declared `genesis_hash`, `genesis_status` (`declared_unverified` / `declared_will_verify` / `unset`), rpc/indexer **host only** (no userinfo) |
+| `genesis.verified` | `validate_genesis=true` and `get_block_hash(0x0)` matched (fail-closed otherwise: `genesis.mismatch`) |
 
 ## Health HTTP
 

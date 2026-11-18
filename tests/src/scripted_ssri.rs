@@ -9,6 +9,8 @@ use ckb_types::prelude::*;
 pub struct ScriptedSsri {
     pub bounds: (u32, u32),
     pub mode: Mode,
+    /// Binaries observed by `get_batch_bounds` / `assemble` (SSRI source tests).
+    pub seen_binaries: RefCell<Vec<Vec<u8>>>,
 }
 
 pub enum Mode {
@@ -24,42 +26,42 @@ pub enum Mode {
 }
 
 impl ScriptedSsri {
-    pub fn mimic(bounds: (u32, u32)) -> Self {
+    fn base(bounds: (u32, u32), mode: Mode) -> Self {
         Self {
             bounds,
-            mode: Mode::MimicExample,
+            mode,
+            seen_binaries: RefCell::new(Vec::new()),
         }
+    }
+
+    pub fn mimic(bounds: (u32, u32)) -> Self {
+        Self::base(bounds, Mode::MimicExample)
     }
 
     pub fn incompatible(code: i8) -> Self {
-        Self {
-            bounds: (1, 4),
-            mode: Mode::AlwaysIncompatible(code),
-        }
+        Self::base((1, 4), Mode::AlwaysIncompatible(code))
     }
 
     pub fn unusable() -> Self {
-        Self {
-            bounds: (1, 4),
-            mode: Mode::Unusable,
-        }
+        Self::base((1, 4), Mode::Unusable)
     }
 
     pub fn ok_then_incompatible(bounds: (u32, u32), ok_calls: u32, code: i8) -> Self {
-        Self {
+        Self::base(
             bounds,
-            mode: Mode::OkThenIncompatible {
+            Mode::OkThenIncompatible {
                 remaining_ok: RefCell::new(ok_calls),
                 code,
             },
-        }
+        )
     }
 
     pub fn fixed_beneficiary(bounds: (u32, u32), capacity: u64) -> Self {
-        Self {
-            bounds,
-            mode: Mode::FixedBeneficiary(capacity),
-        }
+        Self::base(bounds, Mode::FixedBeneficiary(capacity))
+    }
+
+    fn note_binary(&self, binary: &[u8]) {
+        self.seen_binaries.borrow_mut().push(binary.to_vec());
     }
 }
 
@@ -78,7 +80,8 @@ fn pack_partial(outputs: Vec<CellOutput>, data: Vec<Vec<u8>>) -> PartialTx {
 }
 
 impl SsriHost for ScriptedSsri {
-    fn get_batch_bounds(&self, _binary: &[u8]) -> Result<(u32, u32), SsriError> {
+    fn get_batch_bounds(&self, binary: &[u8]) -> Result<(u32, u32), SsriError> {
+        self.note_binary(binary);
         match &self.mode {
             Mode::Unusable => Err(SsriError::Unusable("scripted".into())),
             _ => Ok(self.bounds),
@@ -87,9 +90,10 @@ impl SsriHost for ScriptedSsri {
 
     fn assemble(
         &self,
-        _binary: &[u8],
+        binary: &[u8],
         intentions: &[IntentionInput],
     ) -> Result<PartialTx, SsriError> {
+        self.note_binary(binary);
         match &self.mode {
             Mode::AlwaysIncompatible(c) => Err(SsriError::Incompatible(*c)),
             Mode::Unusable => Err(SsriError::Unusable("scripted".into())),

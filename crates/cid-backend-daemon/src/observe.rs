@@ -650,6 +650,13 @@ mod tests {
         ) -> Result<Option<LiveCell>, RpcError> {
             Ok(None)
         }
+        fn find_live_cells_by_type_script(
+            &self,
+            _: &ckb_types::packed::Script,
+            _: usize,
+        ) -> Result<Vec<LiveCell>, RpcError> {
+            Ok(Vec::new())
+        }
         fn submit_transaction(&self, _: &TransactionView) -> Result<Byte32, RpcError> {
             Err(RpcError::Unavailable("no".into()))
         }
@@ -674,6 +681,13 @@ mod tests {
             &self,
             _: &[u8; 32],
         ) -> Result<Option<LiveCell>, RpcError> {
+            Err(RpcError::Unavailable("indexer down".into()))
+        }
+        fn find_live_cells_by_type_script(
+            &self,
+            _: &ckb_types::packed::Script,
+            _: usize,
+        ) -> Result<Vec<LiveCell>, RpcError> {
             Err(RpcError::Unavailable("indexer down".into()))
         }
         fn submit_transaction(&self, _: &TransactionView) -> Result<Byte32, RpcError> {
@@ -703,6 +717,7 @@ mod tests {
             hash_type: ScriptHashType::Type,
             poll_interval: Duration::from_secs(1),
             extra_cell_deps: vec![],
+            type_id_code_deps: vec![],
             confirmation_depth: 1,
         }
     }
