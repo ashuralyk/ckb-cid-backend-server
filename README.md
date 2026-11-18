@@ -27,7 +27,7 @@ The daemon continuously digests CID Intentions:
 4. In-process SSRI: `Process.batch` yields `[min, max]`; `Process.assemble` yields a partial tx.
 5. Assemble an Execution Tx and `send_transaction`:
    - **`digest_ok`**: destroy this batch of Intentions; Process **1 in / 1 out** recreate. No extra fee / sponsor input; User Lock is not placed in inputs (no signature after Intention creation). Skip on capacity shortfall.
-   - **`digest_incompatible`**: when SSRI returns `Incompatible(code)`, refund Intention capacity to the **User Lock** in args (does not spend Process). If the refund cannot be built, log and skip.
+   - **`digest_incompatible`**: when SSRI returns `Incompatible(code)`, refund to the **User Lock** in args (does not spend Process). Exact **capacity** is copied, and original cell **data** is kept. Supported assets: pure CKB (no type script), or **standard xUDT** (official Data1 `XUDT_CODE_HASH` + 16-byte amount) which also keeps the type script. Any other type script, or xUDT data that is not 16 bytes, is `RefundUnbuildable`: log and skip. See `assemble.rs::refund_output`.
 6. After a successful submit, occupy spent inputs (and the `digest_ok` Process recreate) until confirmation depth is met.
 
 Out of scope: timeout-burn proxy, multi-sig fee sponsor, official ssri-server, multi-instance coordination, testnet/mainnet ops scripts.
@@ -43,7 +43,7 @@ Upstream git pin (`cid-process-executor` / `cid-protocol`): `d9ee77805f7ac930ab1
 - Rust **stable** ([`rust-toolchain.toml`](rust-toolchain.toml)), edition 2021; workspace `ckb-types` 0.119.
 - Running the daemon / FakeRpc tests: `cargo` only.
 - Running the **real SSRI guest** (ckb-vm `Process.batch` / `Process.assemble`): `clang-18` (or `CLANG=clang`) + `riscv64imac-unknown-none-elf`, via [`scripts/build-cid-process-example.sh`](scripts/build-cid-process-example.sh). The ELF is **not** committed.
-- Isolated local dev-chain closure: also pinned `ckb` v0.119.0 (the script downloads it). **Not** testnet / mainnet. See [`docs/local-dev-chain.md`](docs/local-dev-chain.md).
+- Isolated local dev-chain closure: pinned `ckb` v0.119.0. [`scripts/local-dev-chain.sh`](scripts/local-dev-chain.sh) **auto-downloads** the `x86_64-unknown-linux-gnu` binary only. Other platforms (macOS, ARM Linux) must place a matching `ckb` at `$CKB_DIR/ckb` (default `.local-ckb/ckb`). Also needs `python3`, `make`, `git`, `curl`, `tar`. **Not** testnet / mainnet. See [`docs/local-dev-chain.md`](docs/local-dev-chain.md).
 
 ### Build
 
@@ -55,24 +55,26 @@ cargo build --locked -p cid-backend-daemon
 
 `DaemonConfig::from_env()` ([`crates/cid-backend-daemon/src/config.rs`](crates/cid-backend-daemon/src/config.rs)). Missing required values or illegal config logs `config.load_failed` and **exits 1**.
 
-| Variable | Required | Default / meaning |
-|----------|----------|-------------------|
-| `CID_CKB_RPC_URL` | yes | Node JSON-RPC |
-| `CID_INDEXER_URL` | no | Indexer JSON-RPC; empty uses `CID_CKB_RPC_URL` |
-| `CID_LOCK_CODE_HASH` | yes | CID lock `code_hash`, 32-byte hex (`0x` optional) |
-| `CID_LOCK_HASH_TYPE` | no | `type` (default) / `data` / `data1` / `data2` |
-| `CID_POLL_INTERVAL_SECS` | yes | Seconds between ticks, integer **≥ 1** |
-| `CID_LOCK_CELL_DEP` | local-chain | `<tx_hash>:<index>` CID lock code cell (`DepType::Code`) |
-| `CID_PROCESS_CODE_CELL_DEP` | local-chain | Process ELF code cell |
-| `CID_PROCESS_LOCK_CELL_DEP` | local-chain | always-success code cell |
-| `CID_EXTRA_CELL_DEPS` | no | Extra `<tx_hash>:<index>` list, comma-separated |
-| `CID_PROCESS_CODE_HASH` | local-chain | Process ELF **data hash**, used as indexer type-script prefix; CID args store `calc_script_hash`, not code hash. Comma-separated list allowed |
-| `CID_HEALTH_BIND` | no | `host:port` (e.g. `127.0.0.1:9100`); unset or empty **disables** HTTP |
-| `CID_CONFIRMATION_DEPTH` | no | Blocks after a committed Execution Tx before settle; default **24**, must be **≥ 1** |
-| `CID_LOG_FORMAT` | no | `json` (default) or `pretty` (`text` is an alias for pretty) |
-| `RUST_LOG` | no | `tracing` EnvFilter, default `info` |
+| Variable | Config parser | Default / meaning |
+|----------|---------------|-------------------|
+| `CID_CKB_RPC_URL` | required | Node JSON-RPC |
+| `CID_INDEXER_URL` | optional | Indexer JSON-RPC; empty uses `CID_CKB_RPC_URL` |
+| `CID_LOCK_CODE_HASH` | required | CID lock `code_hash`, 32-byte hex (`0x` optional) |
+| `CID_LOCK_HASH_TYPE` | optional | `type` (default) / `data` / `data1` / `data2` |
+| `CID_POLL_INTERVAL_SECS` | required | Seconds between ticks, integer **≥ 1** |
+| `CID_LOCK_CELL_DEP` | optional; **needed at run** to execute CID lock | `<tx_hash>:<index>` CID lock code cell (`DepType::Code`) |
+| `CID_PROCESS_CODE_CELL_DEP` | optional; **needed at run** to execute Process type | Process ELF (or other Process type) code cell |
+| `CID_PROCESS_LOCK_CELL_DEP` | optional; **needed at run** to spend Process lock | Process lock code cell (local-chain uses always-success) |
+| `CID_EXTRA_CELL_DEPS` | optional | Extra `<tx_hash>:<index>` list, comma-separated |
+| `CID_PROCESS_CODE_HASH` | optional; **needed at run** to find Process cells | Indexer type-script **code_hash prefix** for the Process type. Must match that type script's `hash_type` (data1 local-chain: ELF **data** hash; type: Type-ID code hash — not always an ELF hash). CID args store `calc_script_hash`, which is **not** this prefix. Comma-separated list allowed |
+| `CID_HEALTH_BIND` | optional | `host:port` (e.g. `127.0.0.1:9100`); unset or empty **disables** HTTP |
+| `CID_CONFIRMATION_DEPTH` | optional | Blocks after a committed Execution Tx before settle; default **24**, must be **≥ 1** |
+| `CID_LOG_FORMAT` | optional | `json` (default) or `pretty` (`text` is an alias for pretty) |
+| `RUST_LOG` | optional | `tracing` EnvFilter, default `info` |
 
-Cell-dep format: `<tx_hash>:<index>`; index may be decimal or `0x` hex. The four cell-dep variables are merged into `LoopConfig.extra_cell_deps`.
+Cell-dep format: `<tx_hash>:<index>`; index may be decimal or `0x` hex. The four cell-dep variables are merged into `LoopConfig.extra_cell_deps`. `assemble` uses that list as-is and **does not** auto-fill script deps.
+
+`CID_PROCESS_CODE_HASH` is not a local-chain-only switch. `CkbRpc::get_live_process_by_type_hash` always searches indexer type prefixes from that list (plus a prefix search on the args `process_type_hash` itself), then filters `calc_script_hash`. The args hash is a full script hash, so using it as a type `code_hash` prefix usually finds nothing — set the Process type's actual `code_hash`.
 
 The daemon does **not** read `CID_PROCESS_EXAMPLE_PATH` / `CID_LOCAL_CHAIN_E2E` (test fixture / local-chain E2E switch). Production Process binaries come only from live Process cell data. `CkbRpc` talks JSON-RPC to `CID_CKB_RPC_URL` / `CID_INDEXER_URL`; tests use in-memory `FakeRpc`.
 
@@ -82,7 +84,8 @@ The daemon does **not** read `CID_PROCESS_EXAMPLE_PATH` / `CID_LOCAL_CHAIN_E2E` 
 export CID_CKB_RPC_URL=http://127.0.0.1:8114
 export CID_LOCK_CODE_HASH=   # 32-byte hex
 export CID_POLL_INTERVAL_SECS=5
-# local chain also needs CID_LOCK_CELL_DEP / CID_PROCESS_* / CID_PROCESS_CODE_HASH; see docs/local-dev-chain.md
+# By deployment: CID_LOCK_CELL_DEP / CID_PROCESS_*_CELL_DEP / CID_PROCESS_CODE_HASH
+# (query prefix + script deps; assemble does not invent them). See docs/local-dev-chain.md
 cargo run -p cid-backend-daemon
 ```
 
@@ -90,19 +93,21 @@ cargo run -p cid-backend-daemon
 
 ### Isolated local dev chain
 
-Do not use public RPC. The script downloads pinned `ckb` v0.119.0, sets `min_fee_rate` to **0** (digest tx has no fee input), enables the Indexer module, builds RISC-V guests, starts `ckb run` + `ckb miner` on `127.0.0.1:8114`, then runs the ignored E2E:
+Do not use public RPC. The supported entry is:
 
 ```bash
 ./scripts/local-dev-chain.sh
 ```
 
-Equivalent to:
+That script: auto-downloads pinned `ckb` v0.119.0 **only** as `x86_64-unknown-linux-gnu` (skip download if `$CKB_DIR/ckb` is already executable; default `CKB_DIR=.local-ckb`); inits `dev` with genesis miner lock; sets `min_fee_rate` to **0** (digest tx has no fee input); enables the Indexer module; builds RISC-V guests (`clang-18` / `CLANG`, `git`, `make`, `python3`); starts `ckb run` + `ckb miner` on `127.0.0.1:8114`; exports `CID_CKB_RPC_URL`, `CID_PROCESS_EXAMPLE_PATH`, `CID_LOCK_ELF_PATH`, `CID_ALWAYS_SUCCESS_PATH`, `CID_LOCAL_CHAIN_E2E=1`; then runs:
 
 ```bash
-CID_LOCAL_CHAIN_E2E=1 cargo test -p cid-backend-daemon --test local_chain_e2e -- --ignored --nocapture
+cargo test -p cid-backend-daemon --test local_chain_e2e -- --ignored --nocapture
 ```
 
-Success prints `local-chain execution tx committed:` and `local-chain closure ok:`. Details and local-chain prerequisites (Process data must be an ELF, Process lock is always-success, no post-Intention signature) are in [`docs/local-dev-chain.md`](docs/local-dev-chain.md).
+The cargo line is **not** equivalent by itself. On a clean machine it fails without the node and those paths (`local_chain_e2e.rs`). On macOS / ARM Linux, install a matching `ckb` v0.119.0 into `$CKB_DIR/ckb` first. Also needs `curl` and `tar` for the Linux x86_64 download path.
+
+Success prints `local-chain execution tx committed:` and `local-chain closure ok:`. Details (Process data must be an ELF, Process lock is always-success, no post-Intention signature) are in [`docs/local-dev-chain.md`](docs/local-dev-chain.md).
 
 ### Health / metrics
 
