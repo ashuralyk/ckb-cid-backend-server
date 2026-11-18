@@ -51,9 +51,24 @@ Upstream git pin (`cid-process-executor` / `cid-protocol`): `d9ee77805f7ac930ab1
 cargo build --locked -p cid-backend-daemon
 ```
 
-### Configuration (env vars the daemon actually reads)
+### Configuration
 
-`DaemonConfig::from_env()` ([`crates/cid-backend-daemon/src/config.rs`](crates/cid-backend-daemon/src/config.rs)). Missing required values or illegal config logs `config.load_failed` and **exits 1**.
+The daemon is **keyless** (no signing, no dotenv / `.env`). Public network, contract, and runtime settings go in a TOML file; legacy `CID_*` process environment variables still work and **override** the file when set and non-empty.
+
+```bash
+cargo run -p cid-backend-daemon -- --config examples/cid.network.toml.example
+# or: CID_CONFIG=/path/to/cid.toml cargo run -p cid-backend-daemon
+```
+
+`--config PATH` wins over `CID_CONFIG`. If neither is set, behaviour is the previous env-only load (`DaemonConfig::from_vars`). Precedence: **built-in defaults < TOML file < explicit non-empty `CID_*` env**. Copy [`examples/cid.network.toml.example`](examples/cid.network.toml.example) and replace every `<PLACEHOLDER>` — that example is **not** valid hex/URLs and will not start.
+
+`network.name` is a **log label only**. `network.genesis_hash` is the declared chain identity (that node’s `get_block_hash("0x0")`). File mode **requires** it (or `CID_GENESIS_HASH`). It is **not** verified unless `network.validate_genesis = true` (or `CID_VALIDATE_GENESIS=true`), in which case the daemon fail-closes on RPC error or mismatch. Logs use `genesis_status=declared_unverified` or `genesis.verified` accordingly. Cell deps and Process prefixes are **never** auto-discovered.
+
+`config.loaded` logs `rpc` / `indexer` as scheme+host+port only (userinfo and path/query stripped).
+
+`DaemonConfig` lives in [`crates/cid-backend-daemon/src/config.rs`](crates/cid-backend-daemon/src/config.rs). Missing required values or illegal config logs `config.load_failed` and **exits 1**.
+
+#### Env vars (legacy; also file overrides)
 
 | Variable | Config parser | Default / meaning |
 |----------|---------------|-------------------|
@@ -70,6 +85,9 @@ cargo build --locked -p cid-backend-daemon
 | `CID_HEALTH_BIND` | optional | `host:port` (e.g. `127.0.0.1:9100`); unset or empty **disables** HTTP |
 | `CID_CONFIRMATION_DEPTH` | optional | Blocks after a committed Execution Tx before settle; default **24**, must be **≥ 1** |
 | `CID_LOG_FORMAT` | optional | `json` (default) or `pretty` (`text` is an alias for pretty) |
+| `CID_CONFIG` | optional | TOML path if `--config` is omitted |
+| `CID_GENESIS_HASH` | optional | Overrides `network.genesis_hash` |
+| `CID_VALIDATE_GENESIS` | optional | `true`/`false`; overrides `network.validate_genesis` |
 | `RUST_LOG` | optional | `tracing` EnvFilter, default `info` |
 
 Cell-dep format: `<tx_hash>:<index>`; index may be decimal or `0x` hex. The four cell-dep variables are merged into `LoopConfig.extra_cell_deps`. `assemble` uses that list as-is and **does not** auto-fill script deps.
@@ -87,9 +105,10 @@ export CID_POLL_INTERVAL_SECS=5
 # By deployment: CID_LOCK_CELL_DEP / CID_PROCESS_*_CELL_DEP / CID_PROCESS_CODE_HASH
 # (query prefix + script deps; assemble does not invent them). See docs/local-dev-chain.md
 cargo run -p cid-backend-daemon
+# same settings in TOML: cargo run -p cid-backend-daemon -- --config path/to/cid.toml
 ```
 
-`main` sleeps `poll_interval` after each `tick()`. Illegal config exits immediately.
+`main` sleeps `poll_interval` after each `tick()`. Illegal config exits immediately. `--help` prints the flag list.
 
 ### Isolated local dev chain
 

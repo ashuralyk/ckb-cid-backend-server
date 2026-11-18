@@ -47,6 +47,9 @@ Success prints `local-chain execution tx committed:` and `local-chain closure ok
 | `CID_HEALTH_BIND` | optional | Opt-in health/stats HTTP (`docs/observability.md`) |
 | `CID_CONFIRMATION_DEPTH` | optional | Blocks before a committed execution tx is settled (default 24; see `docs/confirmation.md`) |
 | `CID_LOG_FORMAT` / `RUST_LOG` | optional | Structured logs (`docs/observability.md`) |
+| `CID_CONFIG` | optional | TOML path (`--config` wins). See `examples/cid.network.toml.example`. No keys. |
+
+Production/dev operators may put the same public RPC, lock, Process prefix, and cell-dep values in a TOML file. `network.genesis_hash` is declared identity only unless `validate_genesis = true`. The daemon does not auto-fill deployments.
 
 `assemble` uses `extra_cell_deps` as-is and does not auto-fill script deps. `CkbRpc` always uses `CID_PROCESS_CODE_HASH` as a type-script prefix, then filters `calc_script_hash`; the args hash alone is usually not a usable prefix.
 
