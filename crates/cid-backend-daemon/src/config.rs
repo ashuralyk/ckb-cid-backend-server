@@ -63,6 +63,9 @@ pub enum CliAction {
 }
 
 /// Strip userinfo / path / query so logs never echo credential-bearing RPC URLs.
+///
+/// Only `@` inside the URI authority is treated as userinfo. `@` in path, query,
+/// or fragment must not be mistaken for credentials (would leak the suffix as host).
 pub fn rpc_endpoint_for_log(raw: &str) -> String {
     let Some(scheme_end) = raw.find("://") else {
         return "<invalid-rpc-url>".into();
@@ -72,11 +75,13 @@ pub fn rpc_endpoint_for_log(raw: &str) -> String {
         return "<invalid-rpc-url>".into();
     }
     let rest = &raw[scheme_end + 3..];
-    let after_auth = rest.split_once('@').map(|(_, host)| host).unwrap_or(rest);
-    let hostport = after_auth
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or(after_auth);
+    // RFC 3986: authority ends at the first `/`, `?`, or `#`.
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let hostport = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
     if hostport.is_empty() || hostport.contains('@') {
         return "<invalid-rpc-url>".into();
     }
@@ -288,7 +293,34 @@ struct ObserveSection {
 fn read_file_config(path: &Path) -> Result<FileConfig, ConfigError> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| ConfigError::Invalid(format!("cannot read config {}: {e}", path.display())))?;
-    toml::from_str(&raw).map_err(|e| ConfigError::Invalid(format!("TOML {}: {e}", path.display())))
+    toml::from_str(&raw).map_err(|e| format_toml_parse_error(path, &raw, e))
+}
+
+/// Build a TOML parse diagnostic that never echoes the offending source line.
+///
+/// `toml::de::Error`'s `Display` embeds the raw document line (and caret), which
+/// can contain secret-bearing values. Use `message()` plus line/column only.
+fn format_toml_parse_error(path: &Path, raw: &str, err: toml::de::Error) -> ConfigError {
+    let mut msg = format!("TOML {}: {}", path.display(), err.message());
+    if let Some(span) = err.span() {
+        let (line, col) = line_col_of(raw, span.start);
+        msg.push_str(&format!(" (line {line}, column {col})"));
+    }
+    ConfigError::Invalid(msg)
+}
+
+/// 1-based line and column for `byte_index` into `raw` (UTF-8 safe for column).
+fn line_col_of(raw: &str, byte_index: usize) -> (usize, usize) {
+    let byte_index = byte_index.min(raw.len());
+    let before = &raw[..byte_index];
+    let line = before.bytes().filter(|&b| b == b'\n').count() + 1;
+    let col = before
+        .rsplit('\n')
+        .next()
+        .map(|s| s.chars().count())
+        .unwrap_or(0)
+        + 1;
+    (line, col)
 }
 
 fn nonempty(get: &impl Fn(&str) -> Option<String>, key: &str) -> Option<String> {
@@ -1182,20 +1214,76 @@ poll_interval_secs = 1
 
     #[test]
     fn unknown_key_rejected() {
-        let p = write_toml("[network]\ngenesis_hash = \"aa\"\nprivate_key = \"nope\"\n");
+        let p = write_toml(
+            "[network]\ngenesis_hash = \"aa\"\nprivate_key = \"SECRET_MARKER\"\n",
+        );
         let err = DaemonConfig::from_file_and_vars(Some(&p), |_| None).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("TOML") || msg.contains("unknown"), "{msg}");
+        assert!(
+            msg.to_ascii_lowercase().contains("unknown") || msg.contains("private_key"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("SECRET_MARKER"),
+            "TOML diagnostic must not echo secret value: {msg}"
+        );
     }
 
     #[test]
     fn unknown_top_level_key_rejected() {
-        let p = write_toml("secret = \"x\"\n");
+        let p = write_toml("secret = \"SECRET_MARKER\"\n");
         let err = DaemonConfig::from_file_and_vars(Some(&p), |_| None).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.to_ascii_lowercase().contains("unknown") || msg.contains("TOML"),
             "{msg}"
+        );
+        assert!(
+            !msg.contains("SECRET_MARKER"),
+            "TOML diagnostic must not echo secret value: {msg}"
+        );
+    }
+
+    #[test]
+    fn malformed_toml_diagnostic_omits_secret_bearing_line() {
+        // Trailing garbage after a credential-looking URL value: toml Display would
+        // reprint the line; we must keep only message + line/column.
+        let body = format!(
+            r#"
+[network]
+genesis_hash = "0x{g}"
+[rpc]
+url = "http://user:SECRET_MARKER@127.0.0.1:8114/"
+<<<
+[cid_lock]
+code_hash = "0x{lock}"
+[loop]
+poll_interval_secs = 1
+"#,
+            g = "11".repeat(32),
+            lock = "22".repeat(32),
+        );
+        let p = write_toml(&body);
+        let err = DaemonConfig::from_file_and_vars(Some(&p), |_| None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("TOML"), "{msg}");
+        assert!(
+            msg.contains("line") && msg.contains("column"),
+            "expected safe location hint: {msg}"
+        );
+        assert!(
+            !msg.contains("SECRET_MARKER"),
+            "TOML diagnostic must not echo secret value: {msg}"
+        );
+        assert!(
+            !msg.contains("user:"),
+            "TOML diagnostic must not echo userinfo: {msg}"
+        );
+        // Must not look like toml's pretty Display (raw line + caret gutter).
+        assert!(
+            !msg.contains(" | "),
+            "TOML diagnostic must not embed source gutter: {msg}"
         );
     }
 
@@ -1304,5 +1392,32 @@ poll_interval_secs = 1
         assert!(!redacted.contains("user:"));
         assert_eq!(rpc_endpoint_for_log("not-a-url"), "<invalid-rpc-url>");
         assert_eq!(rpc_endpoint_for_log("ftp://127.0.0.1"), "<invalid-rpc-url>");
+    }
+
+    #[test]
+    fn rpc_endpoint_for_log_ignores_at_outside_authority() {
+        // Review repro: `@` in query must not be treated as userinfo.
+        let q = rpc_endpoint_for_log("https://rpc.example/v1?api_key=prefix@TOKEN_MARKER");
+        assert_eq!(q, "https://rpc.example");
+        assert!(!q.contains("TOKEN_MARKER"));
+        assert!(!q.contains("prefix"));
+        assert!(!q.contains("api_key"));
+
+        let path = rpc_endpoint_for_log("https://rpc.example/v1/@TOKEN_MARKER/rpc");
+        assert_eq!(path, "https://rpc.example");
+        assert!(!path.contains("TOKEN_MARKER"));
+
+        let frag = rpc_endpoint_for_log("https://rpc.example/rpc#user@TOKEN_MARKER");
+        assert_eq!(frag, "https://rpc.example");
+        assert!(!frag.contains("TOKEN_MARKER"));
+
+        // Authority userinfo still stripped; path/query/fragment discarded.
+        let mixed = rpc_endpoint_for_log(
+            "https://user:s3cret@rpc.example:8443/v1?api_key=prefix@TOKEN_MARKER#x@y",
+        );
+        assert_eq!(mixed, "https://rpc.example:8443");
+        assert!(!mixed.contains("s3cret"));
+        assert!(!mixed.contains("TOKEN_MARKER"));
+        assert!(!mixed.contains("user"));
     }
 }
