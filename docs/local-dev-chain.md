@@ -26,7 +26,7 @@ Default auto-download is **Linux x86_64** (`ckb_${version}_x86_64-unknown-linux-
 ./scripts/local-dev-chain.sh
 ```
 
-The script inits `dev` with genesis miner lock, sets **`min_fee_rate = 0`** (D8: no fee input; `digest_ok` pays from Process recreate; Incompatible refunds stay zero-fee — a known public-net gap, required here so local refunds clear), enables the Indexer RPC module, builds RISC-V guests, starts `ckb run` + `ckb miner` on `127.0.0.1:8114`, exports `CID_CKB_RPC_URL`, `CID_PROCESS_EXAMPLE_PATH`, `CID_LOCK_ELF_PATH`, `CID_ALWAYS_SUCCESS_PATH`, `CID_LOCAL_CHAIN_E2E=1`, then runs the ignored E2E. Setting only `CID_LOCAL_CHAIN_E2E=1` and invoking `cargo test` on a clean machine is **not** equivalent.
+The script inits `dev` with genesis miner lock, sets **`min_fee_rate = 0`** (D8: no fee input; `digest_ok` pays from Process recreate; Incompatible refunds default to exact/zero-fee under legacy `bounded_refund_fee = false` — required here so local refunds clear against the pinned lock), enables the Indexer RPC module, builds RISC-V guests, starts `ckb run` + `ckb miner` on `127.0.0.1:8114`, exports `CID_CKB_RPC_URL`, `CID_PROCESS_EXAMPLE_PATH`, `CID_LOCK_ELF_PATH`, `CID_ALWAYS_SUCCESS_PATH`, `CID_LOCAL_CHAIN_E2E=1`, then runs the ignored E2E. Setting only `CID_LOCAL_CHAIN_E2E=1` and invoking `cargo test` on a clean machine is **not** equivalent.
 
 Success prints `local-chain execution tx committed:` and `local-chain closure ok:`.
 
@@ -46,6 +46,8 @@ Success prints `local-chain execution tx committed:` and `local-chain closure ok
 | `CID_EXTRA_CELL_DEPS` | optional | Extra `tx_hash:index` list |
 | `CID_HEALTH_BIND` | optional | Opt-in health/stats HTTP (`docs/observability.md`) |
 | `CID_CONFIRMATION_DEPTH` | optional | Blocks before a committed execution tx is settled (default 24; see `docs/confirmation.md`) |
+| `CID_FEE_RATE` | optional | Shannons/KW for digest_ok (Process recreate) and bounded refunds (default 1000) |
+| `CID_BOUNDED_REFUND_FEE` | optional | `true`/`false` — explicit opt-in for ≤ `MAX_REFUND_FEE` refund haircuts (default **false** / legacy exact). Enable only after OWNER redeploy of a lock that accepts the window; never against an undeployed candidate hash. |
 | `CID_LOG_FORMAT` / `RUST_LOG` | optional | Structured logs (`docs/observability.md`) |
 | `CID_CONFIG` | optional | TOML path (`--config` wins). See `examples/cid.network.toml.example`. No keys. |
 
@@ -59,7 +61,7 @@ State is memory-only. Restarting the daemon drops in-flight occupancy and full-r
 
 ## Essential local-chain prerequisites (not phase 3)
 
-- **`min_fee_rate = 0`** on the node. No fee input (D8); `digest_ok` still overpays from Process when `loop.fee_rate > 0`. Refunds stay zero-fee.
+- **`min_fee_rate = 0`** on the node. No fee input (D8); `digest_ok` still overpays from Process when `loop.fee_rate > 0`. Local fixture keeps legacy exact refunds (`bounded_refund_fee = false`) so pinned lock rules still clear.
 - Process cell **data is the RISC-V ELF** so `ProcessResolver` (D4) can SSRI it; the same ELF is also a code cell so the Process **type** script can execute (`hash_type = data1`).
 - Process **lock** is always-success so the daemon does not hold secp keys (no post-Intention signatures).
 - Lookup of live Process cells uses `CID_PROCESS_CODE_HASH` as the Process type's `code_hash` indexer prefix, then filters `calc_script_hash`. On this local chain that prefix is the Process ELF data hash because the type uses `hash_type = data1`.

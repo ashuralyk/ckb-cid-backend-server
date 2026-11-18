@@ -461,6 +461,7 @@ fn scan_resolve_ssri_submit_confirms_on_local_dev_chain() {
         health_bind: None,
         confirmation_depth: 1,
         fee_rate: cid_backend_core::DEFAULT_FEE_RATE,
+        bounded_refund_fee: false,
         network_name: Some("local-dev".into()),
         genesis_hash: None,
         validate_genesis: false,
