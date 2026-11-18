@@ -91,7 +91,7 @@ Static `[[cell_deps]]` / `CID_*_CELL_DEP` remain for **unrelated** extras (secp,
 | `CID_PROCESS_CODE_CELL_DEP` | optional static | Process type code cell outpoint (static mode) |
 | `CID_PROCESS_LOCK_CELL_DEP` | optional static | Process lock code cell (local-chain: always-success) |
 | `CID_EXTRA_CELL_DEPS` | optional | Extra `<tx_hash>:<index>` list, comma-separated |
-| `CID_PROCESS_CODE_HASH` | optional | Indexer type-script **code_hash prefix** for live Process cells; Type-ID mode auto-adds the derived Process code `type_id` |
+| `CID_PROCESS_CODE_HASH` | optional | Indexer type-script **code_hash prefix** for live Process cells; with Process Type-ID only the derived `type_id` is allowed (auto-set) |
 | `CID_HEALTH_BIND` | optional | `host:port` (e.g. `127.0.0.1:9100`); unset or empty **disables** HTTP |
 | `CID_CONFIRMATION_DEPTH` | optional | Blocks after a committed Execution Tx before settle; default **24**, must be **≥ 1** |
 | `CID_LOG_FORMAT` | optional | `json` (default) or `pretty` (`text` is an alias for pretty) |
@@ -199,15 +199,17 @@ The SSRI host is in-process `EmbeddedSsri` (`cid-process-executor`), not an exte
 
 ```mermaid
 flowchart TD
-  start["tick.start"] --> scan["scan_intentions: indexer get_cells ASC"]
-  scan -->|Unavailable| endTick["tick.end / keep occupancy"]
-  scan --> tip["refresh_tip + reconcile_pending"]
-  tip --> filter["filter in_flight / rejected"]
+  start["tick.start"] --> tip["refresh_tip + reconcile_pending"]
+  tip --> deps["refresh Type-ID code CellDeps"]
+  deps -->|Unavailable| endEarly["tick.end / no new assembly"]
+  deps --> scan["scan_intentions: indexer get_cells ASC"]
+  scan -->|Unavailable| endScan["tick.end / keep occupancy"]
+  scan --> filter["filter in_flight / rejected"]
   filter --> bucket["bucket by process_type_hash"]
-  bucket --> resolve["ProcessResolver: live cell data = ELF"]
+  bucket --> resolve["ProcessResolver SSRI source:<br/>Type-ID code ELF or legacy state ELF"]
   resolve --> bounds["SSRI Process.batch → min,max"]
   bounds --> isolate["isolate_window legal sub-batches"]
-  isolate --> peek["lookup rejected_combos fingerprint"]
+  isolate --> peek["lookup rejected_combos fingerprint<br/>incl. Type-ID code identity"]
   peek -->|cache hit| split["CachedRejected: split window, no send"]
   peek --> assemble["SSRI Process.assemble"]
   assemble -->|ok| dok["assemble_digest_ok<br/>Intention + Process 1in/1out"]
@@ -224,10 +226,11 @@ flowchart TD
 
 Each tick ([`digest_loop.rs`](crates/cid-backend-core/src/digest_loop.rs)):
 
-1. Scan live Intentions; skip cells whose lock args fail to decode.
-2. Refresh tip; ask `get_transaction_status` for txs in `pending`. After `Committed`, re-read tip: if the tip rewound, header/tip is unavailable, or `tip < commit_height`, do **not** settle this tick (see [`docs/confirmation.md`](docs/confirmation.md)).
-3. Bucket by Process; `isolate_window` splits into legal `[min, max]` sub-batches.
-4. `digest_ok` occupies the Process recreate until settle; User Lock refunds in the same tick may still submit.
+1. Refresh tip and reconcile `pending` (confirmation / reorg) **before** Type-ID code-dep refresh, so unavailable code deps never stall settlement.
+2. Resolve Type-ID code cells (bounded exact search); merge with static extras. On Process Type-ID, SSRI uses that code-cell ELF and requires the Process **state** type script `hash_type=type` + `code_hash` = derived TYPE_ID. Legacy mode uses state-cell ELF.
+3. Scan live Intentions; skip cells whose lock args fail to decode.
+4. Bucket by Process; `isolate_window` splits into legal `[min, max]` sub-batches. Reject/isolate fingerprints include Type-ID code outpoints so code upgrades clear stale `CachedRejected` without dropping `pending` / `in_flight`.
+5. `digest_ok` occupies the Process recreate until settle; User Lock refunds in the same tick may still submit.
 
 ### Memory-only state and restart
 

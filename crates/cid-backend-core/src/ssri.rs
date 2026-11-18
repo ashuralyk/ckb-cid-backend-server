@@ -170,8 +170,9 @@ mod tests {
     #[ignore = "requires pinned cid_process_example RISC-V guest; CI builds it; see tests/fixtures/README.md"]
     #[test]
     fn real_ssri_guest_binds_to_type_id_process_code_cell() {
-        use crate::process::{ProcessResolver, SsriBinarySource};
+        use crate::process::ProcessResolver;
         use crate::rpc::{LiveCell, Rpc, RpcError, TxStatus};
+        use crate::type_id::type_id_script_hash;
         use ckb_types::core::{ScriptHashType, TransactionView};
         use ckb_types::packed::{Byte32, CellOutput, OutPoint, Script};
         use ckb_types::prelude::*;
@@ -218,10 +219,12 @@ mod tests {
             }
         }
 
+        let type_id_args = [0xABu8; 32];
+        let expected = type_id_script_hash(&type_id_args);
         let ts = Script::new_builder()
-            .code_hash([0x51u8; 32].pack())
+            .code_hash(expected.pack())
             .hash_type(ScriptHashType::Type.into())
-            .args([0xABu8; 32].to_vec().pack())
+            .args([0xCDu8; 32].to_vec().pack())
             .build();
         let hash = crate::rpc::script_hash32(&ts);
         // Divergent state payload that looks like an ELF but is not the guest.
@@ -252,7 +255,7 @@ mod tests {
             data: bin.clone(),
         };
         let rpc = OneProcess { cell: state };
-        let mut resolver = ProcessResolver::with_ssri_source(SsriBinarySource::TypeIdCodeCell);
+        let mut resolver = ProcessResolver::with_type_id_process_code(expected);
         resolver.set_tick_process_code(Some(&code));
         let resolved = resolver.resolve(&rpc, &hash).unwrap().expect("resolved");
         assert_eq!(

@@ -14,9 +14,10 @@ pub struct SubmitState {
     /// Legacy outpoint skip set. SubmitRejected no longer writes here: a
     /// transaction-level reject cannot prove an individual Intention is invalid.
     pub rejected: HashSet<Vec<u8>>,
-    /// Intention-set (+ Process outpoint when the tx spends Process) that got
-    /// `SubmitRejected`. Identical combos are not resubmitted this process
-    /// lifetime. A new Process outpoint is a new combo.
+    /// Intention-set (+ Process outpoint when the tx spends Process) plus the
+    /// tick's Type-ID execution code identity that got `SubmitRejected`.
+    /// Identical combos are not resubmitted while that code snapshot is live.
+    /// A new Process outpoint **or** Type-ID code outpoint is a new combo.
     pub rejected_combos: HashSet<Vec<u8>>,
     /// Submitted tx hash bytes → consumed outpoints still treated as in-flight
     /// until the tx is dropped or reaches confirmation depth.
@@ -103,9 +104,16 @@ pub fn submit_execution<R: Rpc>(
     }
 }
 
-/// Ordered Intention outpoints plus optional Process. Used to skip resubmitting
-/// an identical combo after `SubmitRejected` without blaming one input.
-pub fn combo_fingerprint(intentions: &[OutPoint], process: Option<&OutPoint>) -> Vec<u8> {
+/// Ordered Intention outpoints, optional Process state outpoint, and the
+/// Type-ID execution code identity for this tick. Used to skip resubmitting an
+/// identical combo after `SubmitRejected` without blaming one input. When
+/// Process (or other Type-ID) **code** cells upgrade, `execution_code_key`
+/// changes so a previously rejected combo can be retried under the new guest.
+pub fn combo_fingerprint(
+    intentions: &[OutPoint],
+    process: Option<&OutPoint>,
+    execution_code_key: &[u8],
+) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend_from_slice(&(intentions.len() as u32).to_le_bytes());
     for op in intentions {
@@ -117,6 +125,18 @@ pub fn combo_fingerprint(intentions: &[OutPoint], process: Option<&OutPoint>) ->
             buf.extend(out_point_key(p));
         }
         None => buf.push(0),
+    }
+    buf.extend_from_slice(&(execution_code_key.len() as u32).to_le_bytes());
+    buf.extend_from_slice(execution_code_key);
+    buf
+}
+
+/// Stable key for Type-ID–resolved code CellDep outpoints (config order).
+pub fn execution_code_key(type_id_outpoints: &[OutPoint]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(4 + type_id_outpoints.len() * 36);
+    buf.extend_from_slice(&(type_id_outpoints.len() as u32).to_le_bytes());
+    for op in type_id_outpoints {
+        buf.extend(out_point_key(op));
     }
     buf
 }

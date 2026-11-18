@@ -75,6 +75,9 @@ pub struct ResolvedExecutionDeps {
     /// Present when a `process_code` Type-ID spec resolved. SSRI must use these
     /// bytes (same outpoint as the Process code CellDep) for this tick.
     pub process_code: Option<ResolvedTypeIdCode>,
+    /// Type-ID–resolved code outpoints in config order. Scopes reject/isolate
+    /// caches to the live code snapshot (upgrades must not inherit old rejects).
+    pub type_id_outpoints: Vec<OutPoint>,
 }
 
 /// Resolve one Type-ID code cell. Stops indexer walk after 2 matches.
@@ -155,8 +158,10 @@ pub fn resolve_execution_cell_deps<R: Rpc>(
 ) -> Result<ResolvedExecutionDeps, CodeDepError> {
     let mut resolved_cells = Vec::with_capacity(specs.len());
     let mut process_code = None;
+    let mut type_id_outpoints = Vec::with_capacity(specs.len());
     for spec in specs {
         let cell = resolve_type_id_code_cell(rpc, spec)?;
+        type_id_outpoints.push(cell.cell.out_point.clone());
         if spec.label == PROCESS_CODE_LABEL {
             process_code = Some(cell.clone());
         }
@@ -167,6 +172,7 @@ pub fn resolve_execution_cell_deps<R: Rpc>(
     Ok(ResolvedExecutionDeps {
         cell_deps,
         process_code,
+        type_id_outpoints,
     })
 }
 

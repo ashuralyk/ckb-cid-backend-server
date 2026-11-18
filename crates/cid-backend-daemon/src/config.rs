@@ -479,7 +479,19 @@ fn merge<F: Fn(&str) -> Option<String>>(
     };
     if let Some(ref id) = process_code_identity {
         let derived = id.type_script_hash();
-        if !process_type_code_hashes.iter().any(|h| h == &derived) {
+        // Type-ID Process mode: only the derived TYPE_ID script hash is a valid
+        // Process state type code_hash. Extra prefixes could surface unbound
+        // state cells; reject them at config (runtime still validates identity).
+        for h in &process_type_code_hashes {
+            if h != &derived {
+                return Err(ConfigError::Invalid(
+                    "CID_PROCESS_CODE_HASH / process.type_code_hashes must not list hashes \
+                     other than the derived process.type_id when process.type_id_args is set"
+                        .into(),
+                ));
+            }
+        }
+        if process_type_code_hashes.is_empty() {
             process_type_code_hashes.push(derived);
         }
     }
@@ -899,6 +911,25 @@ log_format = "pretty"
             msg.contains("not treat type_id as args") || msg.contains("without type_id_args"),
             "{msg}"
         );
+    }
+
+    #[test]
+    fn type_id_process_rejects_extra_process_code_hash_prefixes() {
+        let err = DaemonConfig::from_vars(|k| match k {
+            "CID_CKB_RPC_URL" => Some("http://127.0.0.1:8114".into()),
+            "CID_POLL_INTERVAL_SECS" => Some("5".into()),
+            "CID_LOCK_TYPE_ID_ARGS" => Some("aa".repeat(32)),
+            "CID_PROCESS_TYPE_ID_ARGS" => Some("bb".repeat(32)),
+            "CID_PROCESS_CODE_HASH" => Some("51".repeat(32)),
+            _ => None,
+        })
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("CID_PROCESS_CODE_HASH") || msg.contains("type_code_hashes"),
+            "{msg}"
+        );
+        assert!(msg.contains("derived") || msg.contains("type_id"), "{msg}");
     }
 
     #[test]

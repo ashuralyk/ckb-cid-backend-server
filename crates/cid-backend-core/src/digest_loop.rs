@@ -4,7 +4,7 @@ use crate::process::{ProcessResolver, ResolvedProcess};
 use crate::rpc::{out_point_key, Rpc, RpcError, TxStatus};
 use crate::scan::{bucket_by_process_type_hash, scan_intentions, ScannedIntention};
 use crate::ssri::{to_intention_input, SsriError, SsriHost};
-use crate::submit::{combo_fingerprint, submit_execution, SubmitState};
+use crate::submit::{combo_fingerprint, execution_code_key, submit_execution, SubmitState};
 use crate::type_id::TypeIdCodeDep;
 use ckb_types::core::ScriptHashType;
 use ckb_types::packed::{Byte32, CellDep};
@@ -59,6 +59,10 @@ pub struct LoopState {
     /// CellDeps resolved for the current tick (Type-ID + static). Snapshot is
     /// fixed for every assemble in this tick. Cleared when the tick ends.
     pub tick_cell_deps: Vec<CellDep>,
+    /// Type-ID code outpoint identity for this tick. Embedded in reject/isolate
+    /// fingerprints; when it changes, execution-derived caches are cleared
+    /// (not `pending` / `in_flight`).
+    pub execution_code_key: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -130,6 +134,7 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                 isolate_resume: HashMap::new(),
                 isolate_expanded: HashMap::new(),
                 tick_cell_deps: Vec::new(),
+                execution_code_key: Vec::new(),
             },
         }
     }
@@ -193,6 +198,17 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                 return report;
             }
         };
+        let code_key = execution_code_key(&resolved.type_id_outpoints);
+        if code_key != self.state.execution_code_key {
+            // Code upgrade (or first Type-ID resolve): drop execution-derived
+            // reject/isolate caches so guests can be retried. Keep pending /
+            // in_flight occupancy for submitted txs.
+            if !self.state.execution_code_key.is_empty() || !code_key.is_empty() {
+                self.state.submit.rejected_combos.clear();
+                self.state.isolate_expanded.clear();
+            }
+            self.state.execution_code_key = code_key;
+        }
         self.state.tick_cell_deps = resolved.cell_deps;
         self.state
             .resolver
@@ -259,6 +275,7 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
             return Ok(crate::code_deps::ResolvedExecutionDeps {
                 cell_deps: self.config.extra_cell_deps.clone(),
                 process_code: None,
+                type_id_outpoints: Vec::new(),
             });
         }
         resolve_execution_cell_deps(
@@ -530,7 +547,7 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
             let n = items.len().min(max as usize);
             let window = items[..n].to_vec();
             let rest = items[n..].to_vec();
-            let fp = Self::window_fingerprint(&window, process);
+            let fp = self.window_fingerprint(&window, process);
             let already = self
                 .state
                 .isolate_expanded
@@ -636,9 +653,13 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
         None
     }
 
-    fn window_fingerprint(batch: &[ScannedIntention], process: &ResolvedProcess) -> Vec<u8> {
+    fn window_fingerprint(&self, batch: &[ScannedIntention], process: &ResolvedProcess) -> Vec<u8> {
         let ops: Vec<_> = batch.iter().map(|i| i.out_point.clone()).collect();
-        combo_fingerprint(&ops, Some(&process.live_cell.out_point))
+        combo_fingerprint(
+            &ops,
+            Some(&process.live_cell.out_point),
+            &self.state.execution_code_key,
+        )
     }
 
     fn rotate_bucket(
@@ -669,7 +690,11 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
         self.state
             .submit
             .rejected_combos
-            .contains(&combo_fingerprint(&ops, Some(&process.live_cell.out_point)))
+            .contains(&combo_fingerprint(
+                &ops,
+                Some(&process.live_cell.out_point),
+                &self.state.execution_code_key,
+            ))
     }
 
     fn process_batch(
@@ -775,7 +800,11 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
             .any(|i| i.previous_output() == process.live_cell.out_point);
         let intent_ops: Vec<_> = batch.iter().map(|i| i.out_point.clone()).collect();
         let process_op = consumed_process.then(|| process.live_cell.out_point.clone());
-        let fp = combo_fingerprint(&intent_ops, process_op.as_ref());
+        let fp = combo_fingerprint(
+            &intent_ops,
+            process_op.as_ref(),
+            &self.state.execution_code_key,
+        );
         if self.state.submit.rejected_combos.contains(&fp) {
             tracing::debug!(
                 target: LOG_TARGET,
