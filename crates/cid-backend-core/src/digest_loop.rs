@@ -1,9 +1,11 @@
 use crate::assemble::{assemble_digest_incompatible, assemble_digest_ok, AssembleError};
+use crate::code_deps::{resolve_execution_cell_deps, CodeDepError};
 use crate::process::{ProcessResolver, ResolvedProcess};
 use crate::rpc::{out_point_key, Rpc, RpcError, TxStatus};
 use crate::scan::{bucket_by_process_type_hash, scan_intentions, ScannedIntention};
 use crate::ssri::{to_intention_input, SsriError, SsriHost};
 use crate::submit::{combo_fingerprint, submit_execution, SubmitState};
+use crate::type_id::TypeIdCodeDep;
 use ckb_types::core::ScriptHashType;
 use ckb_types::packed::{Byte32, CellDep};
 use ckb_types::prelude::*;
@@ -26,7 +28,12 @@ pub struct LoopConfig {
     pub cid_code_hash: [u8; 32],
     pub hash_type: ScriptHashType,
     pub poll_interval: Duration,
+    /// Static CellDeps (extras / local fixtures). Always merged after Type-ID
+    /// resolution. Not used for Type-ID code discovery.
     pub extra_cell_deps: Vec<CellDep>,
+    /// Type-ID identities for CID lock / Process code (and optional Process
+    /// lock) cells. Resolved every tick; empty keeps legacy static-only deps.
+    pub type_id_code_deps: Vec<TypeIdCodeDep>,
     /// Blocks that must exist on top of a committed execution tx before
     /// occupancy is released. `1` settles on first sight of Committed at the
     /// tip. Daemon default is [`DEFAULT_CONFIRMATION_DEPTH`].
@@ -49,6 +56,9 @@ pub struct LoopState {
     /// Fingerprints already split this isolate sweep (memory-only). Prevents
     /// re-expanding the same cached window; cleared when a sweep completes.
     pub isolate_expanded: HashMap<[u8; 32], HashSet<Vec<u8>>>,
+    /// CellDeps resolved for the current tick (Type-ID + static). Snapshot is
+    /// fixed for every assemble in this tick. Cleared when the tick ends.
+    pub tick_cell_deps: Vec<CellDep>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -119,6 +129,7 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                 last_tip: None,
                 isolate_resume: HashMap::new(),
                 isolate_expanded: HashMap::new(),
+                tick_cell_deps: Vec::new(),
             },
         }
     }
@@ -156,6 +167,22 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
 
     fn tick_inner(&mut self) -> TickReport {
         let mut report = TickReport::default();
+        // Refresh Type-ID code CellDeps every tick so upgrades pick up the new
+        // outpoint while script identity stays stable. Failures are transient:
+        // skip the tick, do not permanently reject Intentions.
+        let cell_deps = match self.refresh_cell_deps() {
+            Ok(deps) => deps,
+            Err(e) => {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    event = "code_deps.unavailable",
+                    error = %e,
+                );
+                report.last_error = Some(format!("code deps: {e}"));
+                return report;
+            }
+        };
+        self.state.tick_cell_deps = cell_deps;
         let scanned =
             match scan_intentions(&self.rpc, &self.config.cid_code_hash, self.config.hash_type) {
                 Ok(v) => v,
@@ -166,6 +193,7 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                         error = %m,
                     );
                     report.last_error = Some(format!("scan unavailable: {m}"));
+                    self.state.tick_cell_deps.clear();
                     return report;
                 }
                 Err(e) => {
@@ -175,6 +203,7 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                         error = %e,
                     );
                     report.last_error = Some(format!("scan error: {e}"));
+                    self.state.tick_cell_deps.clear();
                     return report;
                 }
             };
@@ -205,7 +234,19 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
         for (_hash, bucket) in bucket_by_process_type_hash(&eligible) {
             self.process_bucket(bucket, &mut report);
         }
+        self.state.tick_cell_deps.clear();
         report
+    }
+
+    fn refresh_cell_deps(&self) -> Result<Vec<CellDep>, CodeDepError> {
+        if self.config.type_id_code_deps.is_empty() {
+            return Ok(self.config.extra_cell_deps.clone());
+        }
+        resolve_execution_cell_deps(
+            &self.rpc,
+            &self.config.type_id_code_deps,
+            &self.config.extra_cell_deps,
+        )
     }
 
     fn refresh_tip(&mut self) -> Option<u64> {
@@ -436,6 +477,7 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
     /// Each window fingerprint is expanded at most once per sweep; a separate
     /// cached-split budget stops diamond explosion. Progress persists in
     /// `isolate_expanded` until the sweep completes.
+    #[allow(clippy::too_many_arguments)]
     fn isolate_window(
         &mut self,
         process: &ResolvedProcess,
@@ -642,7 +684,7 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                     report.skipped += batch.len();
                     return BatchOutcome::ProcessOccupied;
                 }
-                match assemble_digest_ok(&batch, process, &partial, &self.config.extra_cell_deps) {
+                match assemble_digest_ok(&batch, process, &partial, &self.state.tick_cell_deps) {
                     Ok(s) => s,
                     Err(AssembleError::CapacityShortfall { inputs, outputs }) => {
                         tracing::warn!(
@@ -673,7 +715,7 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                     event = "ssri.incompatible",
                     code,
                 );
-                match assemble_digest_incompatible(&batch, &self.config.extra_cell_deps) {
+                match assemble_digest_incompatible(&batch, &self.state.tick_cell_deps) {
                     Ok(s) => {
                         tracing::info!(
                             target: LOG_TARGET,

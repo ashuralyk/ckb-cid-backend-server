@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 
 use cid_backend_core::rpc::{out_point_key, script_hash32, LiveCell, Rpc, RpcError, TxStatus};
 use ckb_types::core::{ScriptHashType, TransactionView};
-use ckb_types::packed::{Byte32, OutPoint};
+use ckb_types::packed::{Byte32, OutPoint, Script};
 use ckb_types::prelude::*;
 
 #[derive(Default)]
@@ -18,6 +18,7 @@ struct Inner {
     defer_commit: bool,
     fail_status_queries: bool,
     fail_tip_queries: bool,
+    fail_type_script_queries: bool,
     rewind_tip_on_status: Option<u64>,
     submitted: Vec<TransactionView>,
     consumed_by_tx: HashMap<Vec<u8>, Vec<LiveCell>>,
@@ -113,6 +114,15 @@ impl FakeRpc {
         self.inner.borrow_mut().fail_tip_queries = false;
     }
 
+    /// Next `list_live_cells_by_type_script` returns Unavailable.
+    pub fn fail_type_script_queries(&self) {
+        self.inner.borrow_mut().fail_type_script_queries = true;
+    }
+
+    pub fn restore_type_script_queries(&self) {
+        self.inner.borrow_mut().fail_type_script_queries = false;
+    }
+
     /// Next `get_transaction_status` rewinds the tip first (stale-tip settle).
     pub fn rewind_tip_on_next_status(&self, new_tip: u64) {
         self.inner.borrow_mut().rewind_tip_on_status = Some(new_tip);
@@ -125,6 +135,10 @@ impl FakeRpc {
             .iter()
             .filter_map(|op| inner.cells.get(&out_point_key(op)).cloned())
             .collect()
+    }
+
+    pub fn has_cell(&self, op: &OutPoint) -> bool {
+        self.inner.borrow().cells.contains_key(&out_point_key(op))
     }
 
     pub fn submitted(&self) -> Vec<TransactionView> {
@@ -272,6 +286,31 @@ impl Rpc for FakeRpc {
             }
         }
         Ok(None)
+    }
+
+    fn list_live_cells_by_type_script(
+        &self,
+        type_script: &Script,
+    ) -> Result<Vec<LiveCell>, RpcError> {
+        let inner = self.inner.borrow();
+        if inner.fail_type_script_queries {
+            return Err(RpcError::Unavailable(
+                "injected type-script query unavailable".into(),
+            ));
+        }
+        let want = script_hash32(type_script);
+        let mut out = Vec::new();
+        for op in &inner.order {
+            let Some(cell) = inner.cells.get(&out_point_key(op)) else {
+                continue;
+            };
+            if let Some(ts) = cell.type_script() {
+                if script_hash32(&ts) == want {
+                    out.push(cell.clone());
+                }
+            }
+        }
+        Ok(out)
     }
 
     fn submit_transaction(&self, tx: &TransactionView) -> Result<Byte32, RpcError> {

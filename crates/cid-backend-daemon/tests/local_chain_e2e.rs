@@ -454,6 +454,7 @@ fn scan_resolve_ssri_submit_confirms_on_local_dev_chain() {
         hash_type: ScriptHashType::Data1,
         poll_interval: Duration::from_secs(1),
         extra_cell_deps: vec![cell_dep(cid_op), cell_dep(proc_code_op), cell_dep(as_op)],
+        type_id_code_deps: vec![],
         process_type_code_hashes: vec![process_code_hash],
         health_bind: None,
         confirmation_depth: 1,

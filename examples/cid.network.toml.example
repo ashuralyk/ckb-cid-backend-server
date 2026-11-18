@@ -8,8 +8,18 @@
 # network.name is a log label only. Chain identity is genesis_hash
 # (this network's get_block_hash 0x0). It is DECLARED, not verified,
 # unless validate_genesis = true (then the daemon fail-closes on mismatch
-# or RPC error). Daemon never auto-discovers contracts or cell deps.
-# No keys. No signing.
+# or RPC error).
+#
+# Contract code discovery (preferred for hash_type=type deployments):
+#   type_id_args = 32-byte TYPE_ID type-script args on the CODE cell
+#   type_id      = optional full type-script hash (calc_script_hash of
+#                  built-in TYPE_ID + type_id_args). Fail-closed check only.
+#   NEVER put a full type_id hash into type_id_args.
+# Live Process *state* cells are still found by process_type_hash from CID
+# args (full type script hash) + process type code_hash prefixes — that is
+# not the same as the Process CODE cell's TYPE_ID identity.
+# Daemon never loads dispatcher deployment JSON and never auto-discovers
+# from chain without these configured identities. No keys. No signing.
 
 [network]
 name = "<NETWORK_LABEL>"
@@ -21,32 +31,34 @@ url = "<CKB_NODE_JSON_RPC_URL>"
 # indexer_url = "<CKB_INDEXER_JSON_RPC_URL>"  # omit to use url
 
 [cid_lock]
-code_hash = "<CID_LOCK_CODE_HASH_32>"
-hash_type = "type"                         # type | data | data1 | data2
+# Type-ID deploy (hash_type=type): set type_id_args; code_hash is derived.
+type_id_args = "<CID_LOCK_TYPE_ID_ARGS_32>"
+type_id = "<CID_LOCK_TYPE_ID_FULL_HASH_32>"   # optional verify; must match derived
+# Legacy / local data1 fixtures (no Type-ID discovery for this role):
+# code_hash = "<CID_LOCK_CODE_HASH_32>"
+# hash_type = "data1"
 
 [process]
-# Process type script code_hash prefixes (must match that type's hash_type).
-# Not the calc_script_hash stored in CID args.
-type_code_hashes = ["<PROCESS_TYPE_CODE_HASH_32>"]
+# Process CODE cell Type ID (not the live Process state cell).
+type_id_args = "<PROCESS_CODE_TYPE_ID_ARGS_32>"
+type_id = "<PROCESS_CODE_TYPE_ID_FULL_HASH_32>"  # optional verify
+# Extra indexer prefixes if needed; derived type_id is auto-added when
+# type_id_args is set.
+# type_code_hashes = ["<PROCESS_TYPE_CODE_HASH_32>"]
 
-# assemble uses this list as-is; nothing is auto-filled.
-[[cell_deps]]
-label = "cid_lock"
-tx_hash = "<CID_LOCK_CODE_CELL_TX>"
-index = 0
-dep_type = "code"                          # code | dep_group
+# Optional: Process *lock* code cell via Type ID (e.g. always-success on chain).
+# [process_lock]
+# type_id_args = "<PROCESS_LOCK_TYPE_ID_ARGS_32>"
+# type_id = "<PROCESS_LOCK_TYPE_ID_FULL_HASH_32>"
 
-[[cell_deps]]
-label = "process_code"
-tx_hash = "<PROCESS_TYPE_CODE_CELL_TX>"
-index = 0
-dep_type = "code"
-
-[[cell_deps]]
-label = "process_lock"
-tx_hash = "<PROCESS_LOCK_CODE_CELL_TX>"
-index = 0
-dep_type = "code"
+# Static extras only (secp, xUDT, local always-success, etc.).
+# Do NOT put Type-ID–discovered code cells here unless duplicating is intentional;
+# assemble merges Type-ID deps first, then these, deduped by outpoint.
+# [[cell_deps]]
+# label = "xudt"
+# tx_hash = "<XUDT_CODE_CELL_TX>"
+# index = 0
+# dep_type = "code"
 
 [loop]
 poll_interval_secs = 5

@@ -138,6 +138,9 @@ mod tests {
         ) -> Result<Option<LiveCell>, RpcError> {
             Ok(self.cell.borrow().clone())
         }
+        fn list_live_cells_by_type_script(&self, _: &Script) -> Result<Vec<LiveCell>, RpcError> {
+            Ok(Vec::new())
+        }
         fn submit_transaction(&self, _tx: &TransactionView) -> Result<Byte32, RpcError> {
             Err(RpcError::Unavailable("no".into()))
         }
@@ -153,7 +156,7 @@ mod tests {
         let ts = Script::new_builder()
             .code_hash([0x51u8; 32].pack())
             .hash_type(ScriptHashType::Type.into())
-            .args(vec![0xABu8; 32].pack())
+            .args([0xABu8; 32].to_vec().pack())
             .build();
         let hash = crate::rpc::script_hash32(&ts);
         let op = OutPoint::new_builder()
