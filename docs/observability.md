@@ -25,7 +25,12 @@ Stable field `event` (target `cid_backend`):
 | `refund.path` | User-lock refund assemble (`path=user_lock`) |
 | `submit.ok` | `tx_hash` |
 | `submit.conflict` | Submit mapped as Conflict |
-| `pending.committed` / `pending.dropped` | Pending execution tx status |
+| `submit.rejected` | Transaction-level submit rejection (`TransactionFailedToVerify` / malformed / outputs-validator); that combo is skipped, not every consumed outpoint |
+| `submit.rejected_combo` | Isolation skipped a combo already in `rejected_combos` (no new `send_transaction`) |
+| `pending.committed` | First sight of Committed (occupancy still held) |
+| `pending.settled` | Confirmation depth reached |
+| `pending.dropped` / `pending.reorg` | Pending/confirming tx gone |
+| `reorg.tip_rewind` | Tip height moved backwards |
 | `config.load_failed` | Illegal env / health bind failure (process exits) |
 
 ## Health HTTP

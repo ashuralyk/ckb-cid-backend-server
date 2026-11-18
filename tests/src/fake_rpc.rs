@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use cid_backend_core::rpc::{out_point_key, script_hash32, LiveCell, Rpc, RpcError, TxStatus};
 use ckb_types::core::{ScriptHashType, TransactionView};
@@ -11,11 +11,18 @@ struct Inner {
     cells: HashMap<Vec<u8>, LiveCell>,
     order: Vec<OutPoint>,
     fail_next_submit: bool,
+    reject_next_submit: bool,
+    reject_inputs: HashSet<Vec<u8>>,
+    submit_attempts: usize,
+    unavailable_next_submit: bool,
     defer_commit: bool,
     fail_status_queries: bool,
+    fail_tip_queries: bool,
+    rewind_tip_on_status: Option<u64>,
     submitted: Vec<TransactionView>,
     consumed_by_tx: HashMap<Vec<u8>, Vec<LiveCell>>,
     tx_status: HashMap<Vec<u8>, TxStatus>,
+    tip: u64,
 }
 
 pub struct FakeRpc {
@@ -58,6 +65,59 @@ impl FakeRpc {
         self.inner.borrow_mut().fail_status_queries = true;
     }
 
+    pub fn restore_status_queries(&self) {
+        self.inner.borrow_mut().fail_status_queries = false;
+    }
+
+    /// Next `submit_transaction` returns `SubmitRejected` (permanent for those cells).
+    pub fn inject_reject_once(&self) {
+        self.inner.borrow_mut().reject_next_submit = true;
+    }
+
+    /// Every submit that spends `op` returns `SubmitRejected` (A-fails / B-succeeds).
+    pub fn reject_when_consuming(&self, op: &OutPoint) {
+        self.inner
+            .borrow_mut()
+            .reject_inputs
+            .insert(out_point_key(op));
+    }
+
+    /// Count of `submit_transaction` calls, including injected failures.
+    pub fn submit_attempts(&self) -> usize {
+        self.inner.borrow().submit_attempts
+    }
+
+    /// Next `submit_transaction` returns `Unavailable` (transient).
+    pub fn inject_unavailable_submit_once(&self) {
+        self.inner.borrow_mut().unavailable_next_submit = true;
+    }
+
+    pub fn tip(&self) -> u64 {
+        self.inner.borrow().tip
+    }
+
+    pub fn set_tip(&self, n: u64) {
+        self.inner.borrow_mut().tip = n;
+    }
+
+    pub fn advance_tip(&self, delta: u64) {
+        let mut inner = self.inner.borrow_mut();
+        inner.tip = inner.tip.saturating_add(delta);
+    }
+
+    pub fn fail_tip_queries(&self) {
+        self.inner.borrow_mut().fail_tip_queries = true;
+    }
+
+    pub fn restore_tip_queries(&self) {
+        self.inner.borrow_mut().fail_tip_queries = false;
+    }
+
+    /// Next `get_transaction_status` rewinds the tip first (stale-tip settle).
+    pub fn rewind_tip_on_next_status(&self, new_tip: u64) {
+        self.inner.borrow_mut().rewind_tip_on_status = Some(new_tip);
+    }
+
     pub fn live_cells(&self) -> Vec<LiveCell> {
         let inner = self.inner.borrow();
         inner
@@ -92,6 +152,28 @@ impl FakeRpc {
         inner.tx_status.insert(key, TxStatus::Dropped);
     }
 
+    /// Rewind the tip. Transactions committed above `new_tip` are dropped and
+    /// their inputs restored (reorg of confirming/committed txs).
+    pub fn simulate_reorg(&self, new_tip: u64) {
+        let to_drop: Vec<Byte32> = {
+            let inner = self.inner.borrow();
+            inner
+                .tx_status
+                .iter()
+                .filter_map(|(k, st)| match st {
+                    TxStatus::Committed { block_number } if *block_number > new_tip => {
+                        Byte32::from_slice(k).ok()
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        self.inner.borrow_mut().tip = new_tip;
+        for hash in to_drop {
+            self.simulate_drop(&hash);
+        }
+    }
+
     /// Apply a previously deferred submit: consume inputs and create outputs.
     pub fn commit_pending(&self, tx_hash: &Byte32) {
         let mut inner = self.inner.borrow_mut();
@@ -100,7 +182,10 @@ impl FakeRpc {
             return;
         }
         apply_commit(&mut inner, tx_hash);
-        inner.tx_status.insert(key, TxStatus::Committed);
+        let block_number = inner.tip;
+        inner
+            .tx_status
+            .insert(key, TxStatus::Committed { block_number });
     }
 }
 
@@ -191,6 +276,23 @@ impl Rpc for FakeRpc {
 
     fn submit_transaction(&self, tx: &TransactionView) -> Result<Byte32, RpcError> {
         let mut inner = self.inner.borrow_mut();
+        inner.submit_attempts += 1;
+        if inner.unavailable_next_submit {
+            inner.unavailable_next_submit = false;
+            return Err(RpcError::Unavailable("injected submit unavailable".into()));
+        }
+        if inner.reject_next_submit {
+            inner.reject_next_submit = false;
+            return Err(RpcError::SubmitRejected("injected reject".into()));
+        }
+        let hits_poison = tx.inputs().into_iter().any(|input| {
+            inner
+                .reject_inputs
+                .contains(&out_point_key(&input.previous_output()))
+        });
+        if hits_poison {
+            return Err(RpcError::SubmitRejected("injected input reject".into()));
+        }
         if inner.fail_next_submit {
             inner.fail_next_submit = false;
             return Err(RpcError::Conflict("injected conflict".into()));
@@ -220,13 +322,19 @@ impl Rpc for FakeRpc {
             inner.tx_status.insert(hash_key, TxStatus::Pending);
         } else {
             apply_commit(&mut inner, &tx_hash);
-            inner.tx_status.insert(hash_key, TxStatus::Committed);
+            let block_number = inner.tip;
+            inner
+                .tx_status
+                .insert(hash_key, TxStatus::Committed { block_number });
         }
         Ok(tx_hash)
     }
 
     fn get_transaction_status(&self, tx_hash: &Byte32) -> Result<TxStatus, RpcError> {
-        let inner = self.inner.borrow();
+        let mut inner = self.inner.borrow_mut();
+        if let Some(t) = inner.rewind_tip_on_status.take() {
+            inner.tip = t;
+        }
         if inner.fail_status_queries {
             return Err(RpcError::Unavailable("injected status unavailable".into()));
         }
@@ -235,6 +343,14 @@ impl Rpc for FakeRpc {
             .get(tx_hash.as_slice())
             .copied()
             .unwrap_or(TxStatus::Dropped))
+    }
+
+    fn tip_block_number(&self) -> Result<u64, RpcError> {
+        let inner = self.inner.borrow();
+        if inner.fail_tip_queries {
+            return Err(RpcError::Unavailable("injected tip unavailable".into()));
+        }
+        Ok(inner.tip)
     }
 }
 

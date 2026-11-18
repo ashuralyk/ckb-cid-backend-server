@@ -19,6 +19,8 @@ pub enum Mode {
         remaining_ok: RefCell<u32>,
         code: i8,
     },
+    /// Digest_ok beneficiary output capacity (independent of Intention capacity).
+    FixedBeneficiary(u64),
 }
 
 impl ScriptedSsri {
@@ -50,6 +52,13 @@ impl ScriptedSsri {
                 remaining_ok: RefCell::new(ok_calls),
                 code,
             },
+        }
+    }
+
+    pub fn fixed_beneficiary(bounds: (u32, u32), capacity: u64) -> Self {
+        Self {
+            bounds,
+            mode: Mode::FixedBeneficiary(capacity),
         }
     }
 }
@@ -84,12 +93,13 @@ impl SsriHost for ScriptedSsri {
         match &self.mode {
             Mode::AlwaysIncompatible(c) => Err(SsriError::Incompatible(*c)),
             Mode::Unusable => Err(SsriError::Unusable("scripted".into())),
-            Mode::MimicExample => Ok(mimic_assemble(intentions)),
+            Mode::MimicExample => Ok(mimic_assemble(intentions, None)),
+            Mode::FixedBeneficiary(cap) => Ok(mimic_assemble(intentions, Some(*cap))),
             Mode::OkThenIncompatible { remaining_ok, code } => {
                 let mut n = remaining_ok.borrow_mut();
                 if *n > 0 {
                     *n -= 1;
-                    Ok(mimic_assemble(intentions))
+                    Ok(mimic_assemble(intentions, None))
                 } else {
                     Err(SsriError::Incompatible(*code))
                 }
@@ -98,7 +108,7 @@ impl SsriHost for ScriptedSsri {
     }
 }
 
-fn mimic_assemble(intentions: &[IntentionInput]) -> PartialTx {
+fn mimic_assemble(intentions: &[IntentionInput], fixed_cap: Option<u64>) -> PartialTx {
     let mut outputs = Vec::new();
     let mut data = Vec::new();
     for it in intentions {
@@ -107,9 +117,10 @@ fn mimic_assemble(intentions: &[IntentionInput]) -> PartialTx {
             .hash_type(ScriptHashType::Type.into())
             .args(it.lock_args.clone().pack())
             .build();
+        let cap = fixed_cap.unwrap_or(it.capacity);
         outputs.push(
             CellOutput::new_builder()
-                .capacity(it.capacity.pack())
+                .capacity(cap.pack())
                 .lock(lock)
                 .build(),
         );

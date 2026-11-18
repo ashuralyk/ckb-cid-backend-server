@@ -2,16 +2,14 @@
 mod tests {
     use std::time::Duration;
 
-    use ckb_types::core::ScriptHashType;
-    use ckb_types::prelude::*;
     use cid_backend_core::digest_loop::{DigestLoop, LoopConfig, NopClock};
     use cid_backend_core::process::ProcessResolver;
     use cid_backend_core::rpc::script_hash32;
+    use ckb_types::core::ScriptHashType;
+    use ckb_types::prelude::*;
 
     use crate::fake_rpc::FakeRpc;
-    use crate::helpers::{
-        intention_cell, process_cell, process_type_script, user_lock, CID_CODE,
-    };
+    use crate::helpers::{intention_cell, process_cell, process_type_script, user_lock, CID_CODE};
     use crate::scripted_ssri::ScriptedSsri;
 
     #[test]
@@ -33,6 +31,7 @@ mod tests {
                 hash_type: ScriptHashType::Type,
                 poll_interval: Duration::from_secs(1),
                 extra_cell_deps: vec![],
+                confirmation_depth: 1,
             },
             ProcessResolver::new(),
         );
@@ -41,7 +40,10 @@ mod tests {
 
         let tx = &loop_.rpc().submitted()[0];
         assert_eq!(tx.inputs().len(), 1);
-        assert_eq!(tx.inputs().get(0).unwrap().previous_output(), intent.out_point);
+        assert_eq!(
+            tx.inputs().get(0).unwrap().previous_output(),
+            intent.out_point
+        );
         assert_eq!(tx.outputs().len(), 1);
         let out = tx.outputs().get(0).unwrap();
         let cap: u64 = out.capacity().unpack();
