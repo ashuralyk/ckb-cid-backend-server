@@ -13,6 +13,16 @@ pub struct ScannedIntention {
     pub data: Vec<u8>,
     pub lock_args: Vec<u8>,
     pub args: CidArgs,
+    /// CID lock `code_hash` from the live cell (deployment identity).
+    pub lock_code_hash: [u8; 32],
+    /// CID lock `hash_type` from the live cell.
+    pub lock_hash_type: ScriptHashType,
+}
+
+impl ScannedIntention {
+    pub fn lock_identity(&self) -> crate::fee::CidLockIdentity {
+        crate::fee::CidLockIdentity::new(self.lock_code_hash, self.lock_hash_type)
+    }
 }
 
 pub fn decode_cells(cells: Vec<LiveCell>) -> Vec<ScannedIntention> {
@@ -32,8 +42,11 @@ pub fn decode_cells(cells: Vec<LiveCell>) -> Vec<ScannedIntention> {
 }
 
 fn decode_one(cell: &LiveCell) -> Option<ScannedIntention> {
-    let lock_args: Vec<u8> = cell.lock().args().unpack();
+    let lock = cell.lock();
+    let lock_args: Vec<u8> = lock.args().unpack();
     let args = CidArgs::decode(&lock_args).ok()?;
+    let lock_code_hash: [u8; 32] = lock.code_hash().unpack();
+    let lock_hash_type = ScriptHashType::try_from(lock.hash_type()).ok()?;
     Some(ScannedIntention {
         out_point: cell.out_point.clone(),
         capacity: cell.capacity(),
@@ -41,6 +54,8 @@ fn decode_one(cell: &LiveCell) -> Option<ScannedIntention> {
         data: cell.data.clone(),
         lock_args,
         args,
+        lock_code_hash,
+        lock_hash_type,
     })
 }
 
@@ -51,6 +66,27 @@ pub fn scan_intentions<R: Rpc>(
 ) -> Result<Vec<ScannedIntention>, RpcError> {
     let cells = rpc.list_live_intentions(cid_code_hash, hash_type)?;
     Ok(decode_cells(cells))
+}
+
+/// Scan multiple CID lock identities (primary + extras), preserving ASC order
+/// of first appearance and de-duplicating by out_point.
+pub fn scan_intentions_multi<R: Rpc>(
+    rpc: &R,
+    identities: &[([u8; 32], ScriptHashType)],
+) -> Result<Vec<ScannedIntention>, RpcError> {
+    use crate::rpc::out_point_key;
+    use std::collections::HashSet;
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for (code_hash, hash_type) in identities {
+        for item in scan_intentions(rpc, code_hash, *hash_type)? {
+            let k = out_point_key(&item.out_point);
+            if seen.insert(k) {
+                out.push(item);
+            }
+        }
+    }
+    Ok(out)
 }
 
 pub fn bucket_by_process_type_hash(

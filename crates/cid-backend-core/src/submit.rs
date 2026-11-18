@@ -55,6 +55,12 @@ pub fn submit_execution<R: Rpc>(
     state: &mut SubmitState,
     consumed: &[OutPoint],
 ) -> Result<Byte32, RpcError> {
+    // Fail closed if the sized empty-witness skeleton drifted before RPC.
+    if let Some(guard) = &skeleton.fee_guard {
+        if let Err(e) = guard.verify(&skeleton.tx) {
+            return Err(RpcError::SubmitRejected(format!("fee_guard: {e}")));
+        }
+    }
     match rpc.submit_transaction(&skeleton.tx) {
         Ok(hash) => {
             let mut keys = Vec::with_capacity(consumed.len());

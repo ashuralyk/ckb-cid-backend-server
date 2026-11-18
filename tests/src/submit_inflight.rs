@@ -29,7 +29,10 @@ mod tests {
                     .build(),
             )
             .build();
-        let skeleton = ExecutionSkeleton { tx };
+        let skeleton = ExecutionSkeleton {
+            tx,
+            fee_guard: None,
+        };
         let mut state = SubmitState::default();
         let hash = submit_execution(&rpc, &skeleton, &mut state, &[op.clone()]).unwrap();
         assert!(!hash.as_slice().is_empty() || hash.as_slice().len() == 32);
@@ -57,7 +60,10 @@ mod tests {
         let mut state2 = SubmitState::default();
         let err = submit_execution(
             &rpc,
-            &ExecutionSkeleton { tx: tx2 },
+            &ExecutionSkeleton {
+                tx: tx2,
+                fee_guard: None,
+            },
             &mut state2,
             &[op2.clone()],
         )

@@ -1323,7 +1323,8 @@ mod tests {
             type_id_code_deps: vec![],
             confirmation_depth: depth,
             fee_rate: 1000,
-            bounded_refund_fee: false,
+            bounded_refund_locks: vec![],
+            extra_scan_locks: vec![],
         }
     }
 
@@ -1575,7 +1576,8 @@ mod tests {
             type_id_code_deps: vec![],
             confirmation_depth: 1,
             fee_rate: 1000,
-            bounded_refund_fee: false,
+            bounded_refund_locks: vec![],
+            extra_scan_locks: vec![],
         };
         let mut first = DigestLoop::new(
             CkbRpc::with_process_code_hashes(&url, &url, vec![PROC_CODE]),
@@ -1602,7 +1604,8 @@ mod tests {
                 type_id_code_deps: vec![],
                 confirmation_depth: 1,
                 fee_rate: 1000,
-                bounded_refund_fee: false,
+                bounded_refund_locks: vec![],
+                extra_scan_locks: vec![],
             },
             ProcessResolver::new(),
         );
@@ -1806,7 +1809,8 @@ mod tests {
             type_id_code_deps: vec![],
             confirmation_depth: 1,
             fee_rate: 1000,
-            bounded_refund_fee: false,
+            bounded_refund_locks: vec![],
+            extra_scan_locks: vec![],
         };
         let mut loop_ = DigestLoop::new(
             CkbRpc::with_process_code_hashes(&url, &url, vec![PROC_CODE]),

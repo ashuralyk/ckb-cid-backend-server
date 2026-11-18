@@ -22,13 +22,17 @@ pub use digest_loop::{
     DEFAULT_CONFIRMATION_DEPTH,
 };
 pub use fee::{
-    allocate_refund_fee_cuts, cell_occupied_capacity, fee_for_size, process_min_capacity,
-    refund_capacity_allowed, refund_fee_budget, required_fee, tx_size_in_block, RefundFeeMode,
-    DEFAULT_FEE_RATE, MAX_FEE_RATE, MAX_REFUND_FEE,
+    allocate_refund_fee_cuts, cell_occupied_capacity, fee_covers_shortfalls, fee_for_size,
+    lock_allows_bounded_refund, process_min_capacity, refund_capacity_allowed, refund_fee_budget,
+    required_fee, tx_size_in_block, with_capacity, CidLockIdentity, FeeGuard, FeeGuardError,
+    RefundFeeMode, DEFAULT_FEE_RATE, MAX_FEE_RATE, MAX_REFUND_FEE,
 };
 pub use process::{ProcessResolver, ResolvedProcess, SsriBinarySource};
 pub use rpc::{out_point_key, script_hash32, LiveCell, Rpc, RpcError, TxStatus};
-pub use scan::{bucket_by_process_type_hash, decode_cells, scan_intentions, ScannedIntention};
+pub use scan::{
+    bucket_by_process_type_hash, decode_cells, scan_intentions, scan_intentions_multi,
+    ScannedIntention,
+};
 pub use ssri::{map_executor_error, to_intention_input, EmbeddedSsri, SsriError, SsriHost};
 pub use submit::{combo_fingerprint, execution_code_key, submit_execution, PendingTx, SubmitState};
 pub use type_id::{
