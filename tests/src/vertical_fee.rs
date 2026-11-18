@@ -9,7 +9,8 @@ mod tests {
     use cid_backend_core::rpc::{script_hash32, LiveCell};
     use cid_backend_core::scan::ScannedIntention;
     use cid_backend_core::{
-        assemble_digest_ok, fee_for_size, process_min_capacity, tx_size_in_block, DEFAULT_FEE_RATE,
+        assemble_digest_ok, fee_for_size, process_min_capacity, tx_size_in_block, CidLockIdentity,
+        DEFAULT_FEE_RATE,
     };
     use cid_process_executor::PartialTx;
     use cid_protocol::CidArgs;
@@ -18,14 +19,17 @@ mod tests {
     use ckb_types::prelude::*;
 
     use crate::fake_rpc::FakeRpc;
-    use crate::helpers::{intention_cell, process_cell, process_type_script, user_lock, CID_CODE};
+    use crate::helpers::{
+        intention_cell, intention_cell_with_lock, process_cell, process_type_script, user_lock,
+        CID_CODE,
+    };
     use crate::scripted_ssri::ScriptedSsri;
 
     fn cfg(fee_rate: u64) -> LoopConfig {
-        cfg_mode(fee_rate, false)
+        cfg_allowlist(fee_rate, vec![])
     }
 
-    fn cfg_mode(fee_rate: u64, bounded_refund_fee: bool) -> LoopConfig {
+    fn cfg_allowlist(fee_rate: u64, bounded_refund_locks: Vec<CidLockIdentity>) -> LoopConfig {
         LoopConfig {
             cid_code_hash: CID_CODE,
             hash_type: ScriptHashType::Type,
@@ -34,8 +38,13 @@ mod tests {
             type_id_code_deps: vec![],
             confirmation_depth: 1,
             fee_rate,
-            bounded_refund_fee,
+            bounded_refund_locks,
+            extra_scan_locks: vec![],
         }
+    }
+
+    fn allow_cid() -> Vec<CidLockIdentity> {
+        vec![CidLockIdentity::new(CID_CODE, ScriptHashType::Type)]
     }
 
     fn output_caps(tx: &ckb_types::core::TransactionView) -> Vec<u64> {
@@ -112,7 +121,7 @@ mod tests {
     #[test]
     fn incompatible_refund_keeps_exact_capacity_no_process_fee() {
         // Legacy default: exact User Lock capacity ⇒ fee 0. Never auto-haircut
-        // without explicit bounded_refund_fee (existing deployments).
+        // without allowlisted lock identity (existing deployments).
         let rpc = FakeRpc::new();
         let ts = process_type_script(3);
         let hash = script_hash32(&ts);
@@ -163,7 +172,7 @@ mod tests {
             rpc,
             NopClock,
             ScriptedSsri::incompatible(21),
-            cfg_mode(DEFAULT_FEE_RATE, true),
+            cfg_allowlist(DEFAULT_FEE_RATE, allow_cid()),
             ProcessResolver::new(),
         );
         assert_eq!(loop_.tick().submitted, 1);
@@ -203,7 +212,7 @@ mod tests {
             rpc,
             NopClock,
             ScriptedSsri::incompatible(21),
-            cfg_mode(DEFAULT_FEE_RATE, true),
+            cfg_allowlist(DEFAULT_FEE_RATE, allow_cid()),
             ProcessResolver::new(),
         );
         assert_eq!(loop_.tick().submitted, 1);
@@ -213,6 +222,168 @@ mod tests {
         let caps = output_caps(tx);
         let paid = 200_0000_0000u64 - caps[0] - caps[1];
         assert_eq!(paid, fee_for_size(tx_size_in_block(tx), DEFAULT_FEE_RATE));
+    }
+
+    #[test]
+    fn mixed_old_new_locks_partition_exact_and_bounded() {
+        // NEW lock is allowlisted; OLD is only scanned as legacy. Incompatible
+        // batch must not haircut the legacy Intention.
+        const OLD: [u8; 32] = [0xC0; 32];
+        let rpc = FakeRpc::new();
+        let ts = process_type_script(20);
+        let hash = script_hash32(&ts);
+        rpc.insert_cell(process_cell(
+            20,
+            200_0000_0000,
+            vec![0x7f, b'E', b'L', b'F', 20],
+        ));
+        rpc.insert_cell(intention_cell_with_lock(
+            1,
+            hash,
+            100_0000_0000,
+            OLD,
+            ScriptHashType::Type,
+        ));
+        rpc.insert_cell(intention_cell(2, hash, 100_0000_0000));
+
+        let mut cfg = cfg_allowlist(DEFAULT_FEE_RATE, allow_cid());
+        cfg.extra_scan_locks = vec![CidLockIdentity::new(OLD, ScriptHashType::Type)];
+        let mut loop_ = DigestLoop::new(
+            rpc,
+            NopClock,
+            ScriptedSsri::incompatible(21),
+            cfg,
+            ProcessResolver::new(),
+        );
+        let report = loop_.tick();
+        assert_eq!(report.submitted, 2, "exact + bounded as separate txs");
+        let txs = loop_.rpc().submitted();
+        assert_eq!(txs.len(), 2);
+        let mut saw_exact = false;
+        let mut saw_bounded = false;
+        for tx in &txs {
+            assert_eq!(tx.inputs().len(), 1);
+            assert_eq!(tx.outputs().len(), 1);
+            let in_cap = 100_0000_0000u64;
+            let out_cap: u64 = tx.outputs().get(0).unwrap().capacity().unpack();
+            if out_cap == in_cap {
+                saw_exact = true;
+            } else {
+                saw_bounded = true;
+                assert_eq!(
+                    in_cap - out_cap,
+                    fee_for_size(tx_size_in_block(tx), DEFAULT_FEE_RATE)
+                );
+            }
+        }
+        assert!(saw_exact && saw_bounded);
+    }
+
+    #[test]
+    fn bounded_refund_unaffordable_isolates_viable_subset() {
+        // High fee_rate so n=2 needs more headroom than tight+ample combined,
+        // while n=1 fits in ample alone → isolate/shrink must submit the subset.
+        let rate = 100_000u64;
+        let rpc = FakeRpc::new();
+        let ts = process_type_script(21);
+        let hash = script_hash32(&ts);
+        rpc.insert_cell(process_cell(
+            21,
+            200_0000_0000,
+            vec![0x7f, b'E', b'L', b'F', 21],
+        ));
+        let occupied = 61_0000_0000u64;
+        let tight = intention_cell(1, hash, occupied + 1_000);
+        let ample = intention_cell(2, hash, occupied + 50_000);
+        rpc.insert_cell(tight.clone());
+        rpc.insert_cell(ample.clone());
+
+        let mut loop_ = DigestLoop::new(
+            rpc,
+            NopClock,
+            ScriptedSsri::incompatible(21),
+            cfg_allowlist(rate, allow_cid()),
+            ProcessResolver::new(),
+        );
+        let report = loop_.tick();
+        assert!(
+            report.submitted >= 1,
+            "viable singleton must submit after isolate"
+        );
+        assert!(
+            loop_.rpc().submitted().iter().any(|tx| tx
+                .inputs()
+                .into_iter()
+                .any(|i| i.previous_output() == ample.out_point)),
+            "ample intention must be consumed"
+        );
+    }
+
+    #[test]
+    fn fee_guard_present_on_digest_ok_and_bounded_refund() {
+        use cid_backend_core::{assemble_digest_incompatible, RefundFeeMode};
+        use cid_process_executor::PartialTx;
+        use ckb_types::packed::{CellOutput, RawTransaction, Transaction};
+
+        let ts = process_type_script(22);
+        let hash = script_hash32(&ts);
+        let intent = scanned(&intention_cell(1, hash, 100_0000_0000));
+        let proc = resolved(&process_cell(
+            22,
+            200_0000_0000,
+            vec![0x7f, b'E', b'L', b'F', 22],
+        ));
+        let outputs = vec![CellOutput::new_builder()
+            .capacity(100_0000_0000u64.pack())
+            .lock(
+                ckb_types::packed::Script::new_builder()
+                    .code_hash([0x11u8; 32].pack())
+                    .hash_type(ScriptHashType::Type.into())
+                    .args([0x01u8].pack())
+                    .build(),
+            )
+            .build()];
+        let data: Vec<Vec<u8>> = vec![vec![]];
+        let bytes = Transaction::new_builder()
+            .raw(
+                RawTransaction::new_builder()
+                    .outputs(outputs.pack())
+                    .outputs_data(data.iter().map(|d| d.as_slice().pack()).pack())
+                    .build(),
+            )
+            .build()
+            .as_slice()
+            .to_vec();
+        let partial = PartialTx::from_bytes(&bytes).unwrap();
+        let ok = assemble_digest_ok(
+            std::slice::from_ref(&intent),
+            &proc,
+            &partial,
+            &[],
+            DEFAULT_FEE_RATE,
+        )
+        .unwrap();
+        let g = ok.fee_guard.expect("digest_ok fee_guard");
+        g.verify(&ok.tx).expect("digest_ok guard");
+
+        let refund = assemble_digest_incompatible(
+            std::slice::from_ref(&intent),
+            &[],
+            RefundFeeMode::Bounded,
+            DEFAULT_FEE_RATE,
+        )
+        .unwrap();
+        let g = refund.fee_guard.expect("bounded refund fee_guard");
+        g.verify(&refund.tx).expect("bounded guard");
+
+        let exact = assemble_digest_incompatible(
+            std::slice::from_ref(&intent),
+            &[],
+            RefundFeeMode::Exact,
+            DEFAULT_FEE_RATE,
+        )
+        .unwrap();
+        assert!(exact.fee_guard.is_none(), "exact refunds have no fee_guard");
     }
 
     #[test]
@@ -279,8 +450,11 @@ mod tests {
     }
 
     fn scanned(cell: &LiveCell) -> ScannedIntention {
-        let lock_args: Vec<u8> = cell.lock().args().unpack();
+        let lock = cell.lock();
+        let lock_args: Vec<u8> = lock.args().unpack();
         let args = CidArgs::decode(&lock_args).expect("cid args");
+        let lock_code_hash: [u8; 32] = lock.code_hash().unpack();
+        let lock_hash_type = ScriptHashType::try_from(lock.hash_type()).expect("hash_type");
         ScannedIntention {
             out_point: cell.out_point.clone(),
             capacity: cell.capacity(),
@@ -288,6 +462,8 @@ mod tests {
             data: cell.data.clone(),
             lock_args,
             args,
+            lock_code_hash,
+            lock_hash_type,
         }
     }
 

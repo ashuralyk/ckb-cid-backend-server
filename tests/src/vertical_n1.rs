@@ -34,7 +34,8 @@ mod tests {
                 type_id_code_deps: vec![],
                 confirmation_depth: 1,
                 fee_rate: 1000,
-                bounded_refund_fee: false,
+                bounded_refund_locks: vec![],
+                extra_scan_locks: vec![],
             },
             ProcessResolver::new(),
         );
@@ -102,7 +103,8 @@ mod tests {
                 type_id_code_deps: vec![],
                 confirmation_depth: 1,
                 fee_rate: 1000,
-                bounded_refund_fee: false,
+                bounded_refund_locks: vec![],
+                extra_scan_locks: vec![],
             },
             ProcessResolver::new(),
         );

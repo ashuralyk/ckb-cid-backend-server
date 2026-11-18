@@ -66,13 +66,25 @@ pub fn cid_lock_args(process_type_hash: [u8; 32]) -> Vec<u8> {
 }
 
 pub fn intention_cell(fill: u8, process_type_hash: [u8; 32], capacity: u64) -> LiveCell {
+    intention_cell_with_lock(
+        fill,
+        process_type_hash,
+        capacity,
+        CID_CODE,
+        ScriptHashType::Type,
+    )
+}
+
+pub fn intention_cell_with_lock(
+    fill: u8,
+    process_type_hash: [u8; 32],
+    capacity: u64,
+    lock_code: [u8; 32],
+    lock_hash_type: ScriptHashType,
+) -> LiveCell {
     live_cell(
         out_point(fill, 0),
-        lock_script(
-            CID_CODE,
-            ScriptHashType::Type,
-            cid_lock_args(process_type_hash),
-        ),
+        lock_script(lock_code, lock_hash_type, cid_lock_args(process_type_hash)),
         None,
         capacity,
         vec![],

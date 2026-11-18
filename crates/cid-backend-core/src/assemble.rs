@@ -1,7 +1,7 @@
 use crate::fee::{
     allocate_refund_fee_cuts, cell_occupied_capacity, process_min_capacity,
     refund_capacity_allowed, refund_fee_budget, required_fee, tx_size_in_block, with_capacity,
-    RefundFeeMode, MAX_REFUND_FEE,
+    FeeGuard, RefundFeeMode, MAX_REFUND_FEE,
 };
 use crate::process::ResolvedProcess;
 use crate::rpc::script_hash32;
@@ -15,6 +15,9 @@ use std::fmt;
 #[derive(Clone, Debug)]
 pub struct ExecutionSkeleton {
     pub tx: TransactionView,
+    /// Present when assemble sized a miner fee (digest_ok or bounded refund).
+    /// Submit re-verifies size/paid fee before RPC.
+    pub fee_guard: Option<FeeGuard>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,6 +121,7 @@ fn finish(
     outputs: Vec<CellOutput>,
     outputs_data: Vec<Vec<u8>>,
     extra_cell_deps: &[CellDep],
+    fee_guard: Option<FeeGuard>,
 ) -> Result<ExecutionSkeleton, AssembleError> {
     let output_capacity = sum_output_capacity(&outputs);
     if input_capacity < output_capacity {
@@ -128,6 +132,7 @@ fn finish(
     }
     Ok(ExecutionSkeleton {
         tx: build_tx(inputs, outputs, outputs_data, extra_cell_deps),
+        fee_guard,
     })
 }
 
@@ -182,6 +187,11 @@ fn apply_process_fee(
         outputs,
         outputs_data,
         extra_cell_deps,
+        Some(FeeGuard {
+            sized_size: tx_size,
+            fee_rate,
+            paid_fee: fee,
+        }),
     )
 }
 
@@ -299,6 +309,7 @@ pub fn assemble_digest_incompatible(
             outputs,
             outputs_data,
             extra_cell_deps,
+            None,
         ),
         RefundFeeMode::Bounded => apply_bounded_refund_fee(
             inputs,
@@ -399,6 +410,11 @@ fn apply_bounded_refund_fee(
         outputs,
         outputs_data,
         extra_cell_deps,
+        Some(FeeGuard {
+            sized_size: tx_size,
+            fee_rate,
+            paid_fee: fee,
+        }),
     )
 }
 
@@ -475,6 +491,8 @@ mod tests {
             data: vec![],
             lock_args,
             args,
+            lock_code_hash: [0xC1; 32],
+            lock_hash_type: ScriptHashType::Type,
         }
     }
 
