@@ -280,6 +280,80 @@ mod tests {
     }
 
     #[test]
+    fn two_allowlisted_bounded_identities_submit_separate_txs() {
+        // Two bounded-capable locks in the same Process bucket must never
+        // share one Execution tx (contract S is per executing identity).
+        const LOCK_A: [u8; 32] = CID_CODE;
+        const LOCK_B: [u8; 32] = [0xC2; 32];
+        let rpc = FakeRpc::new();
+        let ts = process_type_script(24);
+        let hash = script_hash32(&ts);
+        rpc.insert_cell(process_cell(
+            24,
+            200_0000_0000,
+            vec![0x7f, b'E', b'L', b'F', 24],
+        ));
+        let a = intention_cell_with_lock(1, hash, 100_0000_0000, LOCK_A, ScriptHashType::Type);
+        let b = intention_cell_with_lock(2, hash, 100_0000_0000, LOCK_B, ScriptHashType::Type);
+        rpc.insert_cell(a.clone());
+        rpc.insert_cell(b.clone());
+
+        let allow = vec![
+            CidLockIdentity::new(LOCK_A, ScriptHashType::Type),
+            CidLockIdentity::new(LOCK_B, ScriptHashType::Type),
+        ];
+        let mut cfg = cfg_allowlist(DEFAULT_FEE_RATE, allow);
+        cfg.extra_scan_locks = vec![CidLockIdentity::new(LOCK_B, ScriptHashType::Type)];
+        let mut loop_ = DigestLoop::new(
+            rpc,
+            NopClock,
+            ScriptedSsri::incompatible(21),
+            cfg,
+            ProcessResolver::new(),
+        );
+        let report = loop_.tick();
+        assert_eq!(report.submitted, 2, "one tx per bounded identity");
+        let txs = loop_.rpc().submitted();
+        assert_eq!(txs.len(), 2);
+        for tx in &txs {
+            assert_eq!(tx.inputs().len(), 1, "no mixed-identity Bounded tx");
+            assert_eq!(tx.outputs().len(), 1);
+            let out_cap: u64 = tx.outputs().get(0).unwrap().capacity().unpack();
+            assert!(
+                out_cap < 100_0000_0000,
+                "each identity uses bounded fee cuts"
+            );
+            assert_eq!(
+                100_0000_0000 - out_cap,
+                fee_for_size(tx_size_in_block(tx), DEFAULT_FEE_RATE)
+            );
+        }
+        let spends_a = txs.iter().any(|tx| {
+            tx.inputs()
+                .into_iter()
+                .any(|i| i.previous_output() == a.out_point)
+        });
+        let spends_b = txs.iter().any(|tx| {
+            tx.inputs()
+                .into_iter()
+                .any(|i| i.previous_output() == b.out_point)
+        });
+        assert!(spends_a && spends_b, "both identities must submit");
+        // No single tx spends both identities.
+        assert!(
+            !txs.iter().any(|tx| {
+                let ops: Vec<_> = tx
+                    .inputs()
+                    .into_iter()
+                    .map(|i| i.previous_output())
+                    .collect();
+                ops.contains(&a.out_point) && ops.contains(&b.out_point)
+            }),
+            "must not co-bundle two bounded lock identities"
+        );
+    }
+
+    #[test]
     fn mixed_exact_submit_plus_bounded_unaffordable_still_isolates() {
         // Exact submits; Bounded n=2 unaffordable but n=1 OK. Must return
         // FeeUnaffordable (not Submitted) so isolate shrinks Bounded. Exact

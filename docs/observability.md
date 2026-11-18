@@ -23,7 +23,7 @@ Stable field `event` (target `cid_backend`):
 | `process.resolve_miss` | No usable live Process binary |
 | `ssri.incompatible` | SSRI `Incompatible(code)` |
 | `refund.path` | User-lock refund assemble (`path=user_lock`, includes `fee`, `bounded`, `n`) |
-| `refund.partition` | Mixed allowlisted/legacy Intentions split into homogeneous refund groups |
+| `refund.partition` | DigestIncompatible refunds split by lock identity (Exact vs Bounded kept separate; no mixed-identity Bounded tx) |
 | `refund.zero_fee` | Legacy exact Incompatible refund submitted with fee 0 (public-net gap vs `min_fee_rate`; default when allowlist empty / lock not listed) |
 | `tick.skip` (`reason=fee_unaffordable`) | Process recreate cannot fund fee for this window; isolate/shrink (non-permanent) |
 | `tick.skip` (`reason=refund_fee_unaffordable`) | Bounded refund budgets cannot cover miner fee; isolate/shrink like fee_unaffordable (non-permanent) |
