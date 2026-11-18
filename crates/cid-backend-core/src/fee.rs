@@ -21,8 +21,9 @@
 //!   OWNER-redeployed CID lock that accepts the window **and** that lock's
 //!   `(code_hash, hash_type)` on the allowlist.
 //!
-//! Never mix allowlisted and legacy locks in one bounded refund tx —
-//! partition into homogeneous groups first.
+//! Never mix allowlisted and legacy locks in one bounded refund tx, and
+//! never co-bundle two different bounded-capable lock identities — the
+//! digest loop partitions by `(code_hash, hash_type)` first.
 //!
 //! ## Contract rules (PR #12 reviewed)
 //!
@@ -32,9 +33,11 @@
 //! **tx-wide** `F >= S` (`fee_covers_shortfalls`: miner fee covers aggregate
 //! shortfall so shortfalls cannot fund other outputs). `S` / DigestOk
 //! counting is scoped to the executing lock's `code_hash` + `hash_type`
-//! (not cross-deployment). TimeoutBurn stays exact. Backend assembly uses
-//! the stronger `sum(cuts) == F` with no extra outputs, which implies
-//! `F >= S`.
+//! (not cross-deployment). A contracts PR #12 follow-up rejects mixed CID
+//! identities in one DigestIncompatible tx (the real defense); assembler
+//! per-identity partitioning is defense-in-depth. TimeoutBurn stays exact.
+//! Backend assembly uses the stronger `sum(cuts) == F` with no extra
+//! outputs, which implies `F >= S`.
 //!
 //! ### Historical note
 //!

@@ -44,7 +44,9 @@ pub struct LoopConfig {
     /// allowlisted locks. Default [`crate::fee::DEFAULT_FEE_RATE`].
     pub fee_rate: u64,
     /// Audited CID lock identities that may use bounded refund fee mode.
-    /// Empty (default) ⇒ legacy exact refunds for every Intention. Never
+    /// Empty (default) ⇒ legacy exact refunds for every Intention. May list
+    /// multiple verified deployed identities after migration; the digest
+    /// loop never co-bundles distinct identities in one refund tx. Never
     /// put an undeployed candidate hash here.
     pub bounded_refund_locks: Vec<CidLockIdentity>,
     /// Extra CID lock identities to scan in addition to
@@ -752,41 +754,53 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
             ))
     }
 
-    /// Partition allowlisted vs legacy locks, assemble homogeneous refund
-    /// txs (never mix), and submit. `RefundFeeUnaffordable` →
-    /// [`BatchOutcome::FeeUnaffordable`] so isolate_window shrinks.
+    /// Partition DigestIncompatible refunds by lock identity
+    /// (`code_hash` + `hash_type`), keeping Exact vs Bounded separation.
+    /// Never co-bundle two different bounded-capable locks in one Execution
+    /// tx (contract `S` is scoped per executing identity; assembler DiD).
+    /// `RefundFeeUnaffordable` → [`BatchOutcome::FeeUnaffordable`] so
+    /// isolate_window shrinks.
     fn handle_incompatible_refunds(
         &mut self,
         batch: &[ScannedIntention],
         code: i8,
         report: &mut TickReport,
     ) -> BatchOutcome {
-        let mut bounded = Vec::new();
-        let mut exact = Vec::new();
+        // Group by lock identity (first-seen order), then Exact groups before
+        // Bounded so unaffordable Bounded can still surface after Exact submit.
+        let mut by_identity: Vec<(CidLockIdentity, Vec<ScannedIntention>)> = Vec::new();
         for item in batch {
-            if matches!(self.config.refund_mode_for(item), RefundFeeMode::Bounded) {
-                bounded.push(item.clone());
+            let id = item.lock_identity();
+            if let Some((_, group)) = by_identity.iter_mut().find(|(existing, _)| *existing == id) {
+                group.push(item.clone());
             } else {
-                exact.push(item.clone());
+                by_identity.push((id, vec![item.clone()]));
             }
         }
-        if !bounded.is_empty() && !exact.is_empty() {
+
+        let mut exact_groups = Vec::new();
+        let mut bounded_groups = Vec::new();
+        for (id, group) in by_identity {
+            match self.config.refund_mode_for(&group[0]) {
+                RefundFeeMode::Bounded => bounded_groups.push((RefundFeeMode::Bounded, id, group)),
+                RefundFeeMode::Exact => exact_groups.push((RefundFeeMode::Exact, id, group)),
+            }
+        }
+
+        if exact_groups.len() + bounded_groups.len() > 1 {
             tracing::info!(
                 target: LOG_TARGET,
                 event = "refund.partition",
                 code,
-                bounded_n = bounded.len(),
-                exact_n = exact.len(),
+                exact_groups = exact_groups.len(),
+                bounded_groups = bounded_groups.len(),
             );
         }
 
         let mut submitted = false;
         let mut unaffordable = false;
 
-        for (mode, group) in [
-            (RefundFeeMode::Exact, exact),
-            (RefundFeeMode::Bounded, bounded),
-        ] {
+        for (mode, _id, group) in exact_groups.into_iter().chain(bounded_groups) {
             if group.is_empty() {
                 continue;
             }

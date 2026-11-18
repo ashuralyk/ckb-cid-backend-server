@@ -12,7 +12,10 @@ at head **`d6c5a86`** (or newer): per-Intention ceiling via
 `refund_capacity_allowed`, plus **tx-wide** `F >= S`
 (`fee_covers_shortfalls`) so shortfalls cannot fund other outputs.
 `S` / DigestOk counting is scoped to the executing lock's
-`code_hash` + `hash_type` (not across deployments). TimeoutBurn stays exact.
+`code_hash` + `hash_type` (not across deployments). A contracts PR #12
+follow-up rejects **mixed CID identities** in one DigestIncompatible tx —
+that on-chain rule is the real defense against cross-identity `S` undercount;
+assembler partitioning is defense-in-depth only. TimeoutBurn stays exact.
 
 Do **not** treat undeployed candidate hashes as production defaults; do **not**
 replace current testnet `code_hash` with an undeployed binary (including
@@ -58,8 +61,11 @@ demands exact capacity.
 - Fail closed / isolate-shrink (`FeeUnaffordable`) if the budget is
   insufficient (non-permanent, no `rejected_combos`).
 - Intentions whose lock is **not** on the allowlist always use exact refunds.
-- **Never** mix allowlisted and legacy locks in one bounded refund tx —
-  the loop partitions them into homogeneous groups.
+- **Never** mix allowlisted and legacy locks in one bounded refund tx.
+- **Never** co-bundle two different bounded-capable lock identities in one
+  Execution tx — the loop partitions DigestIncompatible assembly by
+  `(code_hash, hash_type)`. The allowlist may list multiple verified
+  deployed identities after migration, but they must not share a refund tx.
 - **Never** co-bundle fee-shaved Incompatible refunds with Process /
   DigestOk.
 - **TimeoutBurn** stays exact; this daemon does not assemble it.
