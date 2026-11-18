@@ -26,7 +26,7 @@ Default auto-download is **Linux x86_64** (`ckb_${version}_x86_64-unknown-linux-
 ./scripts/local-dev-chain.sh
 ```
 
-The script inits `dev` with genesis miner lock, sets **`min_fee_rate = 0`** (D8: daemon never adds a fee input; without this the node rejects zero-fee txs), enables the Indexer RPC module, builds RISC-V guests, starts `ckb run` + `ckb miner` on `127.0.0.1:8114`, exports `CID_CKB_RPC_URL`, `CID_PROCESS_EXAMPLE_PATH`, `CID_LOCK_ELF_PATH`, `CID_ALWAYS_SUCCESS_PATH`, `CID_LOCAL_CHAIN_E2E=1`, then runs the ignored E2E. Setting only `CID_LOCAL_CHAIN_E2E=1` and invoking `cargo test` on a clean machine is **not** equivalent.
+The script inits `dev` with genesis miner lock, sets **`min_fee_rate = 0`** (D8: daemon never adds a fee input; `digest_ok` pays fee from the Process recreate, but Incompatible refunds remain zero-fee), enables the Indexer RPC module, builds RISC-V guests, starts `ckb run` + `ckb miner` on `127.0.0.1:8114`, exports `CID_CKB_RPC_URL`, `CID_PROCESS_EXAMPLE_PATH`, `CID_LOCK_ELF_PATH`, `CID_ALWAYS_SUCCESS_PATH`, `CID_LOCAL_CHAIN_E2E=1`, then runs the ignored E2E. Setting only `CID_LOCAL_CHAIN_E2E=1` and invoking `cargo test` on a clean machine is **not** equivalent.
 
 Success prints `local-chain execution tx committed:` and `local-chain closure ok:`.
 
@@ -59,7 +59,7 @@ State is memory-only. Restarting the daemon drops in-flight occupancy and full-r
 
 ## Essential local-chain prerequisites (not phase 3)
 
-- **`min_fee_rate = 0`** on the node. The digest tx has no extra fee input (D8).
+- **`min_fee_rate = 0`** on the node. No fee input (D8); `digest_ok` still overpays from Process when `loop.fee_rate > 0`. Refunds stay zero-fee.
 - Process cell **data is the RISC-V ELF** so `ProcessResolver` (D4) can SSRI it; the same ELF is also a code cell so the Process **type** script can execute (`hash_type = data1`).
 - Process **lock** is always-success so the daemon does not hold secp keys (no post-Intention signatures).
 - Lookup of live Process cells uses `CID_PROCESS_CODE_HASH` as the Process type's `code_hash` indexer prefix, then filters `calc_script_hash`. On this local chain that prefix is the Process ELF data hash because the type uses `hash_type = data1`.

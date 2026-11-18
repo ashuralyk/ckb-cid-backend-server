@@ -1,6 +1,7 @@
 pub mod assemble;
 pub mod code_deps;
 pub mod digest_loop;
+pub mod fee;
 pub mod process;
 pub mod rpc;
 pub mod scan;
@@ -19,6 +20,10 @@ pub use code_deps::{
 pub use digest_loop::{
     Clock, DigestLoop, LoopConfig, LoopState, NopClock, RealClock, TickReport,
     DEFAULT_CONFIRMATION_DEPTH,
+};
+pub use fee::{
+    fee_for_size, process_min_capacity, required_fee, tx_size_in_block, DEFAULT_FEE_RATE,
+    MAX_FEE_RATE,
 };
 pub use process::{ProcessResolver, ResolvedProcess, SsriBinarySource};
 pub use rpc::{out_point_key, script_hash32, LiveCell, Rpc, RpcError, TxStatus};

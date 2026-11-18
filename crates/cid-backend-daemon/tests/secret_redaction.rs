@@ -32,14 +32,8 @@ fn write_toml(body: &str) -> PathBuf {
 }
 
 fn assert_no_secrets(label: &str, blob: &str) {
-    assert!(
-        !blob.contains(SECRET),
-        "{label} leaked {SECRET}: {blob}"
-    );
-    assert!(
-        !blob.contains(TOKEN),
-        "{label} leaked {TOKEN}: {blob}"
-    );
+    assert!(!blob.contains(SECRET), "{label} leaked {SECRET}: {blob}");
+    assert!(!blob.contains(TOKEN), "{label} leaked {TOKEN}: {blob}");
     assert!(
         !blob.contains("user:SECRET") && !blob.contains("user:s3cret"),
         "{label} leaked userinfo: {blob}"
