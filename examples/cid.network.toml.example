@@ -1,0 +1,57 @@
+# Example CID Server config (one file = one network).
+# Copy, replace EVERY <PLACEHOLDER>, then:
+#   cargo run -p cid-backend-daemon -- --config /path/to/your.toml
+#
+# Placeholders are NOT valid hex / URLs. This file cannot run as-is and
+# does not target public testnet/mainnet.
+#
+# network.name is a log label only. Chain identity is genesis_hash
+# (this network's get_block_hash 0x0). It is DECLARED, not verified,
+# unless validate_genesis = true (then the daemon fail-closes on mismatch
+# or RPC error). Daemon never auto-discovers contracts or cell deps.
+# No keys. No signing.
+
+[network]
+name = "<NETWORK_LABEL>"
+genesis_hash = "<GENESIS_BLOCK_HASH_32>"
+validate_genesis = false
+
+[rpc]
+url = "<CKB_NODE_JSON_RPC_URL>"
+# indexer_url = "<CKB_INDEXER_JSON_RPC_URL>"  # omit to use url
+
+[cid_lock]
+code_hash = "<CID_LOCK_CODE_HASH_32>"
+hash_type = "type"                         # type | data | data1 | data2
+
+[process]
+# Process type script code_hash prefixes (must match that type's hash_type).
+# Not the calc_script_hash stored in CID args.
+type_code_hashes = ["<PROCESS_TYPE_CODE_HASH_32>"]
+
+# assemble uses this list as-is; nothing is auto-filled.
+[[cell_deps]]
+label = "cid_lock"
+tx_hash = "<CID_LOCK_CODE_CELL_TX>"
+index = 0
+dep_type = "code"                          # code | dep_group
+
+[[cell_deps]]
+label = "process_code"
+tx_hash = "<PROCESS_TYPE_CODE_CELL_TX>"
+index = 0
+dep_type = "code"
+
+[[cell_deps]]
+label = "process_lock"
+tx_hash = "<PROCESS_LOCK_CODE_CELL_TX>"
+index = 0
+dep_type = "code"
+
+[loop]
+poll_interval_secs = 5
+confirmation_depth = 24
+
+[observe]
+# health_bind = "127.0.0.1:9100"           # omit/empty disables HTTP
+log_format = "json"                        # json | pretty | text

@@ -457,6 +457,10 @@ fn scan_resolve_ssri_submit_confirms_on_local_dev_chain() {
         process_type_code_hashes: vec![process_code_hash],
         health_bind: None,
         confirmation_depth: 1,
+        network_name: Some("local-dev".into()),
+        genesis_hash: None,
+        validate_genesis: false,
+        log_format: cid_backend_daemon::logging::LogFormat::Json,
     };
     let live_rpc = CkbRpc::from_config(&cfg);
     let mut loop_ = DigestLoop::new(

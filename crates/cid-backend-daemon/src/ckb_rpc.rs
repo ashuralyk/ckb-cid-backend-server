@@ -6,7 +6,7 @@
 //! (`CID_PROCESS_CODE_HASH`) then filtered to `calc_script_hash ==
 //! process_type_hash` from CID args.
 
-use crate::config::DaemonConfig;
+use crate::config::{ConfigError, DaemonConfig};
 use cid_backend_core::rpc::{script_hash32, LiveCell, Rpc, RpcError, TxStatus};
 use ckb_types::core::{DepType, ScriptHashType, TransactionView};
 use ckb_types::packed::{Byte32, CellInput, CellOutput, OutPoint, Script};
@@ -65,6 +65,33 @@ impl CkbRpc {
     /// Node JSON-RPC helper for local-chain bootstrap / confirmation polls.
     pub fn call_node(&self, method: &str, params: Value) -> Result<Value, RpcError> {
         self.rpc_call(&self.node_url, method, params)
+    }
+
+    /// Fail-closed genesis identity: `get_block_hash("0x0")`.
+    pub fn genesis_block_hash(&self) -> Result<[u8; 32], RpcError> {
+        let result = self.call_node("get_block_hash", json!(["0x0"]))?;
+        let hex = result.as_str().ok_or_else(|| {
+            RpcError::Unavailable("get_block_hash: result not hex".into())
+        })?;
+        let bytes = decode_hex(hex)?;
+        <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
+            RpcError::Unavailable("get_block_hash: not 32 bytes".into())
+        })
+    }
+
+    /// Compare declared genesis to the node. RPC errors and mismatches both fail.
+    pub fn verify_declared_genesis(&self, expected: &[u8; 32]) -> Result<(), ConfigError> {
+        match self.genesis_block_hash() {
+            Ok(got) if &got == expected => Ok(()),
+            Ok(got) => Err(ConfigError::Invalid(format!(
+                "genesis hash mismatch (fail-closed): declared 0x{} node 0x{}",
+                hex::encode(expected),
+                hex::encode(got)
+            ))),
+            Err(e) => Err(ConfigError::Invalid(format!(
+                "genesis hash check failed (fail-closed): {e}"
+            ))),
+        }
     }
 
     fn rpc_call(&self, url: &str, method: &str, params: Value) -> Result<Value, RpcError> {
@@ -1516,5 +1543,40 @@ mod tests {
             r2.submitted, 0,
             "pending occupancy holds; sticky cells must not hide it from scan"
         );
+    }
+
+    #[test]
+    fn verify_declared_genesis_matches() {
+        let url = spawn_mock(Arc::new(|method, _| {
+            assert_eq!(method, "get_block_hash");
+            Ok(Value::String(format!("0x{}", "ab".repeat(32))))
+        }));
+        let rpc = CkbRpc::new(&url, &url);
+        rpc.verify_declared_genesis(&[0xabu8; 32]).unwrap();
+    }
+
+    #[test]
+    fn verify_declared_genesis_mismatch_fails_closed() {
+        let url = spawn_mock(Arc::new(|method, _| {
+            assert_eq!(method, "get_block_hash");
+            Ok(Value::String(format!("0x{}", "ab".repeat(32))))
+        }));
+        let rpc = CkbRpc::new(&url, &url);
+        let err = rpc.verify_declared_genesis(&[0xcdu8; 32]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("fail-closed"), "{msg}");
+        assert!(msg.contains("mismatch"), "{msg}");
+    }
+
+    #[test]
+    fn verify_declared_genesis_rpc_error_fails_closed() {
+        let url = spawn_mock(Arc::new(|method, _| {
+            assert_eq!(method, "get_block_hash");
+            Err((-1, "unavailable".into()))
+        }));
+        let rpc = CkbRpc::new(&url, &url);
+        let err = rpc.verify_declared_genesis(&[0xabu8; 32]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("fail-closed"), "{msg}");
     }
 }
