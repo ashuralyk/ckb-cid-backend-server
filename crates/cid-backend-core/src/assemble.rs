@@ -1,10 +1,10 @@
 use crate::process::ResolvedProcess;
 use crate::rpc::script_hash32;
 use crate::scan::ScannedIntention;
+use cid_process_executor::PartialTx;
 use ckb_types::core::{TransactionBuilder, TransactionView};
 use ckb_types::packed::{CellDep, CellInput, CellOutput, Script};
 use ckb_types::prelude::*;
-use cid_process_executor::PartialTx;
 use std::fmt;
 
 #[derive(Clone, Debug)]
@@ -83,8 +83,8 @@ pub fn assemble_digest_ok(
         .collect();
     inputs.push(cell_input(&process.live_cell.out_point));
 
-    let input_capacity = intentions.iter().map(|i| i.capacity).sum::<u64>()
-        + process.live_cell.capacity();
+    let input_capacity =
+        intentions.iter().map(|i| i.capacity).sum::<u64>() + process.live_cell.capacity();
 
     let mut outputs = Vec::new();
     let mut outputs_data = Vec::new();
@@ -111,7 +111,13 @@ pub fn assemble_digest_ok(
     outputs.push(proc_out);
     outputs_data.push(proc_data);
 
-    finish(inputs, input_capacity, outputs, outputs_data, extra_cell_deps)
+    finish(
+        inputs,
+        input_capacity,
+        outputs,
+        outputs_data,
+        extra_cell_deps,
+    )
 }
 
 fn protocol_script_to_packed(script: &cid_protocol::Script) -> Script {
@@ -142,12 +148,16 @@ pub fn assemble_digest_incompatible(
         outputs.push(out);
         outputs_data.push(data);
     }
-    finish(inputs, input_capacity, outputs, outputs_data, extra_cell_deps)
+    finish(
+        inputs,
+        input_capacity,
+        outputs,
+        outputs_data,
+        extra_cell_deps,
+    )
 }
 
-fn refund_output(
-    intent: &ScannedIntention,
-) -> Result<(CellOutput, Vec<u8>), AssembleError> {
+fn refund_output(intent: &ScannedIntention) -> Result<(CellOutput, Vec<u8>), AssembleError> {
     let user = protocol_script_to_packed(&intent.args.entry.user_lock);
     let mut builder = CellOutput::new_builder()
         .capacity(intent.capacity.pack())
@@ -176,13 +186,11 @@ mod tests {
     use crate::process::ResolvedProcess;
     use crate::rpc::LiveCell;
     use crate::scan::ScannedIntention;
-    use ckb_types::core::ScriptHashType;
-    use ckb_types::packed::{
-        Byte32, CellOutput, OutPoint, RawTransaction, Script, Transaction,
-    };
-    use ckb_types::prelude::*;
-    use cid_protocol::{CidArgs, Payload, Script as CidScript};
     use cid_process_executor::PartialTx;
+    use cid_protocol::{CidArgs, Payload, Script as CidScript};
+    use ckb_types::core::ScriptHashType;
+    use ckb_types::packed::{Byte32, CellOutput, OutPoint, RawTransaction, Script, Transaction};
+    use ckb_types::prelude::*;
 
     fn pack_partial(outputs: Vec<CellOutput>, data: Vec<Vec<u8>>) -> PartialTx {
         let bytes = Transaction::new_builder()
@@ -207,11 +215,7 @@ mod tests {
     }
 
     fn intention(fill: u8, process_hash: [u8; 32], cap: u64) -> ScannedIntention {
-        let args = CidArgs::new(
-            process_hash,
-            user_lock(),
-            Payload { data: vec![0xAA] },
-        );
+        let args = CidArgs::new(process_hash, user_lock(), Payload { data: vec![0xAA] });
         let lock_args = args.encode().unwrap();
         ScannedIntention {
             out_point: OutPoint::new_builder()
@@ -276,10 +280,13 @@ mod tests {
         let hash = proc.type_hash;
         let intent = intention(1, hash, 100_0000_0000);
         let partial = pack_partial(vec![beneficiary(100_0000_0000)], vec![vec![]]);
-        let skel = assemble_digest_ok(&[intent.clone()], &proc, &partial, &[])
-            .expect("assemble");
+        let skel = assemble_digest_ok(&[intent.clone()], &proc, &partial, &[]).expect("assemble");
         let tx = skel.tx;
-        assert_eq!(tx.inputs().len(), 2, "intention + process only; no fee input");
+        assert_eq!(
+            tx.inputs().len(),
+            2,
+            "intention + process only; no fee input"
+        );
         let in_ops: Vec<_> = tx
             .inputs()
             .into_iter()
@@ -290,7 +297,10 @@ mod tests {
         assert_eq!(tx.outputs().len(), 2, "beneficiary + process recreate");
         let proc_out = tx.outputs().get(1).unwrap();
         assert_eq!(
-            proc_out.type_().to_opt().map(|t| crate::rpc::script_hash32(&t)),
+            proc_out
+                .type_()
+                .to_opt()
+                .map(|t| crate::rpc::script_hash32(&t)),
             Some(hash)
         );
         assert_eq!(proc_out.capacity(), proc.live_cell.output.capacity());
@@ -313,10 +323,7 @@ mod tests {
         let intent = intention(1, hash, 10_0000_0000);
         let partial = pack_partial(vec![beneficiary(500_0000_0000)], vec![vec![]]);
         let err = assemble_digest_ok(&[intent], &proc, &partial, &[]).unwrap_err();
-        assert!(matches!(
-            err,
-            AssembleError::CapacityShortfall { .. }
-        ));
+        assert!(matches!(err, AssembleError::CapacityShortfall { .. }));
     }
 
     #[test]
@@ -348,7 +355,10 @@ mod tests {
         let skel = assemble_digest_incompatible(&[intent.clone()], &[]).unwrap();
         let tx = skel.tx;
         assert_eq!(tx.inputs().len(), 1);
-        assert_eq!(tx.inputs().get(0).unwrap().previous_output(), intent.out_point);
+        assert_eq!(
+            tx.inputs().get(0).unwrap().previous_output(),
+            intent.out_point
+        );
         assert_eq!(tx.outputs().len(), 1);
         let out = tx.outputs().get(0).unwrap();
         let cap: u64 = out.capacity().unpack();
@@ -362,7 +372,7 @@ mod tests {
 
     #[test]
     fn digest_incompatible_preserves_standard_xudt() {
-        use cid_protocol::{XUDT_AMOUNT_LEN, XUDT_CODE_HASH, SCRIPT_HASH_TYPE_DATA1};
+        use cid_protocol::{SCRIPT_HASH_TYPE_DATA1, XUDT_AMOUNT_LEN, XUDT_CODE_HASH};
         let mut intent = intention(1, [0xAB; 32], 100_0000_0000);
         let ts = Script::new_builder()
             .code_hash(XUDT_CODE_HASH.pack())

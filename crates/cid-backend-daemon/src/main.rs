@@ -1,5 +1,6 @@
+use cid_backend_core::code_deps::PROCESS_CODE_LABEL;
 use cid_backend_core::digest_loop::{DigestLoop, NopClock};
-use cid_backend_core::process::ProcessResolver;
+use cid_backend_core::process::{ProcessResolver, SsriBinarySource};
 use cid_backend_core::ssri::EmbeddedSsri;
 use cid_backend_daemon::observe::{spawn_health, DaemonStats};
 use cid_backend_daemon::{
@@ -99,13 +100,18 @@ fn main() {
     }
     let loop_config = config.to_loop_config();
     let poll = config.poll_interval;
-    let mut digest = DigestLoop::new(
-        rpc,
-        NopClock,
-        EmbeddedSsri,
-        loop_config,
-        ProcessResolver::new(),
-    );
+    // Type-ID Process code → SSRI executes the resolved code-cell ELF (same
+    // snapshot as the CellDep). Legacy / local data1 keeps state-cell ELF.
+    let resolver = if config
+        .type_id_code_deps
+        .iter()
+        .any(|d| d.label == PROCESS_CODE_LABEL)
+    {
+        ProcessResolver::with_ssri_source(SsriBinarySource::TypeIdCodeCell)
+    } else {
+        ProcessResolver::new()
+    };
+    let mut digest = DigestLoop::new(rpc, NopClock, EmbeddedSsri, loop_config, resolver);
     loop {
         let report = digest.tick();
         stats.observe(&report, digest.state().submit.pending.len());

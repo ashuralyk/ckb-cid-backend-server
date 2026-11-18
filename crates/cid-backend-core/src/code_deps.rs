@@ -1,22 +1,31 @@
-//! Resolve Type-ID–deployed code cells to CellDeps.
+//! Resolve Type-ID–deployed code cells to CellDeps (+ Process code bytes).
 //!
 //! Fail-closed: zero matches → Missing; two or more → Ambiguous; optional
-//! `type_id` hash mismatch → IdentityMismatch. Transient indexer/RPC errors
-//! surface as Unavailable and must not permanently reject Intentions.
+//! `type_id` hash mismatch → IdentityMismatch; same outpoint with conflicting
+//! `dep_type` → DepTypeConflict. Transient indexer/RPC errors surface as
+//! Unavailable and must not permanently reject Intentions.
+//!
+//! Uniqueness search is bounded (`max_results = 2`) so a unique Type-ID cell
+//! does not require paging the full indexer set. Cell data is retained so
+//! Process **code** SSRI can bind to the same per-tick snapshot as the CellDep.
 
-use crate::rpc::{Rpc, RpcError};
+use crate::rpc::{LiveCell, Rpc, RpcError};
 use crate::type_id::{TypeIdCodeDep, TypeIdIdentity};
 use ckb_types::core::DepType;
 use ckb_types::packed::{CellDep, OutPoint};
 use ckb_types::prelude::*;
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::fmt;
+
+/// Label used for the Process type **code** cell Type-ID role.
+pub const PROCESS_CODE_LABEL: &str = "process_code";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CodeDepError {
     Missing { label: String },
     Ambiguous { label: String, count: usize },
     IdentityMismatch { label: String, detail: String },
+    DepTypeConflict { detail: String },
     Unavailable(String),
 }
 
@@ -35,6 +44,9 @@ impl fmt::Display for CodeDepError {
             CodeDepError::IdentityMismatch { label, detail } => {
                 write!(f, "type-id identity mismatch for {label}: {detail}")
             }
+            CodeDepError::DepTypeConflict { detail } => {
+                write!(f, "cell_dep dep_type conflict: {detail}")
+            }
             CodeDepError::Unavailable(m) => write!(f, "type-id resolve unavailable: {m}"),
         }
     }
@@ -48,11 +60,28 @@ impl From<RpcError> for CodeDepError {
     }
 }
 
-/// Resolve one Type-ID code cell to a `DepType::Code` CellDep.
-pub fn resolve_type_id_code_dep<R: Rpc>(
+/// One Type-ID–resolved code cell (CellDep + live cell snapshot including data).
+#[derive(Clone, Debug)]
+pub struct ResolvedTypeIdCode {
+    pub label: String,
+    pub cell_dep: CellDep,
+    pub cell: LiveCell,
+}
+
+/// Per-tick execution deps: merged CellDeps plus optional Process code snapshot.
+#[derive(Clone, Debug, Default)]
+pub struct ResolvedExecutionDeps {
+    pub cell_deps: Vec<CellDep>,
+    /// Present when a `process_code` Type-ID spec resolved. SSRI must use these
+    /// bytes (same outpoint as the Process code CellDep) for this tick.
+    pub process_code: Option<ResolvedTypeIdCode>,
+}
+
+/// Resolve one Type-ID code cell. Stops indexer walk after 2 matches.
+pub fn resolve_type_id_code_cell<R: Rpc>(
     rpc: &R,
     spec: &TypeIdCodeDep,
-) -> Result<CellDep, CodeDepError> {
+) -> Result<ResolvedTypeIdCode, CodeDepError> {
     if let Err(detail) = spec.identity.validate_expected() {
         return Err(CodeDepError::IdentityMismatch {
             label: spec.label.clone(),
@@ -60,12 +89,20 @@ pub fn resolve_type_id_code_dep<R: Rpc>(
         });
     }
     let script = spec.identity.type_script();
-    let cells = rpc.list_live_cells_by_type_script(&script)?;
+    // max_results=2: unique vs ambiguous without unbounded collection.
+    let cells = rpc.find_live_cells_by_type_script(&script, 2)?;
     match cells.len() {
         0 => Err(CodeDepError::Missing {
             label: spec.label.clone(),
         }),
-        1 => Ok(cell_dep_code(&cells[0].out_point)),
+        1 => {
+            let cell = cells.into_iter().next().expect("len 1");
+            Ok(ResolvedTypeIdCode {
+                label: spec.label.clone(),
+                cell_dep: cell_dep_code(&cell.out_point),
+                cell,
+            })
+        }
         n => Err(CodeDepError::Ambiguous {
             label: spec.label.clone(),
             count: n,
@@ -73,19 +110,41 @@ pub fn resolve_type_id_code_dep<R: Rpc>(
     }
 }
 
+/// Resolve one Type-ID code cell to a `DepType::Code` CellDep.
+pub fn resolve_type_id_code_dep<R: Rpc>(
+    rpc: &R,
+    spec: &TypeIdCodeDep,
+) -> Result<CellDep, CodeDepError> {
+    Ok(resolve_type_id_code_cell(rpc, spec)?.cell_dep)
+}
+
 /// Merge Type-ID–resolved deps with static extras. Dedupes by outpoint
-/// (first wins: Type-ID order, then static). Snapshot is consistent for one
-/// assemble/execute.
-pub fn merge_cell_deps(resolved: &[CellDep], static_extra: &[CellDep]) -> Vec<CellDep> {
-    let mut seen = BTreeSet::new();
+/// (first wins: Type-ID order, then static). Same outpoint with a different
+/// `dep_type` fails closed — silent keep of the first would hide misconfig.
+pub fn merge_cell_deps(
+    resolved: &[CellDep],
+    static_extra: &[CellDep],
+) -> Result<Vec<CellDep>, CodeDepError> {
+    let mut by_outpoint: BTreeMap<Vec<u8>, CellDep> = BTreeMap::new();
     let mut out = Vec::new();
     for dep in resolved.iter().chain(static_extra.iter()) {
         let key = dep.out_point().as_slice().to_vec();
-        if seen.insert(key) {
-            out.push(dep.clone());
+        if let Some(prev) = by_outpoint.get(&key) {
+            if prev.dep_type() != dep.dep_type() {
+                return Err(CodeDepError::DepTypeConflict {
+                    detail: format!(
+                        "outpoint appears with both dep_type={:?} and dep_type={:?}",
+                        prev.dep_type(),
+                        dep.dep_type()
+                    ),
+                });
+            }
+            continue;
         }
+        by_outpoint.insert(key, dep.clone());
+        out.push(dep.clone());
     }
-    out
+    Ok(out)
 }
 
 /// Resolve all Type-ID specs then merge with static extras.
@@ -93,12 +152,22 @@ pub fn resolve_execution_cell_deps<R: Rpc>(
     rpc: &R,
     specs: &[TypeIdCodeDep],
     static_extra: &[CellDep],
-) -> Result<Vec<CellDep>, CodeDepError> {
-    let mut resolved = Vec::with_capacity(specs.len());
+) -> Result<ResolvedExecutionDeps, CodeDepError> {
+    let mut resolved_cells = Vec::with_capacity(specs.len());
+    let mut process_code = None;
     for spec in specs {
-        resolved.push(resolve_type_id_code_dep(rpc, spec)?);
+        let cell = resolve_type_id_code_cell(rpc, spec)?;
+        if spec.label == PROCESS_CODE_LABEL {
+            process_code = Some(cell.clone());
+        }
+        resolved_cells.push(cell);
     }
-    Ok(merge_cell_deps(&resolved, static_extra))
+    let resolved_deps: Vec<CellDep> = resolved_cells.iter().map(|c| c.cell_dep.clone()).collect();
+    let cell_deps = merge_cell_deps(&resolved_deps, static_extra)?;
+    Ok(ResolvedExecutionDeps {
+        cell_deps,
+        process_code,
+    })
 }
 
 fn cell_dep_code(op: &OutPoint) -> CellDep {
@@ -123,7 +192,7 @@ pub fn derived_type_code_hash(identity: &TypeIdIdentity) -> Result<[u8; 32], Cod
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rpc::{script_hash32, LiveCell, TxStatus};
+    use crate::rpc::{out_point_key, script_hash32, LiveCell, TxStatus};
     use crate::type_id::{type_id_script, TypeIdIdentity};
     use ckb_types::core::{ScriptHashType, TransactionView};
     use ckb_types::packed::{Byte32, CellOutput, Script};
@@ -132,6 +201,7 @@ mod tests {
     struct MapRpc {
         cells: RefCell<Vec<LiveCell>>,
         fail: RefCell<bool>,
+        last_max: RefCell<Option<usize>>,
     }
 
     impl MapRpc {
@@ -139,6 +209,7 @@ mod tests {
             Self {
                 cells: RefCell::new(cells),
                 fail: RefCell::new(false),
+                last_max: RefCell::new(None),
             }
         }
     }
@@ -159,10 +230,12 @@ mod tests {
             Ok(None)
         }
 
-        fn list_live_cells_by_type_script(
+        fn find_live_cells_by_type_script(
             &self,
             type_script: &Script,
+            max_results: usize,
         ) -> Result<Vec<LiveCell>, RpcError> {
+            *self.last_max.borrow_mut() = Some(max_results);
             if *self.fail.borrow() {
                 return Err(RpcError::Unavailable("injected".into()));
             }
@@ -176,6 +249,7 @@ mod tests {
                         .map(|ts| script_hash32(&ts) == want)
                         .unwrap_or(false)
                 })
+                .take(max_results)
                 .cloned()
                 .collect())
         }
@@ -194,6 +268,10 @@ mod tests {
     }
 
     fn code_cell(tx_byte: u8, args: [u8; 32]) -> LiveCell {
+        code_cell_with_data(tx_byte, args, vec![0x7f, b'E', b'L', b'F'])
+    }
+
+    fn code_cell_with_data(tx_byte: u8, args: [u8; 32], data: Vec<u8>) -> LiveCell {
         let type_script = type_id_script(&args);
         let lock = Script::new_builder()
             .code_hash(Byte32::from_slice(&[0x99; 32]).unwrap())
@@ -211,7 +289,7 @@ mod tests {
                 .index(0u32.pack())
                 .build(),
             output,
-            data: vec![0x7f, b'E', b'L', b'F'],
+            data,
         }
     }
 
@@ -227,6 +305,30 @@ mod tests {
         let dep = resolve_type_id_code_dep(&rpc, &spec).unwrap();
         assert_eq!(dep.out_point(), cell.out_point);
         assert_eq!(dep.dep_type(), DepType::Code.into());
+        assert_eq!(*rpc.last_max.borrow(), Some(2));
+    }
+
+    #[test]
+    fn resolve_process_code_retains_elf_bytes() {
+        let args = [0xae; 32];
+        let data = vec![0x7f, b'E', b'L', b'F', 0x42];
+        let cell = code_cell_with_data(3, args, data.clone());
+        let rpc = MapRpc::new(vec![cell.clone()]);
+        let resolved = resolve_execution_cell_deps(
+            &rpc,
+            &[TypeIdCodeDep {
+                label: PROCESS_CODE_LABEL.into(),
+                identity: TypeIdIdentity::new(args),
+            }],
+            &[],
+        )
+        .unwrap();
+        let pc = resolved.process_code.expect("process_code");
+        assert_eq!(pc.cell.data, data);
+        assert_eq!(
+            out_point_key(&pc.cell.out_point),
+            out_point_key(&cell.out_point)
+        );
     }
 
     #[test]
@@ -319,9 +421,29 @@ mod tests {
                 .index(0u32.pack())
                 .build(),
         );
-        let merged = merge_cell_deps(std::slice::from_ref(&a), &[a.clone(), b.clone()]);
+        let merged = merge_cell_deps(std::slice::from_ref(&a), &[a.clone(), b.clone()]).unwrap();
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0], a);
         assert_eq!(merged[1], b);
+    }
+
+    #[test]
+    fn merge_rejects_same_outpoint_conflicting_dep_type() {
+        let op = OutPoint::new_builder()
+            .tx_hash(Byte32::from_slice(&[9; 32]).unwrap())
+            .index(0u32.pack())
+            .build();
+        let code = CellDep::new_builder()
+            .out_point(op.clone())
+            .dep_type(DepType::Code.into())
+            .build();
+        let group = CellDep::new_builder()
+            .out_point(op)
+            .dep_type(DepType::DepGroup.into())
+            .build();
+        match merge_cell_deps(&[code], &[group]) {
+            Err(CodeDepError::DepTypeConflict { .. }) => {}
+            other => panic!("expected DepTypeConflict, got {other:?}"),
+        }
     }
 }

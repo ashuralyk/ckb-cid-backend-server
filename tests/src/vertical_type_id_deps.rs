@@ -2,8 +2,9 @@
 mod tests {
     use std::time::Duration;
 
+    use cid_backend_core::code_deps::PROCESS_CODE_LABEL;
     use cid_backend_core::digest_loop::{DigestLoop, LoopConfig, NopClock};
-    use cid_backend_core::process::ProcessResolver;
+    use cid_backend_core::process::{ProcessResolver, SsriBinarySource};
     use cid_backend_core::rpc::{out_point_key, script_hash32};
     use cid_backend_core::type_id::{type_id_script, TypeIdCodeDep, TypeIdIdentity};
     use ckb_types::core::{DepType, ScriptHashType};
@@ -45,6 +46,10 @@ mod tests {
             type_id_code_deps,
             confirmation_depth: 1,
         }
+    }
+
+    fn process_code_resolver() -> ProcessResolver {
+        ProcessResolver::with_ssri_source(SsriBinarySource::TypeIdCodeCell)
     }
 
     #[test]
@@ -92,7 +97,7 @@ mod tests {
         let hash = script_hash32(&ts);
         let intent = intention_cell(2, hash, 100_0000_0000);
         let proc = process_cell(2, 200_0000_0000, vec![0x7f, b'E', b'L', b'F', 2]);
-        let code_v1 = code_cell(0x21, args, vec![1]);
+        let code_v1 = code_cell(0x21, args, vec![0x7f, b'E', b'L', b'F', 1]);
         rpc.insert_cell(intent.clone());
         rpc.insert_cell(proc.clone());
         rpc.insert_cell(code_v1.clone());
@@ -103,24 +108,26 @@ mod tests {
             ScriptedSsri::mimic((1, 4)),
             cfg(
                 vec![TypeIdCodeDep {
-                    label: "process_code".into(),
+                    label: PROCESS_CODE_LABEL.into(),
                     identity: TypeIdIdentity::new(args),
                 }],
                 vec![],
             ),
-            ProcessResolver::new(),
+            process_code_resolver(),
         );
-        assert_eq!(loop_.tick().submitted, 1);
+        assert_eq!(
+            loop_.tick().submitted,
+            1,
+            "v1 must submit with ELF code cell"
+        );
         let first_dep = loop_.rpc().submitted()[0].cell_deps().get(0).unwrap();
         assert_eq!(first_dep.out_point(), code_v1.out_point);
 
-        // Upgrade: same TYPE_ID args, new code-cell outpoint. Intention still live
-        // because first tick consumed it — re-insert a new intention + process.
         loop_.rpc().consume(&code_v1.out_point);
-        let code_v2 = code_cell(0x22, args, vec![2]);
+        let code_v2 = code_cell(0x22, args, vec![0x7f, b'E', b'L', b'F', 2]);
         loop_.rpc().insert_cell(code_v2.clone());
         let intent2 = intention_cell(3, hash, 100_0000_0000);
-        let proc2 = process_cell(3, 200_0000_0000, vec![0x7f, b'E', b'L', b'F', 3]);
+        let proc2 = process_cell(3, 200_0000_0000, vec![0x00]);
         loop_.rpc().insert_cell(intent2);
         loop_.rpc().insert_cell(proc2);
 
@@ -176,7 +183,6 @@ mod tests {
             .rejected
             .contains(&out_point_key(&intent.out_point)));
 
-        // Recovery when the code cell appears.
         loop_
             .rpc()
             .insert_cell(code_cell(0x30, args, vec![0x7f, b'E', b'L', b'F']));
@@ -188,7 +194,7 @@ mod tests {
     fn ambiguous_type_id_cells_fail_closed_without_submit() {
         let args = [0xa4; 32];
         let rpc = FakeRpc::new();
-        let ts = process_type_script(4);
+        let ts = process_type_script(5);
         let hash = script_hash32(&ts);
         rpc.insert_cell(intention_cell(5, hash, 100_0000_0000));
         rpc.insert_cell(process_cell(
@@ -314,5 +320,213 @@ mod tests {
         assert_eq!(deps.len(), 2, "resolved + unique static");
         assert_eq!(deps[0].out_point(), code.out_point);
         assert_eq!(deps[1].out_point(), static_only.out_point());
+    }
+
+    /// Regression #1: code-deps refresh failure must not stall pending settlement.
+    #[test]
+    fn pending_settles_while_type_id_refresh_unavailable() {
+        let args = [0xb1; 32];
+        let rpc = FakeRpc::new();
+        rpc.defer_commit();
+        let ts = process_type_script(11);
+        let hash = script_hash32(&ts);
+        let proc = process_cell(11, 400_0000_0000, vec![0x7f, b'E', b'L', b'F', 11]);
+        rpc.insert_cell(proc.clone());
+        rpc.insert_cell(intention_cell(11, hash, 100_0000_0000));
+        let code = code_cell(0x71, args, vec![0x7f, b'E', b'L', b'F']);
+        rpc.insert_cell(code);
+
+        let mut loop_ = DigestLoop::new(
+            rpc,
+            NopClock,
+            ScriptedSsri::mimic((1, 1)),
+            cfg(
+                vec![TypeIdCodeDep {
+                    label: "cid_lock".into(),
+                    identity: TypeIdIdentity::new(args),
+                }],
+                vec![],
+            ),
+            ProcessResolver::new(),
+        );
+        assert_eq!(loop_.tick().submitted, 1);
+        assert_eq!(loop_.state().submit.pending.len(), 1);
+        let tx_hash = loop_.rpc().submitted()[0].hash();
+        loop_.rpc().commit_pending(&tx_hash);
+        loop_.rpc().advance_tip(1);
+
+        // Second Intention appears while a prior digest_ok is still confirming.
+        loop_
+            .rpc()
+            .insert_cell(intention_cell(12, hash, 100_0000_0000));
+
+        loop_.rpc().fail_type_script_queries();
+        let blocked = loop_.tick();
+        assert_eq!(blocked.submitted, 0);
+        assert!(blocked
+            .last_error
+            .as_deref()
+            .unwrap_or("")
+            .contains("unavailable"));
+        assert!(
+            loop_.state().submit.pending.is_empty(),
+            "pending must settle even when Type-ID refresh fails"
+        );
+
+        loop_.rpc().restore_type_script_queries();
+        let after = loop_.tick();
+        assert_eq!(
+            after.submitted, 1,
+            "new assembly resumes after deps restore; err={:?}",
+            after.last_error
+        );
+    }
+
+    /// Regression #2: SSRI must use Type-ID Process CODE bytes, not divergent state ELF.
+    #[test]
+    fn process_type_id_ssri_uses_code_cell_not_state_elf() {
+        let args = [0xb2; 32];
+        let state_elf = vec![0x7f, b'E', b'L', b'F', 0xAA];
+        let code_elf = vec![0x7f, b'E', b'L', b'F', 0xBB];
+        let rpc = FakeRpc::new();
+        let ts = process_type_script(13);
+        let hash = script_hash32(&ts);
+        rpc.insert_cell(intention_cell(13, hash, 100_0000_0000));
+        rpc.insert_cell(process_cell(13, 200_0000_0000, state_elf.clone()));
+        let code = code_cell(0x72, args, code_elf.clone());
+        rpc.insert_cell(code.clone());
+
+        let ssri = ScriptedSsri::mimic((1, 4));
+        let mut loop_ = DigestLoop::new(
+            rpc,
+            NopClock,
+            ssri,
+            cfg(
+                vec![TypeIdCodeDep {
+                    label: PROCESS_CODE_LABEL.into(),
+                    identity: TypeIdIdentity::new(args),
+                }],
+                vec![],
+            ),
+            process_code_resolver(),
+        );
+        let report = loop_.tick();
+        assert_eq!(report.submitted, 1, "{:?}", report.last_error);
+        let seen = loop_.ssri().seen_binaries.borrow().clone();
+        assert!(
+            seen.iter().any(|b| b == &code_elf),
+            "SSRI must see code-cell ELF, got {seen:?}"
+        );
+        assert!(
+            seen.iter().all(|b| b != &state_elf),
+            "SSRI must not use divergent state ELF"
+        );
+        let dep = loop_.rpc().submitted()[0].cell_deps().get(0).unwrap();
+        assert_eq!(dep.out_point(), code.out_point);
+    }
+
+    /// Regression #2 upgrade path: code outpoint change invalidates SSRI source.
+    #[test]
+    fn process_code_upgrade_changes_ssri_binary_and_cell_dep() {
+        let args = [0xb3; 32];
+        let rpc = FakeRpc::new();
+        let ts = process_type_script(14);
+        let hash = script_hash32(&ts);
+        rpc.insert_cell(intention_cell(14, hash, 100_0000_0000));
+        // Non-ELF state: Type-ID mode must not fall back to state data.
+        rpc.insert_cell(process_cell(14, 200_0000_0000, vec![0x00]));
+        let code_v1 = code_cell(0x73, args, vec![0x7f, b'E', b'L', b'F', 0x01]);
+        rpc.insert_cell(code_v1.clone());
+
+        let ssri = ScriptedSsri::mimic((1, 4));
+        let mut loop_ = DigestLoop::new(
+            rpc,
+            NopClock,
+            ssri,
+            cfg(
+                vec![TypeIdCodeDep {
+                    label: PROCESS_CODE_LABEL.into(),
+                    identity: TypeIdIdentity::new(args),
+                }],
+                vec![],
+            ),
+            process_code_resolver(),
+        );
+        assert_eq!(loop_.tick().submitted, 1);
+        assert!(loop_
+            .ssri()
+            .seen_binaries
+            .borrow()
+            .iter()
+            .any(|b| b.last() == Some(&0x01)));
+
+        loop_.rpc().consume(&code_v1.out_point);
+        let code_v2 = code_cell(0x74, args, vec![0x7f, b'E', b'L', b'F', 0x02]);
+        loop_.rpc().insert_cell(code_v2.clone());
+        loop_
+            .rpc()
+            .insert_cell(intention_cell(15, hash, 100_0000_0000));
+        loop_
+            .rpc()
+            .insert_cell(process_cell(15, 200_0000_0000, vec![0x00]));
+        loop_.ssri().seen_binaries.borrow_mut().clear();
+
+        assert_eq!(loop_.tick().submitted, 1);
+        assert!(loop_
+            .ssri()
+            .seen_binaries
+            .borrow()
+            .iter()
+            .any(|b| b.last() == Some(&0x02)));
+        assert_eq!(
+            loop_.rpc().submitted()[1]
+                .cell_deps()
+                .get(0)
+                .unwrap()
+                .out_point(),
+            code_v2.out_point
+        );
+    }
+
+    /// Regression #3: same outpoint, conflicting dep_type fails closed (no submit).
+    #[test]
+    fn conflicting_dep_type_on_same_outpoint_skips_assembly() {
+        let args = [0xb4; 32];
+        let code = code_cell(0x75, args, vec![0x7f, b'E', b'L', b'F']);
+        let conflict = CellDep::new_builder()
+            .out_point(code.out_point.clone())
+            .dep_type(DepType::DepGroup.into())
+            .build();
+        let rpc = FakeRpc::new();
+        let ts = process_type_script(16);
+        let hash = script_hash32(&ts);
+        rpc.insert_cell(intention_cell(16, hash, 100_0000_0000));
+        rpc.insert_cell(process_cell(
+            16,
+            200_0000_0000,
+            vec![0x7f, b'E', b'L', b'F', 16],
+        ));
+        rpc.insert_cell(code);
+
+        let mut loop_ = DigestLoop::new(
+            rpc,
+            NopClock,
+            ScriptedSsri::mimic((1, 4)),
+            cfg(
+                vec![TypeIdCodeDep {
+                    label: "cid_lock".into(),
+                    identity: TypeIdIdentity::new(args),
+                }],
+                vec![conflict],
+            ),
+            ProcessResolver::new(),
+        );
+        let report = loop_.tick();
+        assert_eq!(report.submitted, 0);
+        assert!(report
+            .last_error
+            .as_deref()
+            .unwrap_or("")
+            .contains("dep_type"));
     }
 }

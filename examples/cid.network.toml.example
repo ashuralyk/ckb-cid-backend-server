@@ -52,8 +52,10 @@ type_id = "<PROCESS_CODE_TYPE_ID_FULL_HASH_32>"  # optional verify
 # type_id = "<PROCESS_LOCK_TYPE_ID_FULL_HASH_32>"
 
 # Static extras only (secp, xUDT, local always-success, etc.).
-# Do NOT put Type-ID–discovered code cells here unless duplicating is intentional;
-# assemble merges Type-ID deps first, then these, deduped by outpoint.
+# Do NOT set label = "cid_lock" / "process_code" / "process_lock" when that
+# role uses type_id_args — config load rejects the conflict (stale outpoints
+# after upgrades). Unlabeled extras cannot be inferred as role code cells.
+# Same outpoint with a different dep_type vs a Type-ID dep also fails closed.
 # [[cell_deps]]
 # label = "xudt"
 # tx_hash = "<XUDT_CODE_CELL_TX>"

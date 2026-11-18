@@ -650,9 +650,10 @@ mod tests {
         ) -> Result<Option<LiveCell>, RpcError> {
             Ok(None)
         }
-        fn list_live_cells_by_type_script(
+        fn find_live_cells_by_type_script(
             &self,
             _: &ckb_types::packed::Script,
+            _: usize,
         ) -> Result<Vec<LiveCell>, RpcError> {
             Ok(Vec::new())
         }
@@ -682,9 +683,10 @@ mod tests {
         ) -> Result<Option<LiveCell>, RpcError> {
             Err(RpcError::Unavailable("indexer down".into()))
         }
-        fn list_live_cells_by_type_script(
+        fn find_live_cells_by_type_script(
             &self,
             _: &ckb_types::packed::Script,
+            _: usize,
         ) -> Result<Vec<LiveCell>, RpcError> {
             Err(RpcError::Unavailable("indexer down".into()))
         }

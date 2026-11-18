@@ -1,8 +1,8 @@
 use crate::rpc::{LiveCell, Rpc, RpcError};
+use cid_protocol::CidArgs;
 use ckb_types::core::ScriptHashType;
 use ckb_types::packed::{OutPoint, Script};
 use ckb_types::prelude::*;
-use cid_protocol::CidArgs;
 use std::collections::HashMap;
 
 #[derive(Clone, Debug)]
@@ -75,10 +75,10 @@ pub fn bucket_by_process_type_hash(
 mod tests {
     use super::*;
     use crate::rpc::LiveCell;
+    use cid_protocol::{CidArgs, Payload, Script as CidScript};
     use ckb_types::core::ScriptHashType;
     use ckb_types::packed::{Byte32, CellOutput, OutPoint, Script};
     use ckb_types::prelude::*;
-    use cid_protocol::{CidArgs, Payload, Script as CidScript};
 
     fn op(fill: u8) -> OutPoint {
         OutPoint::new_builder()

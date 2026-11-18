@@ -460,6 +460,7 @@ mod tests {
             ScriptedSsri {
                 bounds: (1, 1),
                 mode: Mode::AlwaysIncompatible(21),
+                seen_binaries: Default::default(),
             },
             cfg(),
             ProcessResolver::new(),
