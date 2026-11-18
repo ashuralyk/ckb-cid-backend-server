@@ -237,12 +237,14 @@ mod tests {
 
     #[test]
     fn allocate_refund_fee_cuts_exact_and_fail_closed() {
-        assert_eq!(allocate_refund_fee_cuts(&[100, 100], 150).unwrap(), vec![
-            100, 50
-        ]);
-        assert_eq!(allocate_refund_fee_cuts(&[40, 40, 40], 90).unwrap(), vec![
-            40, 40, 10
-        ]);
+        assert_eq!(
+            allocate_refund_fee_cuts(&[100, 100], 150).unwrap(),
+            vec![100, 50]
+        );
+        assert_eq!(
+            allocate_refund_fee_cuts(&[40, 40, 40], 90).unwrap(),
+            vec![40, 40, 10]
+        );
         assert_eq!(allocate_refund_fee_cuts(&[5], 0).unwrap(), vec![0]);
         assert_eq!(allocate_refund_fee_cuts(&[10, 10], 25).unwrap_err(), 5);
         let cuts = allocate_refund_fee_cuts(&[MAX_REFUND_FEE, MAX_REFUND_FEE], 1_200_000).unwrap();

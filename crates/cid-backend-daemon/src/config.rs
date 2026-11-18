@@ -1017,10 +1017,9 @@ log_format = "pretty"
         let cfg = DaemonConfig::from_file_and_vars(Some(&path), |_| None).unwrap();
         assert!(!cfg.bounded_refund_fee);
 
-        let path = write_toml(&minimal_toml().replace(
-            "[cid_lock]",
-            "[cid_lock]\nbounded_refund_fee = true",
-        ));
+        let path = write_toml(
+            &minimal_toml().replace("[cid_lock]", "[cid_lock]\nbounded_refund_fee = true"),
+        );
         let cfg = DaemonConfig::from_file_and_vars(Some(&path), |_| None).unwrap();
         assert!(cfg.bounded_refund_fee);
         assert!(cfg.to_loop_config().bounded_refund_fee);
