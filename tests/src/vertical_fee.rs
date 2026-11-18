@@ -5,12 +5,16 @@ mod tests {
     use std::time::Duration;
 
     use cid_backend_core::digest_loop::{DigestLoop, LoopConfig, NopClock};
-    use cid_backend_core::process::ProcessResolver;
-    use cid_backend_core::rpc::script_hash32;
+    use cid_backend_core::process::{ProcessResolver, ResolvedProcess};
+    use cid_backend_core::rpc::{script_hash32, LiveCell};
+    use cid_backend_core::scan::ScannedIntention;
     use cid_backend_core::{
-        fee_for_size, process_min_capacity, tx_size_in_block, DEFAULT_FEE_RATE,
+        assemble_digest_ok, fee_for_size, process_min_capacity, tx_size_in_block, DEFAULT_FEE_RATE,
     };
+    use cid_process_executor::PartialTx;
+    use cid_protocol::CidArgs;
     use ckb_types::core::ScriptHashType;
+    use ckb_types::packed::{CellOutput, RawTransaction, Script, Transaction};
     use ckb_types::prelude::*;
 
     use crate::fake_rpc::FakeRpc;
@@ -102,9 +106,8 @@ mod tests {
 
     #[test]
     fn incompatible_refund_keeps_exact_capacity_no_process_fee() {
-        // Incompatible path cannot spend Process for fee without flipping the
-        // Process example contract into DigestOk (beneficiary) verification.
-        // Refund outputs therefore stay exact; fee paid is 0.
+        // Known public-net gap: refund path does not spend Process; contract
+        // exact User Lock capacity ⇒ fee 0 (not fixed by loop.fee_rate).
         let rpc = FakeRpc::new();
         let ts = process_type_script(3);
         let hash = script_hash32(&ts);
@@ -200,5 +203,128 @@ mod tests {
             let need = fee_for_size(tx_size_in_block(tx), rate);
             assert!(paid >= need, "rate={rate} paid={paid} need={need}");
         }
+    }
+
+    fn scanned(cell: &LiveCell) -> ScannedIntention {
+        let lock_args: Vec<u8> = cell.lock().args().unpack();
+        let args = CidArgs::decode(&lock_args).expect("cid args");
+        ScannedIntention {
+            out_point: cell.out_point.clone(),
+            capacity: cell.capacity(),
+            type_script: cell.type_script(),
+            data: cell.data.clone(),
+            lock_args,
+            args,
+        }
+    }
+
+    fn resolved(cell: &LiveCell) -> ResolvedProcess {
+        ResolvedProcess {
+            type_hash: script_hash32(&cell.type_script().expect("process type")),
+            live_cell: cell.clone(),
+            binary: cell.data.clone(),
+        }
+    }
+
+    fn mimic_partial(intentions: &[ScannedIntention]) -> PartialTx {
+        let outputs: Vec<_> = intentions
+            .iter()
+            .map(|i| {
+                CellOutput::new_builder()
+                    .capacity(i.capacity.pack())
+                    .lock(
+                        Script::new_builder()
+                            .code_hash([0x11u8; 32].pack())
+                            .hash_type(ScriptHashType::Type.into())
+                            .args(i.lock_args.clone().pack())
+                            .build(),
+                    )
+                    .build()
+            })
+            .collect();
+        let data: Vec<Vec<u8>> = intentions.iter().map(|i| i.data.clone()).collect();
+        let bytes = Transaction::new_builder()
+            .raw(
+                RawTransaction::new_builder()
+                    .outputs(outputs.pack())
+                    .outputs_data(data.iter().map(|d| d.as_slice().pack()).pack())
+                    .build(),
+            )
+            .build()
+            .as_slice()
+            .to_vec();
+        PartialTx::from_bytes(&bytes).unwrap()
+    }
+
+    fn paid_process_fee(
+        intentions: &[ScannedIntention],
+        process: &ResolvedProcess,
+        fee_rate: u64,
+    ) -> u64 {
+        let partial = mimic_partial(intentions);
+        let skel = assemble_digest_ok(intentions, process, &partial, &[], fee_rate).unwrap();
+        let proc_out: u64 = skel
+            .tx
+            .outputs()
+            .get(skel.tx.outputs().len() - 1)
+            .unwrap()
+            .capacity()
+            .unpack();
+        process.live_cell.capacity() - proc_out
+    }
+
+    #[test]
+    fn fee_unaffordable_at_max_shrinks_to_affordable_smaller_batch() {
+        // Fee scales with tx size: max window may be unaffordable while a
+        // shrunk window clears. Isolate like Rejected (non-permanent).
+        let ts = process_type_script(6);
+        let hash = script_hash32(&ts);
+        let data = vec![0x7f, b'E', b'L', b'F', 6];
+        let ample = process_cell(6, 500_0000_0000, data.clone());
+        let i1 = intention_cell(1, hash, 100_0000_0000);
+        let i2 = intention_cell(2, hash, 100_0000_0000);
+        let s1 = scanned(&i1);
+        let s2 = scanned(&i2);
+        let proc = resolved(&ample);
+        let fee1 = paid_process_fee(&[s1.clone()], &proc, DEFAULT_FEE_RATE);
+        let fee2 = paid_process_fee(&[s1, s2], &proc, DEFAULT_FEE_RATE);
+        assert!(
+            fee2 > fee1,
+            "larger batch must need more fee (fee1={fee1} fee2={fee2})"
+        );
+
+        let min = process_min_capacity(&ample.output, &data).expect("occupied");
+        // Surplus clears n=1 but not n=2.
+        let surplus = fee1 + (fee2 - fee1) / 2;
+        assert!(surplus >= fee1 && surplus < fee2);
+
+        let rpc = FakeRpc::new();
+        rpc.insert_cell(intention_cell(1, hash, 100_0000_0000));
+        rpc.insert_cell(intention_cell(2, hash, 100_0000_0000));
+        rpc.insert_cell(process_cell(6, min + surplus, data));
+
+        let mut loop_ = DigestLoop::new(
+            rpc,
+            NopClock,
+            ScriptedSsri::mimic((1, 2)),
+            cfg(DEFAULT_FEE_RATE),
+            ProcessResolver::new(),
+        );
+        let report = loop_.tick();
+        assert_eq!(report.submitted, 1, "shrunk window must submit");
+        assert!(loop_.state().submit.rejected_combos.is_empty());
+        let tx = &loop_.rpc().submitted()[0];
+        assert_eq!(
+            tx.inputs().len(),
+            2,
+            "expected n=1 intention + process after shrink from max=2"
+        );
+        let remaining = loop_
+            .rpc()
+            .live_cells()
+            .iter()
+            .filter(|c| c.lock().code_hash().as_slice() == CID_CODE)
+            .count();
+        assert_eq!(remaining, 1, "one Intention left for a later tick");
     }
 }

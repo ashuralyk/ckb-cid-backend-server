@@ -26,7 +26,7 @@ Default auto-download is **Linux x86_64** (`ckb_${version}_x86_64-unknown-linux-
 ./scripts/local-dev-chain.sh
 ```
 
-The script inits `dev` with genesis miner lock, sets **`min_fee_rate = 0`** (D8: daemon never adds a fee input; `digest_ok` pays fee from the Process recreate, but Incompatible refunds remain zero-fee), enables the Indexer RPC module, builds RISC-V guests, starts `ckb run` + `ckb miner` on `127.0.0.1:8114`, exports `CID_CKB_RPC_URL`, `CID_PROCESS_EXAMPLE_PATH`, `CID_LOCK_ELF_PATH`, `CID_ALWAYS_SUCCESS_PATH`, `CID_LOCAL_CHAIN_E2E=1`, then runs the ignored E2E. Setting only `CID_LOCAL_CHAIN_E2E=1` and invoking `cargo test` on a clean machine is **not** equivalent.
+The script inits `dev` with genesis miner lock, sets **`min_fee_rate = 0`** (D8: no fee input; `digest_ok` pays from Process recreate; Incompatible refunds stay zero-fee — a known public-net gap, required here so local refunds clear), enables the Indexer RPC module, builds RISC-V guests, starts `ckb run` + `ckb miner` on `127.0.0.1:8114`, exports `CID_CKB_RPC_URL`, `CID_PROCESS_EXAMPLE_PATH`, `CID_LOCK_ELF_PATH`, `CID_ALWAYS_SUCCESS_PATH`, `CID_LOCAL_CHAIN_E2E=1`, then runs the ignored E2E. Setting only `CID_LOCAL_CHAIN_E2E=1` and invoking `cargo test` on a clean machine is **not** equivalent.
 
 Success prints `local-chain execution tx committed:` and `local-chain closure ok:`.
 

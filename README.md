@@ -26,8 +26,9 @@ The daemon continuously digests CID Intentions:
 3. Resolve the matching live Process cell. SSRI binary source: **Type-ID Process code** (when `process.type_id_args` is set) uses that code-cell ELF for the tick; otherwise legacy **state-cell data** ELF (local data1). The daemon does **not** install a Process-binary fallback.
 4. In-process SSRI: `Process.batch` yields `[min, max]`; `Process.assemble` yields a partial tx.
 5. Assemble an Execution Tx and `send_transaction`:
-   - **`digest_ok`**: destroy this batch of Intentions; Process **1 in / 1 out** recreate. No extra fee / sponsor input; User Lock is not placed in inputs (no signature after Intention creation). Skip on capacity shortfall.
+   - **`digest_ok`**: destroy this batch of Intentions; Process **1 in / 1 out** recreate. No extra fee / sponsor input; fee is `ceil(serialized_size_in_block * loop.fee_rate / 1000)` deducted from the Process recreate (default rate 1000). User Lock is not placed in inputs (no signature after Intention creation). Skip on capacity shortfall; on fee-unaffordable, isolate/shrink the batch window (non-permanent).
    - **`digest_incompatible`**: when SSRI returns `Incompatible(code)`, refund to the **User Lock** in args (does not spend Process). Exact **capacity** is copied, and original cell **data** is kept. Supported assets: pure CKB (no type script), or **standard xUDT** (official Data1 `XUDT_CODE_HASH` + 16-byte amount) which also keeps the type script. Any other type script, or xUDT data that is not 16 bytes, is `RefundUnbuildable`: log and skip. See `assemble.rs::refund_output`.
+   - **Known public-net gap (not fixed):** Incompatible refunds pay **fee 0** (exact User Lock capacity; Process not spent — contracts `DigestIncompatible` / `refund_assets_match`). Public nodes with `min_fee_rate > 0` reject them (`-1104`). The daemon logs `refund.zero_fee`; local-dev uses `min_fee_rate = 0`.
 6. After a successful submit, occupy spent inputs (and the `digest_ok` Process recreate) until confirmation depth is met.
 
 Out of scope: timeout-burn proxy, multi-sig fee sponsor, official ssri-server, multi-instance coordination, testnet/mainnet ops scripts.

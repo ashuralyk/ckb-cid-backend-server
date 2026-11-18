@@ -22,8 +22,9 @@ Stable field `event` (target `cid_backend`):
 | `scan.unavailable` | Indexer/RPC scan failed |
 | `process.resolve_miss` | No usable live Process binary |
 | `ssri.incompatible` | SSRI `Incompatible(code)` |
-| `refund.path` | User-lock refund assemble (`path=user_lock`) |
-| `tick.skip` (`reason=fee_unaffordable`) | Process recreate cannot fund `ceil(size*fee_rate/1000)` without dropping below occupied capacity; non-permanent skip |
+| `refund.path` | User-lock refund assemble (`path=user_lock`, includes `fee`) |
+| `refund.zero_fee` | Incompatible refund submitted with fee 0 (known public-net gap vs `min_fee_rate`) |
+| `tick.skip` (`reason=fee_unaffordable`) | Process recreate cannot fund fee for this window; isolate/shrink to a smaller batch (non-permanent, not combo-rejected) |
 | `submit.ok` | `tx_hash` |
 | `submit.conflict` | Submit mapped as Conflict |
 | `submit.rejected` | Transaction-level submit rejection (`TransactionFailedToVerify` / malformed / outputs-validator); that combo is skipped, not every consumed outpoint |
