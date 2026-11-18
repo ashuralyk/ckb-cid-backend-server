@@ -176,22 +176,97 @@ impl CkbRpc {
         self.get_cells(&key)
     }
 
-    fn cells_by_exact_type_script(&self, type_script: &Script) -> Result<Vec<LiveCell>, RpcError> {
+    /// Exact TYPE_ID / type-script lookup with early stop and page bound.
+    ///
+    /// `with_data = true` so a unique Process code cell carries ELF bytes for
+    /// SSRI in the same snapshot as the CellDep. Stops once `max_results`
+    /// matches are collected (use 2 for unique-vs-ambiguous). Full pages
+    /// without an advancing cursor, or exceeding `MAX_TYPE_ID_PAGES` before
+    /// the set is exhausted while still under `max_results`, fail closed —
+    /// never report a unique cell from a truncated walk.
+    fn find_cells_by_exact_type_script(
+        &self,
+        type_script: &Script,
+        max_results: usize,
+    ) -> Result<Vec<LiveCell>, RpcError> {
         let ht: ScriptHashType = type_script
             .hash_type()
             .try_into()
             .map_err(|_| RpcError::Unavailable("type script hash_type".into()))?;
         let code: [u8; 32] = type_script.code_hash().unpack();
         let args: Vec<u8> = type_script.args().unpack();
-        let key = json!({
+        let search_key = json!({
             "script": json_script(&code, ht, &args),
             "script_type": "type",
             "script_search_mode": "exact",
             "with_data": true,
         });
-        self.get_cells(&key)
+        let mut after = Value::Null;
+        let mut out = Vec::new();
+        let mut pages = 0usize;
+        loop {
+            if out.len() >= max_results {
+                out.truncate(max_results);
+                return Ok(out);
+            }
+            if pages >= MAX_TYPE_ID_PAGES {
+                return Err(RpcError::Unavailable(format!(
+                    "get_cells exact type-id: exceeded {MAX_TYPE_ID_PAGES} pages before \
+                     uniqueness settled; refusing truncated live-set"
+                )));
+            }
+            let result = self.rpc_call(
+                &self.indexer_url,
+                "get_cells",
+                json!([&search_key, "asc", PAGE_LIMIT_HEX, after.clone()]),
+            )?;
+            pages += 1;
+            let objects = result
+                .get("objects")
+                .and_then(|o| o.as_array())
+                .ok_or_else(|| RpcError::Unavailable("get_cells: missing objects".into()))?;
+            let want = script_hash32(type_script);
+            for obj in objects {
+                let cell = live_cell_from_indexer(obj)?;
+                // Local exact filter even if indexer "exact" is loose.
+                if cell
+                    .type_script()
+                    .map(|ts| script_hash32(&ts) == want)
+                    .unwrap_or(false)
+                {
+                    out.push(cell);
+                    if out.len() >= max_results {
+                        out.truncate(max_results);
+                        return Ok(out);
+                    }
+                }
+            }
+            if objects.len() < PAGE_LIMIT {
+                break;
+            }
+            let cursor = result
+                .get("last_cursor")
+                .and_then(|c| c.as_str())
+                .unwrap_or("");
+            if cursor_is_empty(cursor) {
+                return Err(RpcError::Unavailable(format!(
+                    "get_cells: full page of {PAGE_LIMIT} without last_cursor; refusing truncated live-set"
+                )));
+            }
+            let next = Value::String(cursor.to_string());
+            if next == after {
+                return Err(RpcError::Unavailable(
+                    "get_cells: last_cursor did not advance; refusing truncated live-set".into(),
+                ));
+            }
+            after = next;
+        }
+        Ok(out)
     }
 }
+
+/// Safety bound for Type-ID uniqueness walks (not for intention live-set scans).
+const MAX_TYPE_ID_PAGES: usize = 16;
 
 impl Rpc for CkbRpc {
     fn list_live_intentions(
@@ -227,21 +302,12 @@ impl Rpc for CkbRpc {
         }))
     }
 
-    fn list_live_cells_by_type_script(
+    fn find_live_cells_by_type_script(
         &self,
         type_script: &Script,
+        max_results: usize,
     ) -> Result<Vec<LiveCell>, RpcError> {
-        let cells = self.cells_by_exact_type_script(type_script)?;
-        // Fail-closed filter: indexer "exact" still verified locally.
-        let want = script_hash32(type_script);
-        Ok(cells
-            .into_iter()
-            .filter(|c| {
-                c.type_script()
-                    .map(|ts| script_hash32(&ts) == want)
-                    .unwrap_or(false)
-            })
-            .collect())
+        self.find_cells_by_exact_type_script(type_script, max_results)
     }
 
     fn submit_transaction(&self, tx: &TransactionView) -> Result<Byte32, RpcError> {
@@ -813,6 +879,7 @@ mod tests {
         let args = [0x7eu8; 32];
         let ts = type_id_script(&args);
         let type_json = script_json(&ts);
+        let type_json_full = type_json.clone();
         let page = Arc::new(AtomicUsize::new(0));
         let page2 = page.clone();
         let url = spawn_mock(Arc::new(move |method, params| {
@@ -853,11 +920,56 @@ mod tests {
             }
         }));
         let rpc = CkbRpc::new(&url, &url);
+        // Uniqueness walk stops at 2 matches (ambiguous) without draining pages.
         let cells = rpc
-            .list_live_cells_by_type_script(&ts)
+            .find_live_cells_by_type_script(&ts, 2)
             .expect("exact type-id search");
-        assert_eq!(cells.len(), 101);
-        assert_eq!(cells[100].capacity(), 42);
+        assert_eq!(cells.len(), 2);
+        assert_eq!(
+            page.load(Ordering::SeqCst),
+            1,
+            "must not fetch page 2 once ambiguous"
+        );
+
+        // Explicit larger bound still paginates and includes cell data.
+        let page_full = Arc::new(AtomicUsize::new(0));
+        let page_full2 = page_full.clone();
+        let url2 = spawn_mock(Arc::new(move |method, params| {
+            assert_eq!(method, "get_cells");
+            assert_eq!(params[0]["script_search_mode"], "exact");
+            assert_eq!(params[0]["with_data"], true);
+            let n = page_full2.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                let mut objs = Vec::new();
+                for i in 0..100 {
+                    objs.push(indexer_cell(
+                        0x10,
+                        i as u32,
+                        lock_json([0; 32], &[]),
+                        Some(type_json_full.clone()),
+                        1,
+                        &[0x7f],
+                    ));
+                }
+                Ok(json!({"objects": objs, "last_cursor": "0xc0ffee"}))
+            } else {
+                Ok(cells_result(vec![indexer_cell(
+                    0x11,
+                    0,
+                    lock_json([0; 32], &[]),
+                    Some(type_json_full.clone()),
+                    42,
+                    &[0x7f, b'E', b'L', b'F'],
+                )]))
+            }
+        }));
+        let rpc2 = CkbRpc::new(&url2, &url2);
+        let all = rpc2
+            .find_live_cells_by_type_script(&ts, 200)
+            .expect("paged exact search");
+        assert_eq!(all.len(), 101);
+        assert_eq!(all[100].capacity(), 42);
+        assert_eq!(&all[100].data, &[0x7f, b'E', b'L', b'F']);
     }
 
     #[test]

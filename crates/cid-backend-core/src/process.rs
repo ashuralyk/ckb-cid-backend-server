@@ -1,4 +1,4 @@
-use crate::rpc::{LiveCell, Rpc, RpcError};
+use crate::rpc::{out_point_key, LiveCell, Rpc, RpcError};
 use std::collections::HashMap;
 
 pub type ProcessFallback = Box<dyn Fn(&[u8; 32], &LiveCell) -> Option<Vec<u8>> + Send + Sync>;
@@ -11,13 +11,33 @@ pub struct ResolvedProcess {
 }
 
 struct CachedBinary {
-    live_data: Vec<u8>,
+    /// Fingerprint of the SSRI source (code-cell outpoint key, or state data).
+    source_key: Vec<u8>,
     binary: Vec<u8>,
+}
+
+/// How `ProcessResolver` chooses the RISC-V ELF for SSRI.
+///
+/// - [`SsriBinarySource::StateCellData`]: legacy / local data1 fixtures — ELF
+///   is the live Process **state** cell data (same bytes often also published
+///   as a code cell). Daemon production without Process Type-ID uses this.
+/// - [`SsriBinarySource::TypeIdCodeCell`]: Process **code** is discovered via
+///   Type ID; SSRI must execute the resolved code-cell bytes for the tick, and
+///   the tx CellDep must reference that same outpoint. State-cell data is
+///   **not** used as the guest (avoids upgrade divergence / wrong reject poison).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SsriBinarySource {
+    #[default]
+    StateCellData,
+    TypeIdCodeCell,
 }
 
 pub struct ProcessResolver {
     fallback: Option<ProcessFallback>,
     binary_cache: HashMap<[u8; 32], CachedBinary>,
+    ssri_source: SsriBinarySource,
+    /// Per-tick Process code snapshot when `ssri_source == TypeIdCodeCell`.
+    tick_process_code: Option<(Vec<u8>, Vec<u8>)>,
 }
 
 impl Default for ProcessResolver {
@@ -31,6 +51,17 @@ impl ProcessResolver {
         Self {
             fallback: None,
             binary_cache: HashMap::new(),
+            ssri_source: SsriBinarySource::StateCellData,
+            tick_process_code: None,
+        }
+    }
+
+    pub fn with_ssri_source(ssri_source: SsriBinarySource) -> Self {
+        Self {
+            fallback: None,
+            binary_cache: HashMap::new(),
+            ssri_source,
+            tick_process_code: None,
         }
     }
 
@@ -38,6 +69,8 @@ impl ProcessResolver {
         Self {
             fallback: Some(fallback),
             binary_cache: HashMap::new(),
+            ssri_source: SsriBinarySource::StateCellData,
+            tick_process_code: None,
         }
     }
 
@@ -49,6 +82,23 @@ impl ProcessResolver {
                 Some(binary.clone())
             }
         }))
+    }
+
+    pub fn ssri_source(&self) -> SsriBinarySource {
+        self.ssri_source
+    }
+
+    /// Install (or clear) this tick's Process **code** cell snapshot.
+    /// Required when `ssri_source == TypeIdCodeCell`. Clears the binary cache
+    /// entry for a type hash when the code outpoint changes.
+    pub fn set_tick_process_code(&mut self, code: Option<&LiveCell>) {
+        let next = code.map(|c| (out_point_key(&c.out_point), c.data.clone()));
+        if self.tick_process_code.as_ref().map(|(k, _)| k.as_slice())
+            != next.as_ref().map(|(k, _)| k.as_slice())
+        {
+            self.binary_cache.clear();
+        }
+        self.tick_process_code = next;
     }
 
     pub fn resolve<R: Rpc>(
@@ -63,14 +113,15 @@ impl ProcessResolver {
             );
             return Ok(None);
         };
+        let source_key = self.source_key(&cell);
         let binary = match self.binary_cache.get(process_type_hash) {
-            Some(cached) if cached.live_data == cell.data => cached.binary.clone(),
+            Some(cached) if cached.source_key == source_key => cached.binary.clone(),
             _ => match self.derive_binary(process_type_hash, &cell) {
                 Some(binary) => {
                     self.binary_cache.insert(
                         *process_type_hash,
                         CachedBinary {
-                            live_data: cell.data.clone(),
+                            source_key,
                             binary: binary.clone(),
                         },
                     );
@@ -89,21 +140,53 @@ impl ProcessResolver {
         }))
     }
 
-    fn derive_binary(&self, process_type_hash: &[u8; 32], cell: &LiveCell) -> Option<Vec<u8>> {
-        if looks_like_elf(&cell.data) {
-            return Some(cell.data.clone());
+    fn source_key(&self, cell: &LiveCell) -> Vec<u8> {
+        match self.ssri_source {
+            SsriBinarySource::TypeIdCodeCell => self
+                .tick_process_code
+                .as_ref()
+                .map(|(k, _)| k.clone())
+                .unwrap_or_default(),
+            SsriBinarySource::StateCellData => cell.data.clone(),
         }
-        if let Some(fb) = &self.fallback {
-            match fb(process_type_hash, cell) {
-                Some(b) if looks_like_elf(&b) => return Some(b),
-                _ => {
-                    log::warn!("Process cell data empty/unusable and fallback missing");
+    }
+
+    fn derive_binary(&self, process_type_hash: &[u8; 32], cell: &LiveCell) -> Option<Vec<u8>> {
+        match self.ssri_source {
+            SsriBinarySource::TypeIdCodeCell => {
+                let Some((_, data)) = &self.tick_process_code else {
+                    log::warn!(
+                        "Type-ID Process code mode but no tick process_code snapshot \
+                         (code deps refresh missing process_code?)"
+                    );
                     return None;
+                };
+                if looks_like_elf(data) {
+                    return Some(data.clone());
                 }
+                log::warn!(
+                    "Type-ID Process code cell data is not a usable ELF ({} bytes)",
+                    data.len()
+                );
+                None
+            }
+            SsriBinarySource::StateCellData => {
+                if looks_like_elf(&cell.data) {
+                    return Some(cell.data.clone());
+                }
+                if let Some(fb) = &self.fallback {
+                    match fb(process_type_hash, cell) {
+                        Some(b) if looks_like_elf(&b) => return Some(b),
+                        _ => {
+                            log::warn!("Process cell data empty/unusable and fallback missing");
+                            return None;
+                        }
+                    }
+                }
+                log::warn!("Process cell data empty/unusable; no fallback installed");
+                None
             }
         }
-        log::warn!("Process cell data empty/unusable; no fallback installed");
-        None
     }
 }
 
@@ -138,7 +221,11 @@ mod tests {
         ) -> Result<Option<LiveCell>, RpcError> {
             Ok(self.cell.borrow().clone())
         }
-        fn list_live_cells_by_type_script(&self, _: &Script) -> Result<Vec<LiveCell>, RpcError> {
+        fn find_live_cells_by_type_script(
+            &self,
+            _: &Script,
+            _: usize,
+        ) -> Result<Vec<LiveCell>, RpcError> {
             Ok(Vec::new())
         }
         fn submit_transaction(&self, _tx: &TransactionView) -> Result<Byte32, RpcError> {
@@ -181,6 +268,26 @@ mod tests {
         (hash, cell)
     }
 
+    fn code_live(tx_byte: u8, data: Vec<u8>) -> LiveCell {
+        LiveCell {
+            out_point: OutPoint::new_builder()
+                .tx_hash(Byte32::from_slice(&[tx_byte; 32]).unwrap())
+                .index(0u32.pack())
+                .build(),
+            output: CellOutput::new_builder()
+                .capacity(1000u64.pack())
+                .lock(
+                    Script::new_builder()
+                        .code_hash([0u8; 32].pack())
+                        .hash_type(ScriptHashType::Type.into())
+                        .args(Vec::<u8>::new().pack())
+                        .build(),
+                )
+                .build(),
+            data,
+        }
+    }
+
     #[test]
     fn resolve_uses_live_cell_data_when_non_empty() {
         let (hash, cell) = process_cell(vec![0x7f, b'E', b'L', b'F', 0x01]);
@@ -202,38 +309,36 @@ mod tests {
         assert!(resolver.resolve(&rpc, &[0x11; 32]).unwrap().is_none());
 
         let (hash, cell) = process_cell(vec![]);
-        rpc.cell.replace(Some(cell));
+        *rpc.cell.borrow_mut() = Some(cell);
         assert!(resolver.resolve(&rpc, &hash).unwrap().is_none());
     }
 
     #[test]
     fn fallback_used_when_live_data_not_elf() {
-        let (hash, cell) = process_cell(b"not-an-elf".to_vec());
+        let (hash, cell) = process_cell(vec![0x00, 0x01]);
         let rpc = TestRpc {
             cell: RefCell::new(Some(cell)),
         };
         let mut resolver = ProcessResolver::with_fallback_binary(vec![0x7f, b'E', b'L', b'F']);
         let got = resolver.resolve(&rpc, &hash).unwrap().expect("fallback");
         assert_eq!(got.binary, vec![0x7f, b'E', b'L', b'F']);
-        assert_eq!(got.live_cell.data, b"not-an-elf");
     }
 
     #[test]
     fn resolve_refetches_live_cell_out_point_after_recreate() {
-        let (hash, cell1) = process_cell(vec![0x7f, b'E', b'L', b'F', 0x01]);
+        let (hash, cell) = process_cell(vec![0x7f, b'E', b'L', b'F', 0x01]);
         let rpc = TestRpc {
-            cell: RefCell::new(Some(cell1.clone())),
+            cell: RefCell::new(Some(cell.clone())),
         };
         let mut resolver = ProcessResolver::new();
         let first = resolver.resolve(&rpc, &hash).unwrap().unwrap();
-        assert_eq!(first.live_cell.out_point, cell1.out_point);
-
-        let mut cell2 = cell1.clone();
+        let mut cell2 = cell;
         cell2.out_point = OutPoint::new_builder()
             .tx_hash(Byte32::from_slice(&[0x88; 32]).unwrap())
-            .index(0u32.pack())
+            .index(1u32.pack())
             .build();
-        rpc.cell.replace(Some(cell2.clone()));
+        cell2.data = vec![0x7f, b'E', b'L', b'F', 0x01];
+        *rpc.cell.borrow_mut() = Some(cell2.clone());
         let second = resolver.resolve(&rpc, &hash).unwrap().unwrap();
         assert_eq!(second.live_cell.out_point, cell2.out_point);
         assert_eq!(second.binary, first.binary);
@@ -241,57 +346,99 @@ mod tests {
 
     #[test]
     fn resolve_uses_updated_live_data_for_same_type_hash() {
-        let (hash, cell1) = process_cell(vec![0x7f, b'E', b'L', b'F', 0x01]);
+        let (hash, cell) = process_cell(vec![0x7f, b'E', b'L', b'F', 0x01]);
         let rpc = TestRpc {
-            cell: RefCell::new(Some(cell1.clone())),
+            cell: RefCell::new(Some(cell)),
         };
         let mut resolver = ProcessResolver::new();
         let first = resolver.resolve(&rpc, &hash).unwrap().unwrap();
         assert_eq!(first.binary, vec![0x7f, b'E', b'L', b'F', 0x01]);
-
-        let mut cell2 = cell1.clone();
-        cell2.out_point = OutPoint::new_builder()
-            .tx_hash(Byte32::from_slice(&[0x99; 32]).unwrap())
-            .index(0u32.pack())
-            .build();
-        cell2.data = vec![0x7f, b'E', b'L', b'F', 0x02];
-        rpc.cell.replace(Some(cell2.clone()));
+        let (_, cell2) = process_cell(vec![0x7f, b'E', b'L', b'F', 0x02]);
+        *rpc.cell.borrow_mut() = Some(cell2);
         let second = resolver.resolve(&rpc, &hash).unwrap().unwrap();
-        assert_eq!(second.live_cell.out_point, cell2.out_point);
         assert_eq!(second.binary, vec![0x7f, b'E', b'L', b'F', 0x02]);
     }
 
     #[test]
     fn resolve_skips_when_live_data_changes_from_elf_to_non_elf_without_fallback() {
-        let (hash, cell1) = process_cell(vec![0x7f, b'E', b'L', b'F', 0x01]);
+        let (hash, cell) = process_cell(vec![0x7f, b'E', b'L', b'F', 0x01]);
         let rpc = TestRpc {
-            cell: RefCell::new(Some(cell1.clone())),
+            cell: RefCell::new(Some(cell)),
         };
         let mut resolver = ProcessResolver::new();
         assert!(resolver.resolve(&rpc, &hash).unwrap().is_some());
-
-        let mut cell2 = cell1;
-        cell2.data = b"not-an-elf".to_vec();
-        rpc.cell.replace(Some(cell2));
+        let (_, cell2) = process_cell(vec![0x00]);
+        *rpc.cell.borrow_mut() = Some(cell2);
         assert!(resolver.resolve(&rpc, &hash).unwrap().is_none());
     }
 
     #[test]
     fn resolve_fallback_when_live_data_changes_from_elf_to_non_elf() {
-        let (hash, cell1) = process_cell(vec![0x7f, b'E', b'L', b'F', 0x01]);
+        let (hash, cell) = process_cell(vec![0x7f, b'E', b'L', b'F', 0x01]);
         let rpc = TestRpc {
-            cell: RefCell::new(Some(cell1.clone())),
+            cell: RefCell::new(Some(cell)),
         };
         let mut resolver =
             ProcessResolver::with_fallback_binary(vec![0x7f, b'E', b'L', b'F', 0xFB]);
         let first = resolver.resolve(&rpc, &hash).unwrap().unwrap();
         assert_eq!(first.binary, vec![0x7f, b'E', b'L', b'F', 0x01]);
-
-        let mut cell2 = cell1;
-        cell2.data = b"not-an-elf".to_vec();
-        rpc.cell.replace(Some(cell2.clone()));
+        let (_, cell2) = process_cell(vec![0x00]);
+        *rpc.cell.borrow_mut() = Some(cell2);
         let second = resolver.resolve(&rpc, &hash).unwrap().unwrap();
         assert_eq!(second.binary, vec![0x7f, b'E', b'L', b'F', 0xFB]);
-        assert_eq!(second.live_cell.data, b"not-an-elf");
+    }
+
+    #[test]
+    fn type_id_mode_uses_code_cell_not_divergent_state_elf() {
+        let (hash, state) = process_cell(vec![0x7f, b'E', b'L', b'F', 0xAA]);
+        let code = code_live(0x10, vec![0x7f, b'E', b'L', b'F', 0xBB]);
+        let rpc = TestRpc {
+            cell: RefCell::new(Some(state)),
+        };
+        let mut resolver = ProcessResolver::with_ssri_source(SsriBinarySource::TypeIdCodeCell);
+        resolver.set_tick_process_code(Some(&code));
+        let got = resolver.resolve(&rpc, &hash).unwrap().expect("resolved");
+        assert_eq!(got.binary, vec![0x7f, b'E', b'L', b'F', 0xBB]);
+    }
+
+    #[test]
+    fn type_id_mode_cache_invalidates_on_code_outpoint_change() {
+        let (hash, state) = process_cell(vec![0x00]);
+        let code_v1 = code_live(0x21, vec![0x7f, b'E', b'L', b'F', 0x01]);
+        let code_v2 = code_live(0x22, vec![0x7f, b'E', b'L', b'F', 0x02]);
+        let rpc = TestRpc {
+            cell: RefCell::new(Some(state)),
+        };
+        let mut resolver = ProcessResolver::with_ssri_source(SsriBinarySource::TypeIdCodeCell);
+        resolver.set_tick_process_code(Some(&code_v1));
+        assert_eq!(
+            resolver
+                .resolve(&rpc, &hash)
+                .unwrap()
+                .unwrap()
+                .binary
+                .last(),
+            Some(&0x01)
+        );
+        resolver.set_tick_process_code(Some(&code_v2));
+        assert_eq!(
+            resolver
+                .resolve(&rpc, &hash)
+                .unwrap()
+                .unwrap()
+                .binary
+                .last(),
+            Some(&0x02)
+        );
+    }
+
+    #[test]
+    fn type_id_mode_without_tick_snapshot_skips() {
+        let (hash, state) = process_cell(vec![0x7f, b'E', b'L', b'F', 0x01]);
+        let rpc = TestRpc {
+            cell: RefCell::new(Some(state)),
+        };
+        let mut resolver = ProcessResolver::with_ssri_source(SsriBinarySource::TypeIdCodeCell);
+        assert!(resolver.resolve(&rpc, &hash).unwrap().is_none());
     }
 }

@@ -51,9 +51,9 @@ Success prints `local-chain execution tx committed:` and `local-chain closure ok
 
 Production/dev operators may put the same public RPC / Type-ID / static cell-dep values in a TOML file. `network.genesis_hash` is declared identity only unless `validate_genesis = true`.
 
-**Local-chain fixture stays static `data1` cell deps** (CID lock ELF / Process ELF / always-success outpoints). Type-ID discovery (`*_TYPE_ID_ARGS`) is for `hash_type=type` networks; it is optional here and does not replace the local data1 path. On Type-ID networks, code CellDeps are resolved each tick from configured `type_id_args` (exact TYPE_ID type script); static `[[cell_deps]]` remain for extras.
+**Local-chain fixture stays static `data1` cell deps** (CID lock ELF / Process ELF / always-success outpoints) with `ProcessResolver` SSRI source = state-cell ELF. Type-ID discovery (`*_TYPE_ID_ARGS`) is for `hash_type=type` networks; it is optional here and does not replace the local data1 path. On Type-ID networks, code CellDeps are resolved each tick from configured `type_id_args` (bounded exact TYPE_ID type-script search with cell data); when Process Type-ID is set, SSRI binds to that code-cell ELF snapshot. Static `[[cell_deps]]` remain for unlabeled extras; labeled role deps conflict with Type-ID for the same role.
 
-`assemble` uses the tick's merged CellDeps (Type-ID resolved + static). `CkbRpc` uses `CID_PROCESS_CODE_HASH` (and auto-derived Process code `type_id` when configured) as a type-script prefix, then filters `calc_script_hash`.
+`assemble` uses the tick's merged CellDeps (Type-ID resolved + static; same-outpoint dep_type conflicts fail closed). Confirmation/reorg reconciliation runs even if Type-ID refresh fails. `CkbRpc` uses `CID_PROCESS_CODE_HASH` (and auto-derived Process code `type_id` when configured) as a type-script prefix, then filters `calc_script_hash`.
 
 State is memory-only. Restarting the daemon drops in-flight occupancy and full-rescans indexer `asc`.
 

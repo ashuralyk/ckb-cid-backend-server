@@ -256,8 +256,10 @@ struct ProcessLockSection {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CellDepFile {
+    /// Optional role label (`cid_lock` / `process_code` / `process_lock`).
+    /// Used to reject static role deps when the same role uses Type-ID discovery.
+    /// Unlabeled rows are treated as unrelated extras (secp / xUDT / …).
     #[serde(default)]
-    #[allow(dead_code)]
     label: Option<String>,
     tx_hash: String,
     index: u32,
@@ -417,6 +419,41 @@ fn merge<F: Fn(&str) -> Option<String>>(
             }
         },
     };
+
+    // Role-specific static code deps conflict with Type-ID discovery for the
+    // same role (stale outpoints would survive upgrades). Unlabeled extras
+    // (secp / xUDT / always-success) remain allowed — we cannot infer their
+    // historical role from outpoint alone.
+    if cid_lock_identity.is_some() {
+        if nonempty(&get, "CID_LOCK_CELL_DEP").is_some() {
+            return Err(ConfigError::Invalid(
+                "CID_LOCK_CELL_DEP conflicts with cid_lock.type_id_args / CID_LOCK_TYPE_ID_ARGS; \
+                 omit the static role dep (Type-ID resolves the code cell each tick)"
+                    .into(),
+            ));
+        }
+        reject_labeled_static_role(&file.cell_deps, "cid_lock")?;
+    }
+    if process_code_identity.is_some() {
+        if nonempty(&get, "CID_PROCESS_CODE_CELL_DEP").is_some() {
+            return Err(ConfigError::Invalid(
+                "CID_PROCESS_CODE_CELL_DEP conflicts with process.type_id_args / \
+                 CID_PROCESS_TYPE_ID_ARGS; omit the static role dep"
+                    .into(),
+            ));
+        }
+        reject_labeled_static_role(&file.cell_deps, "process_code")?;
+    }
+    if process_lock_identity.is_some() {
+        if nonempty(&get, "CID_PROCESS_LOCK_CELL_DEP").is_some() {
+            return Err(ConfigError::Invalid(
+                "CID_PROCESS_LOCK_CELL_DEP conflicts with process_lock.type_id_args / \
+                 CID_PROCESS_LOCK_TYPE_ID_ARGS; omit the static role dep"
+                    .into(),
+            ));
+        }
+        reject_labeled_static_role(&file.cell_deps, "process_lock")?;
+    }
 
     let env_cell_dep_raws = [
         nonempty(&get, "CID_LOCK_CELL_DEP"),
@@ -581,6 +618,24 @@ fn parse_type_id_identity(
             Ok(Some(id))
         }
     }
+}
+
+fn reject_labeled_static_role(rows: &[CellDepFile], role: &str) -> Result<(), ConfigError> {
+    for row in rows {
+        if row
+            .label
+            .as_deref()
+            .map(|l| l.trim() == role)
+            .unwrap_or(false)
+        {
+            return Err(ConfigError::Invalid(format!(
+                "[[cell_deps]] label=\"{role}\" conflicts with {role}.type_id_args; \
+                 remove the static role dep or the Type-ID identity (unlabeled extras \
+                 like xUDT/secp are fine)"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn file_cell_deps(rows: &[CellDepFile]) -> Result<Vec<CellDep>, ConfigError> {
@@ -844,6 +899,48 @@ log_format = "pretty"
             msg.contains("not treat type_id as args") || msg.contains("without type_id_args"),
             "{msg}"
         );
+    }
+
+    #[test]
+    fn type_id_role_rejects_static_env_cell_dep() {
+        let err = DaemonConfig::from_vars(|k| match k {
+            "CID_CKB_RPC_URL" => Some("http://127.0.0.1:8114".into()),
+            "CID_POLL_INTERVAL_SECS" => Some("5".into()),
+            "CID_LOCK_TYPE_ID_ARGS" => Some("aa".repeat(32)),
+            "CID_LOCK_CELL_DEP" => Some(format!("{}:0", "dd".repeat(32))),
+            _ => None,
+        })
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("CID_LOCK_CELL_DEP"), "{msg}");
+        assert!(msg.contains("conflicts"), "{msg}");
+    }
+
+    #[test]
+    fn type_id_role_rejects_labeled_file_cell_dep() {
+        let path = write_toml(&format!(
+            r#"
+[network]
+genesis_hash = "0x{g}"
+[rpc]
+url = "http://127.0.0.1:8114"
+[cid_lock]
+type_id_args = "0x{args}"
+[[cell_deps]]
+label = "cid_lock"
+tx_hash = "0x{dep}"
+index = 0
+[loop]
+poll_interval_secs = 5
+"#,
+            g = "11".repeat(32),
+            args = "aa".repeat(32),
+            dep = "dd".repeat(32),
+        ));
+        let err = DaemonConfig::from_file_and_vars(Some(&path), |_| None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("cid_lock"), "{msg}");
+        assert!(msg.contains("conflicts"), "{msg}");
     }
 
     #[test]

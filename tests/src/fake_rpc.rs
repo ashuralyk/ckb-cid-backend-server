@@ -288,9 +288,10 @@ impl Rpc for FakeRpc {
         Ok(None)
     }
 
-    fn list_live_cells_by_type_script(
+    fn find_live_cells_by_type_script(
         &self,
         type_script: &Script,
+        max_results: usize,
     ) -> Result<Vec<LiveCell>, RpcError> {
         let inner = self.inner.borrow();
         if inner.fail_type_script_queries {
@@ -301,6 +302,9 @@ impl Rpc for FakeRpc {
         let want = script_hash32(type_script);
         let mut out = Vec::new();
         for op in &inner.order {
+            if out.len() >= max_results {
+                break;
+            }
             let Some(cell) = inner.cells.get(&out_point_key(op)) else {
                 continue;
             };

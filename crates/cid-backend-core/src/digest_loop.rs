@@ -138,6 +138,10 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
         &self.rpc
     }
 
+    pub fn ssri(&self) -> &S {
+        &self.ssri
+    }
+
     pub fn state(&self) -> &LoopState {
         &self.state
     }
@@ -167,10 +171,15 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
 
     fn tick_inner(&mut self) -> TickReport {
         let mut report = TickReport::default();
+        // Confirmation / reorg recovery must run even when Type-ID code deps
+        // cannot be refreshed: already-submitted txs do not need new CellDeps.
+        let tip = self.refresh_tip();
+        self.reconcile_pending(tip);
+
         // Refresh Type-ID code CellDeps every tick so upgrades pick up the new
         // outpoint while script identity stays stable. Failures are transient:
-        // skip the tick, do not permanently reject Intentions.
-        let cell_deps = match self.refresh_cell_deps() {
+        // skip NEW assembly/submit only; do not permanently reject Intentions.
+        let resolved = match self.refresh_cell_deps() {
             Ok(deps) => deps,
             Err(e) => {
                 tracing::warn!(
@@ -179,10 +188,16 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                     error = %e,
                 );
                 report.last_error = Some(format!("code deps: {e}"));
+                self.state.resolver.set_tick_process_code(None);
+                self.state.tick_cell_deps.clear();
                 return report;
             }
         };
-        self.state.tick_cell_deps = cell_deps;
+        self.state.tick_cell_deps = resolved.cell_deps;
+        self.state
+            .resolver
+            .set_tick_process_code(resolved.process_code.as_ref().map(|c| &c.cell));
+
         let scanned =
             match scan_intentions(&self.rpc, &self.config.cid_code_hash, self.config.hash_type) {
                 Ok(v) => v,
@@ -194,6 +209,7 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                     );
                     report.last_error = Some(format!("scan unavailable: {m}"));
                     self.state.tick_cell_deps.clear();
+                    self.state.resolver.set_tick_process_code(None);
                     return report;
                 }
                 Err(e) => {
@@ -204,6 +220,7 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                     );
                     report.last_error = Some(format!("scan error: {e}"));
                     self.state.tick_cell_deps.clear();
+                    self.state.resolver.set_tick_process_code(None);
                     return report;
                 }
             };
@@ -214,8 +231,6 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
             .iter()
             .map(|i| out_point_key(&i.out_point))
             .collect();
-        let tip = self.refresh_tip();
-        self.reconcile_pending(tip);
         let pending_occupied = self.state.submit.pending_occupied_keys();
         self.state.submit.in_flight.retain(|k| {
             (live_keys.contains(k) || pending_occupied.contains(k))
@@ -235,12 +250,16 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
             self.process_bucket(bucket, &mut report);
         }
         self.state.tick_cell_deps.clear();
+        self.state.resolver.set_tick_process_code(None);
         report
     }
 
-    fn refresh_cell_deps(&self) -> Result<Vec<CellDep>, CodeDepError> {
+    fn refresh_cell_deps(&self) -> Result<crate::code_deps::ResolvedExecutionDeps, CodeDepError> {
         if self.config.type_id_code_deps.is_empty() {
-            return Ok(self.config.extra_cell_deps.clone());
+            return Ok(crate::code_deps::ResolvedExecutionDeps {
+                cell_deps: self.config.extra_cell_deps.clone(),
+                process_code: None,
+            });
         }
         resolve_execution_cell_deps(
             &self.rpc,
