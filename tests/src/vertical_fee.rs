@@ -191,7 +191,11 @@ mod tests {
         let rpc = FakeRpc::new();
         let ts = process_type_script(14);
         let hash = script_hash32(&ts);
-        rpc.insert_cell(process_cell(14, 200_0000_0000, vec![0x7f, b'E', b'L', b'F', 14]));
+        rpc.insert_cell(process_cell(
+            14,
+            200_0000_0000,
+            vec![0x7f, b'E', b'L', b'F', 14],
+        ));
         rpc.insert_cell(intention_cell(1, hash, 100_0000_0000));
         rpc.insert_cell(intention_cell(2, hash, 100_0000_0000));
 
@@ -355,7 +359,7 @@ mod tests {
         let s1 = scanned(&i1);
         let s2 = scanned(&i2);
         let proc = resolved(&ample);
-        let fee1 = paid_process_fee(&[s1.clone()], &proc, DEFAULT_FEE_RATE);
+        let fee1 = paid_process_fee(std::slice::from_ref(&s1), &proc, DEFAULT_FEE_RATE);
         let fee2 = paid_process_fee(&[s1, s2], &proc, DEFAULT_FEE_RATE);
         assert!(
             fee2 > fee1,

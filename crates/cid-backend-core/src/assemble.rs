@@ -1,6 +1,7 @@
 use crate::fee::{
-    allocate_refund_fee_cuts, cell_occupied_capacity, process_min_capacity, refund_capacity_allowed,
-    refund_fee_budget, required_fee, tx_size_in_block, with_capacity, RefundFeeMode, MAX_REFUND_FEE,
+    allocate_refund_fee_cuts, cell_occupied_capacity, process_min_capacity,
+    refund_capacity_allowed, refund_fee_budget, required_fee, tx_size_in_block, with_capacity,
+    RefundFeeMode, MAX_REFUND_FEE,
 };
 use crate::process::ResolvedProcess;
 use crate::rpc::script_hash32;
@@ -897,13 +898,9 @@ mod tests {
                 .build(),
         );
         intent.data = vec![1, 2, 3];
-        let err = assemble_digest_incompatible(
-            &[intent],
-            &[],
-            RefundFeeMode::Exact,
-            DEFAULT_FEE_RATE,
-        )
-        .unwrap_err();
+        let err =
+            assemble_digest_incompatible(&[intent], &[], RefundFeeMode::Exact, DEFAULT_FEE_RATE)
+                .unwrap_err();
         assert!(matches!(err, AssembleError::RefundUnbuildable(_)));
     }
 
@@ -952,13 +949,9 @@ mod tests {
             .build();
         intent.type_script = Some(ts.clone());
         intent.data = 1_000u128.to_le_bytes()[..XUDT_AMOUNT_LEN].to_vec();
-        let skel = assemble_digest_incompatible(
-            &[intent],
-            &[],
-            RefundFeeMode::Exact,
-            DEFAULT_FEE_RATE,
-        )
-        .unwrap();
+        let skel =
+            assemble_digest_incompatible(&[intent], &[], RefundFeeMode::Exact, DEFAULT_FEE_RATE)
+                .unwrap();
         let out = skel.tx.outputs().get(0).unwrap();
         let got = out.type_().to_opt().expect("xudt type");
         assert_eq!(got.as_slice(), ts.as_slice());
