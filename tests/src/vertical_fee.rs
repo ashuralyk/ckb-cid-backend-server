@@ -280,6 +280,74 @@ mod tests {
     }
 
     #[test]
+    fn mixed_exact_submit_plus_bounded_unaffordable_still_isolates() {
+        // Exact submits; Bounded n=2 unaffordable but n=1 OK. Must return
+        // FeeUnaffordable (not Submitted) so isolate shrinks Bounded. Exact
+        // input stays in_flight — never double-spent.
+        const OLD: [u8; 32] = [0xC0; 32];
+        let rate = 100_000u64;
+        let rpc = FakeRpc::new();
+        let ts = process_type_script(23);
+        let hash = script_hash32(&ts);
+        rpc.insert_cell(process_cell(
+            23,
+            200_0000_0000,
+            vec![0x7f, b'E', b'L', b'F', 23],
+        ));
+        let occupied = 61_0000_0000u64;
+        let legacy = intention_cell_with_lock(1, hash, 100_0000_0000, OLD, ScriptHashType::Type);
+        let tight = intention_cell(2, hash, occupied + 1_000);
+        let ample = intention_cell(3, hash, occupied + 50_000);
+        rpc.insert_cell(legacy.clone());
+        rpc.insert_cell(tight.clone());
+        rpc.insert_cell(ample.clone());
+
+        let mut cfg = cfg_allowlist(rate, allow_cid());
+        cfg.extra_scan_locks = vec![CidLockIdentity::new(OLD, ScriptHashType::Type)];
+        let mut loop_ = DigestLoop::new(
+            rpc,
+            NopClock,
+            ScriptedSsri::incompatible(21),
+            cfg,
+            ProcessResolver::new(),
+        );
+        let report = loop_.tick();
+        assert!(
+            report.submitted >= 2,
+            "exact + viable bounded singleton; got submitted={}",
+            report.submitted
+        );
+        let txs = loop_.rpc().submitted();
+        let legacy_spends = txs
+            .iter()
+            .filter(|tx| {
+                tx.inputs()
+                    .into_iter()
+                    .any(|i| i.previous_output() == legacy.out_point)
+            })
+            .count();
+        assert_eq!(legacy_spends, 1, "legacy Exact must not be double-spent");
+        assert!(
+            txs.iter().any(|tx| tx
+                .inputs()
+                .into_iter()
+                .any(|i| i.previous_output() == ample.out_point)),
+            "viable Bounded subset must submit after isolate"
+        );
+        // Legacy refund is exact (fee 0); bounded pays fee.
+        let legacy_tx = txs
+            .iter()
+            .find(|tx| {
+                tx.inputs()
+                    .into_iter()
+                    .any(|i| i.previous_output() == legacy.out_point)
+            })
+            .expect("legacy tx");
+        let legacy_out: u64 = legacy_tx.outputs().get(0).unwrap().capacity().unpack();
+        assert_eq!(legacy_out, 100_0000_0000);
+    }
+
+    #[test]
     fn bounded_refund_unaffordable_isolates_viable_subset() {
         // High fee_rate so n=2 needs more headroom than tight+ample combined,
         // while n=1 fits in ample alone → isolate/shrink must submit the subset.

@@ -26,20 +26,23 @@
 //!
 //! ## Contract rules (PR #12 reviewed)
 //!
-//! Reviewed contract head (or newer): `f3aa831` on
+//! Reviewed contract head (or newer): `d6c5a86` on
 //! `ckb-common-intention-dispatcher` PR #12. On-chain DigestIncompatible
 //! requires per-Intention ceiling via [`refund_capacity_allowed`] and
 //! **tx-wide** `F >= S` (`fee_covers_shortfalls`: miner fee covers aggregate
-//! shortfall so shortfalls cannot fund other outputs). TimeoutBurn stays
-//! exact. Backend assembly uses the stronger `sum(cuts) == F` with no extra
-//! outputs, which implies `F >= S`.
+//! shortfall so shortfalls cannot fund other outputs). `S` / DigestOk
+//! counting is scoped to the executing lock's `code_hash` + `hash_type`
+//! (not cross-deployment). TimeoutBurn stays exact. Backend assembly uses
+//! the stronger `sum(cuts) == F` with no extra outputs, which implies
+//! `F >= S`.
 //!
 //! ### Historical note
 //!
 //! An earlier candidate (`fcd33d9`) allowed capacity shortfall without
 //! tx-wide fee binding; review found arbitrary outputs could siphon the
 //! haircut. That finding is addressed by PR #12's `fee_covers_shortfalls`.
-//! Do **not** treat undeployed candidate hashes as production defaults.
+//! Do **not** treat undeployed candidate hashes as production defaults
+//! (including provisional data hashes such as `0x2edb827f…`).
 //!
 //! ## Process example / DigestOk co-bundling
 //!

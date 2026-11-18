@@ -8,19 +8,22 @@ Backend can opt into **bounded** Incompatible refund fee cuts
 
 Reviewed contract rules live in
 [ckb-common-intention-dispatcher PR #12](https://github.com/ashuralyk/ckb-common-intention-dispatcher/pull/12)
-at head **`f3aa831`** (or newer): per-Intention ceiling via
+at head **`d6c5a86`** (or newer): per-Intention ceiling via
 `refund_capacity_allowed`, plus **tx-wide** `F >= S`
 (`fee_covers_shortfalls`) so shortfalls cannot fund other outputs.
-TimeoutBurn stays exact.
+`S` / DigestOk counting is scoped to the executing lock's
+`code_hash` + `hash_type` (not across deployments). TimeoutBurn stays exact.
 
 Do **not** treat undeployed candidate hashes as production defaults; do **not**
-replace current testnet `code_hash` with an undeployed binary.
+replace current testnet `code_hash` with an undeployed binary (including
+provisional data hashes such as `0x2edb827f…` — document as example only,
+never as an active allowlist entry).
 
 ### Historical note
 
 An earlier candidate (`fcd33d9`) allowed capacity shortfall without tx-wide
 fee binding; review found arbitrary outputs could siphon the haircut. PR #12
-(`e0e7f18` → `f3aa831`) binds haircuts to miner fee (`F >= S`) and restores
+(`e0e7f18` → `d6c5a86`) binds haircuts to miner fee (`F >= S`) and restores
 TimeoutBurn exact capacity.
 
 ## Defaults (safe for existing deployments)
