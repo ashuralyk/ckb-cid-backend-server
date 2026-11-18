@@ -91,6 +91,10 @@ enum BatchOutcome {
     Rejected,
     /// Combo already in `rejected_combos`; isolate without a new submit.
     CachedRejected,
+    /// Process recreate cannot fund fee for this window size. Isolate/shrink
+    /// like `Rejected` (smaller batch → smaller tx → lower fee) but do **not**
+    /// combo-reject — surplus or fee_rate may change later.
+    FeeUnaffordable,
     /// Conflict / Unavailable / assemble skip: remaining items may continue.
     Continue,
     /// Process recreate already occupied; stop digest_ok this tick.
@@ -507,15 +511,19 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
         }
     }
 
-    /// Split a `SubmitRejected` window into legal `[min, max]` sub-batches.
-    /// Returns a resume `out_point_key` when leftover work should start there
-    /// next tick (budget cut or Process occupied/consumed with remainder).
+    /// Split a `SubmitRejected` / `FeeUnaffordable` window into legal
+    /// `[min, max]` sub-batches. Returns a resume `out_point_key` when leftover
+    /// work should start there next tick (budget cut or Process
+    /// occupied/consumed with remainder).
     ///
     /// Iterative so a long poison prefix cannot grow the stack. Cached combos
     /// are isolated without charging `attempts` (new `send_transaction` only).
     /// Each window fingerprint is expanded at most once per sweep; a separate
     /// cached-split budget stops diamond explosion. Progress persists in
     /// `isolate_expanded` until the sweep completes.
+    ///
+    /// `FeeUnaffordable` uses the same shrink (fee scales with tx size) but is
+    /// never written to `rejected_combos`.
     #[allow(clippy::too_many_arguments)]
     fn isolate_window(
         &mut self,
@@ -631,7 +639,9 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                         stack.push(rest);
                     }
                 }
-                BatchOutcome::Rejected | BatchOutcome::CachedRejected => {
+                BatchOutcome::Rejected
+                | BatchOutcome::CachedRejected
+                | BatchOutcome::FeeUnaffordable => {
                     self.state
                         .isolate_expanded
                         .entry(hash)
@@ -757,8 +767,8 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                         tx_size,
                         fee_rate,
                     }) => {
-                        // Non-permanent: Process may gain capacity later, or
-                        // fee_rate / tx size may change. Do not combo-reject.
+                        // Non-permanent: isolate/shrink the window (smaller
+                        // batch → smaller tx → lower fee). Do not combo-reject.
                         tracing::warn!(
                             target: LOG_TARGET,
                             event = "tick.skip",
@@ -768,9 +778,9 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                             fee,
                             tx_size,
                             fee_rate,
+                            n = batch.len(),
                         );
-                        report.skipped += batch.len();
-                        return BatchOutcome::Continue;
+                        return BatchOutcome::FeeUnaffordable;
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -792,12 +802,36 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                 );
                 match assemble_digest_incompatible(&batch, &self.state.tick_cell_deps) {
                     Ok(s) => {
+                        // Known public-net gap: refund txs pay fee 0 (exact
+                        // User Lock capacity; Process not spent). Nodes with
+                        // min_fee_rate > 0 reject them (-1104). Not fixed here.
+                        let out_sum: u64 =
+                            s.tx.outputs()
+                                .into_iter()
+                                .map(|o| {
+                                    let c: u64 = o.capacity().unpack();
+                                    c
+                                })
+                                .sum();
+                        let in_sum: u64 = batch.iter().map(|i| i.capacity).sum();
+                        let fee = in_sum.saturating_sub(out_sum);
                         tracing::info!(
                             target: LOG_TARGET,
                             event = "refund.path",
                             code,
                             path = "user_lock",
+                            fee,
                         );
+                        if fee == 0 {
+                            tracing::warn!(
+                                target: LOG_TARGET,
+                                event = "refund.zero_fee",
+                                code,
+                                fee,
+                                fee_rate = self.config.fee_rate,
+                                n = batch.len(),
+                            );
+                        }
                         s
                     }
                     Err(e) => {

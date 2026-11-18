@@ -108,8 +108,9 @@ fn finish(
 
 /// Deduct `fee_rate`-based fee from the Process recreate (last output).
 ///
-/// Size is measured on a fully built tx (witnesses + 4-byte in-block offset).
-/// Capacity is a fixed-width field, so adjusting it does not change size.
+/// Size is measured on the final skeleton as submitted (empty witnesses;
+/// cell_deps + I/O + 4-byte in-block offset). Capacity is a fixed-width
+/// field, so adjusting it does not change size.
 fn apply_process_fee(
     inputs: Vec<CellInput>,
     input_capacity: u64,
@@ -219,8 +220,16 @@ fn protocol_script_to_packed(script: &cid_protocol::Script) -> Script {
 }
 
 /// Exact User Lock refund. Does **not** spend Process and therefore cannot
-/// deduct fee from a Process recreate (see module notes / design report).
-/// Refund output capacities stay equal to Intention capacities.
+/// deduct fee from a Process recreate.
+///
+/// # Known public-net gap (not fixed here)
+///
+/// Refund outputs must keep Intention capacity exactly (CID Process example
+/// `DigestIncompatible` / `refund_assets_match` in the contracts repo). With
+/// no Process pair and no fee input, paid fee is always **0**. Public nodes
+/// with `min_fee_rate > 0` reject these txs (`-1104`). Local-dev sets
+/// `min_fee_rate = 0` so refunds still clear there. Do not claim this is
+/// solved by `loop.fee_rate` — that only funds `digest_ok` via Process.
 pub fn assemble_digest_incompatible(
     intentions: &[ScannedIntention],
     extra_cell_deps: &[CellDep],

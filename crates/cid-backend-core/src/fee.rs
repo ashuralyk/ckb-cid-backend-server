@@ -11,14 +11,15 @@
 //! Changing only a capacity `uint64` does not change serialized size, so one
 //! measure-after-structure pass is stable (no fixed-point iteration needed).
 //!
-//! ## Incompatible / refund path
+//! ## Incompatible / refund path (known public-net gap)
 //!
 //! `assemble_digest_incompatible` does not spend Process (User Lock exact
-//! refund). Including Process to fund the fee would put the Process type hash
-//! in both I/O; the Process example contract then classifies matching
-//! Intentions as DigestOk (beneficiary obligations), not user_lock refunds.
-//! Refunds therefore remain zero-fee; public nodes with `min_fee_rate > 0`
-//! may reject them until a contract-compatible fee source exists.
+//! refund; contracts `DigestIncompatible` + `refund_assets_match` require
+//! exact capacity). Including Process to fund the fee would put the Process
+//! type hash in both I/O; the Process example then classifies matching
+//! Intentions as DigestOk (beneficiary), not refunds. Refunds therefore stay
+//! **zero-fee** and fail on public nodes with `min_fee_rate > 0` (`-1104`).
+//! This is intentional current behavior — not fixed by `fee_rate`.
 
 use ckb_types::core::{Capacity, TransactionView};
 use ckb_types::packed::CellOutput;
@@ -91,6 +92,21 @@ mod tests {
         // With fee_rate == 1000, ceil and floor of size*rate/1000 coincide.
         for size in [1u64, 573, 574, 601, 4096, 100_000] {
             assert_eq!(fee_for_size(size, 1000), size);
+        }
+    }
+
+    #[test]
+    fn fee_for_size_never_underpays_ckb_feerate_floor() {
+        use ckb_types::core::FeeRate;
+        for rate in [1u64, 999, 1000, 1001, 1500, 2500, 10_000] {
+            for size in [1u64, 17, 573, 574, 601, 1000, 1001, 4096, 50_000] {
+                let ours = fee_for_size(size, rate);
+                let ckb = FeeRate::from_u64(rate).fee(size).as_u64();
+                assert!(
+                    ours >= ckb,
+                    "size={size} rate={rate}: ceil={ours} < ckb_floor={ckb}"
+                );
+            }
         }
     }
 }
