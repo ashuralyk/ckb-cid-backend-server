@@ -1,5 +1,6 @@
 use crate::logging::LogFormat;
 use cid_backend_core::digest_loop::{LoopConfig, DEFAULT_CONFIRMATION_DEPTH};
+use cid_backend_core::type_id::{TypeIdCodeDep, TypeIdIdentity};
 use ckb_types::core::{DepType, ScriptHashType};
 use ckb_types::packed::{Byte32, CellDep, OutPoint};
 use ckb_types::prelude::*;
@@ -16,11 +17,13 @@ pub struct DaemonConfig {
     pub cid_lock_code_hash: [u8; 32],
     pub hash_type: ScriptHashType,
     pub poll_interval: Duration,
-    /// Code/dep-group cell deps for CID lock, Process type, Process lock, etc.
+    /// Static CellDeps (extras / local fixtures). Merged after Type-ID resolve.
     pub extra_cell_deps: Vec<CellDep>,
+    /// Type-ID identities for code cells (CID lock / Process code / Process lock).
+    pub type_id_code_deps: Vec<TypeIdCodeDep>,
     /// Indexer type-script `code_hash` prefixes used to find Process cells by
     /// `calc_script_hash` (the 32-byte value in CID args is a script hash, not
-    /// a code hash).
+    /// a code hash). Auto-includes derived Process code `type_id` when set.
     pub process_type_code_hashes: Vec<[u8; 32]>,
     /// Optional health/stats bind. Unset/empty disables the listener.
     pub health_bind: Option<SocketAddr>,
@@ -106,6 +109,7 @@ impl DaemonConfig {
             hash_type: self.hash_type,
             poll_interval: self.poll_interval,
             extra_cell_deps: self.extra_cell_deps.clone(),
+            type_id_code_deps: self.type_id_code_deps.clone(),
             confirmation_depth: self.confirmation_depth,
         }
     }
@@ -121,9 +125,7 @@ pub fn parse_cli(args: &[String]) -> Result<CliAction, ConfigError> {
         }
         if let Some(p) = arg.strip_prefix("--config=") {
             if p.is_empty() {
-                return Err(ConfigError::Invalid(
-                    "--config requires a file path".into(),
-                ));
+                return Err(ConfigError::Invalid("--config requires a file path".into()));
             }
             if config_path.replace(PathBuf::from(p)).is_some() {
                 return Err(ConfigError::Invalid("duplicate --config".into()));
@@ -132,14 +134,10 @@ pub fn parse_cli(args: &[String]) -> Result<CliAction, ConfigError> {
         }
         if arg == "--config" {
             let Some(p) = iter.next() else {
-                return Err(ConfigError::Invalid(
-                    "--config requires a file path".into(),
-                ));
+                return Err(ConfigError::Invalid("--config requires a file path".into()));
             };
             if p.starts_with('-') {
-                return Err(ConfigError::Invalid(
-                    "--config requires a file path".into(),
-                ));
+                return Err(ConfigError::Invalid("--config requires a file path".into()));
             }
             if config_path.replace(PathBuf::from(p)).is_some() {
                 return Err(ConfigError::Invalid("duplicate --config".into()));
@@ -157,7 +155,9 @@ pub fn parse_cli(args: &[String]) -> Result<CliAction, ConfigError> {
 pub fn resolve_config_path(cli: &CliAction, cid_config: Option<String>) -> Option<PathBuf> {
     match cli {
         CliAction::Help => None,
-        CliAction::Run { config_path: Some(p) } => Some(p.clone()),
+        CliAction::Run {
+            config_path: Some(p),
+        } => Some(p.clone()),
         CliAction::Run { config_path: None } => cid_config
             .filter(|s| !s.trim().is_empty())
             .map(PathBuf::from),
@@ -171,7 +171,10 @@ pub fn usage() -> &'static str {
      Config: --config PATH overrides CID_CONFIG. Neither: legacy CID_* env only.\n\
      Precedence: defaults < TOML file < non-empty CID_* process env.\n\
      File mode requires [network].genesis_hash (declared identity, not verified\n\
-     unless network.validate_genesis = true).\n"
+     unless network.validate_genesis = true).\n\
+     Type-ID code cells: cid_lock/process/process_lock type_id_args (+ optional\n\
+     type_id full hash). Derived hash_type=type code_hash; CellDeps refreshed\n\
+     each tick. Static [[cell_deps]] remain for extras / local fixtures.\n"
 }
 
 #[derive(Default, Deserialize)]
@@ -185,6 +188,8 @@ struct FileConfig {
     cid_lock: Option<CidLockSection>,
     #[serde(default)]
     process: Option<ProcessSection>,
+    #[serde(default)]
+    process_lock: Option<ProcessLockSection>,
     #[serde(default)]
     cell_deps: Vec<CellDepFile>,
     #[serde(rename = "loop", default)]
@@ -220,6 +225,12 @@ struct CidLockSection {
     code_hash: Option<String>,
     #[serde(default)]
     hash_type: Option<String>,
+    /// TYPE_ID type-script args (32 bytes). Preferred for hash_type=type deploys.
+    #[serde(default)]
+    type_id_args: Option<String>,
+    /// Optional full type-script hash for fail-closed check. Not args.
+    #[serde(default)]
+    type_id: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -227,6 +238,19 @@ struct CidLockSection {
 struct ProcessSection {
     #[serde(default)]
     type_code_hashes: Vec<String>,
+    #[serde(default)]
+    type_id_args: Option<String>,
+    #[serde(default)]
+    type_id: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProcessLockSection {
+    #[serde(default)]
+    type_id_args: Option<String>,
+    #[serde(default)]
+    type_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -260,12 +284,9 @@ struct ObserveSection {
 }
 
 fn read_file_config(path: &Path) -> Result<FileConfig, ConfigError> {
-    let raw = std::fs::read_to_string(path).map_err(|e| {
-        ConfigError::Invalid(format!("cannot read config {}: {e}", path.display()))
-    })?;
-    toml::from_str(&raw).map_err(|e| {
-        ConfigError::Invalid(format!("TOML {}: {e}", path.display()))
-    })
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| ConfigError::Invalid(format!("cannot read config {}: {e}", path.display())))?;
+    toml::from_str(&raw).map_err(|e| ConfigError::Invalid(format!("TOML {}: {e}", path.display())))
 }
 
 fn nonempty(get: &impl Fn(&str) -> Option<String>, key: &str) -> Option<String> {
@@ -282,6 +303,7 @@ fn merge<F: Fn(&str) -> Option<String>>(
     let rpc = file.rpc.unwrap_or_default();
     let cid_lock = file.cid_lock.unwrap_or_default();
     let process = file.process.unwrap_or_default();
+    let process_lock = file.process_lock.unwrap_or_default();
     let digest = file.digest.unwrap_or_default();
     let observe = file.observe.unwrap_or_default();
 
@@ -299,23 +321,82 @@ fn merge<F: Fn(&str) -> Option<String>>(
             .unwrap_or_else(|| node_url.clone()),
     };
 
-    let cid_lock_code_hash = match nonempty(&get, "CID_LOCK_CODE_HASH") {
-        Some(v) => parse_hex32(&v)?,
-        None => match cid_lock.code_hash.filter(|s| !s.trim().is_empty()) {
-            Some(v) => parse_hex32(&v)?,
-            None => {
-                return Err(ConfigError::Missing(
-                    "CID_LOCK_CODE_HASH (or cid_lock.code_hash in --config file)".into(),
-                ));
+    let cid_lock_identity = parse_type_id_identity(
+        &get,
+        "CID_LOCK_TYPE_ID_ARGS",
+        "CID_LOCK_TYPE_ID",
+        cid_lock.type_id_args.as_deref(),
+        cid_lock.type_id.as_deref(),
+        "cid_lock",
+    )?;
+    let process_code_identity = parse_type_id_identity(
+        &get,
+        "CID_PROCESS_TYPE_ID_ARGS",
+        "CID_PROCESS_TYPE_ID",
+        process.type_id_args.as_deref(),
+        process.type_id.as_deref(),
+        "process",
+    )?;
+    let process_lock_identity = parse_type_id_identity(
+        &get,
+        "CID_PROCESS_LOCK_TYPE_ID_ARGS",
+        "CID_PROCESS_LOCK_TYPE_ID",
+        process_lock.type_id_args.as_deref(),
+        process_lock.type_id.as_deref(),
+        "process_lock",
+    )?;
+
+    let (cid_lock_code_hash, hash_type) = if let Some(ref id) = cid_lock_identity {
+        let derived = id.type_script_hash();
+        let explicit_hash = match nonempty(&get, "CID_LOCK_CODE_HASH") {
+            Some(v) => Some(parse_hex32(&v)?),
+            None => match cid_lock.code_hash.filter(|s| !s.trim().is_empty()) {
+                Some(v) => Some(parse_hex32(&v)?),
+                None => None,
+            },
+        };
+        if let Some(h) = explicit_hash {
+            if h != derived {
+                return Err(ConfigError::Invalid(format!(
+                    "cid_lock.code_hash / CID_LOCK_CODE_HASH 0x{} != type_id-derived 0x{}",
+                    hex::encode(h),
+                    hex::encode(derived)
+                )));
             }
-        },
-    };
-    let hash_type = match nonempty(&get, "CID_LOCK_HASH_TYPE") {
-        Some(s) => parse_hash_type(&s)?,
-        None => match cid_lock.hash_type {
+        }
+        let ht = match nonempty(&get, "CID_LOCK_HASH_TYPE") {
             Some(s) => parse_hash_type(&s)?,
-            None => ScriptHashType::Type,
-        },
+            None => match cid_lock.hash_type {
+                Some(s) => parse_hash_type(&s)?,
+                None => ScriptHashType::Type,
+            },
+        };
+        if !matches!(ht, ScriptHashType::Type) {
+            return Err(ConfigError::Invalid(
+                "cid_lock.type_id_args requires hash_type=type (TYPE_ID code reference)".into(),
+            ));
+        }
+        (derived, ScriptHashType::Type)
+    } else {
+        let cid_lock_code_hash = match nonempty(&get, "CID_LOCK_CODE_HASH") {
+            Some(v) => parse_hex32(&v)?,
+            None => match cid_lock.code_hash.filter(|s| !s.trim().is_empty()) {
+                Some(v) => parse_hex32(&v)?,
+                None => {
+                    return Err(ConfigError::Missing(
+                        "CID_LOCK_CODE_HASH / cid_lock.code_hash, or cid_lock.type_id_args".into(),
+                    ));
+                }
+            },
+        };
+        let hash_type = match nonempty(&get, "CID_LOCK_HASH_TYPE") {
+            Some(s) => parse_hash_type(&s)?,
+            None => match cid_lock.hash_type {
+                Some(s) => parse_hash_type(&s)?,
+                None => ScriptHashType::Type,
+            },
+        };
+        (cid_lock_code_hash, hash_type)
     };
 
     let secs = match nonempty(&get, "CID_POLL_INTERVAL_SECS") {
@@ -331,8 +412,7 @@ fn merge<F: Fn(&str) -> Option<String>>(
             }
             None => {
                 return Err(ConfigError::Missing(
-                    "CID_POLL_INTERVAL_SECS (or loop.poll_interval_secs in --config file)"
-                        .into(),
+                    "CID_POLL_INTERVAL_SECS (or loop.poll_interval_secs in --config file)".into(),
                 ));
             }
         },
@@ -350,7 +430,7 @@ fn merge<F: Fn(&str) -> Option<String>>(
         file_cell_deps(&file.cell_deps)?
     };
 
-    let process_type_code_hashes = match nonempty(&get, "CID_PROCESS_CODE_HASH") {
+    let mut process_type_code_hashes = match nonempty(&get, "CID_PROCESS_CODE_HASH") {
         Some(raw) => parse_hash_list(Some(raw))?,
         None => {
             let mut out = Vec::new();
@@ -360,6 +440,32 @@ fn merge<F: Fn(&str) -> Option<String>>(
             out
         }
     };
+    if let Some(ref id) = process_code_identity {
+        let derived = id.type_script_hash();
+        if !process_type_code_hashes.iter().any(|h| h == &derived) {
+            process_type_code_hashes.push(derived);
+        }
+    }
+
+    let mut type_id_code_deps = Vec::new();
+    if let Some(id) = cid_lock_identity {
+        type_id_code_deps.push(TypeIdCodeDep {
+            label: "cid_lock".into(),
+            identity: id,
+        });
+    }
+    if let Some(id) = process_code_identity {
+        type_id_code_deps.push(TypeIdCodeDep {
+            label: "process_code".into(),
+            identity: id,
+        });
+    }
+    if let Some(id) = process_lock_identity {
+        type_id_code_deps.push(TypeIdCodeDep {
+            label: "process_lock".into(),
+            identity: id,
+        });
+    }
 
     let health_bind = match nonempty(&get, "CID_HEALTH_BIND") {
         Some(s) => Some(parse_health_bind(&s)?),
@@ -422,6 +528,7 @@ fn merge<F: Fn(&str) -> Option<String>>(
         hash_type,
         poll_interval: Duration::from_secs(secs),
         extra_cell_deps,
+        type_id_code_deps,
         process_type_code_hashes,
         health_bind,
         confirmation_depth,
@@ -430,6 +537,50 @@ fn merge<F: Fn(&str) -> Option<String>>(
         validate_genesis,
         log_format,
     })
+}
+
+fn parse_type_id_identity(
+    get: &impl Fn(&str) -> Option<String>,
+    args_env: &str,
+    hash_env: &str,
+    file_args: Option<&str>,
+    file_hash: Option<&str>,
+    label: &str,
+) -> Result<Option<TypeIdIdentity>, ConfigError> {
+    let args_raw = match nonempty(get, args_env) {
+        Some(v) => Some(v),
+        None => file_args
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string()),
+    };
+    let hash_raw = match nonempty(get, hash_env) {
+        Some(v) => Some(v),
+        None => file_hash
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string()),
+    };
+    match (args_raw, hash_raw) {
+        (None, None) => Ok(None),
+        (None, Some(_)) => Err(ConfigError::Invalid(format!(
+            "{label}.type_id (full type-script hash) set without type_id_args; \
+             do not treat type_id as args — set {args_env} / {label}.type_id_args"
+        ))),
+        (Some(args), expected) => {
+            let args = parse_hex32(&args)?;
+            let expected = match expected {
+                Some(h) => Some(parse_hex32(&h)?),
+                None => None,
+            };
+            let id = TypeIdIdentity {
+                args,
+                expected_type_hash: expected,
+            };
+            id.validate_expected().map_err(ConfigError::Invalid)?;
+            Ok(Some(id))
+        }
+    }
 }
 
 fn file_cell_deps(rows: &[CellDepFile]) -> Result<Vec<CellDep>, ConfigError> {
@@ -584,11 +735,7 @@ mod tests {
 
     fn write_toml(body: &str) -> PathBuf {
         let n = TMP_N.fetch_add(1, Ordering::SeqCst);
-        let p = std::env::temp_dir().join(format!(
-            "cid-cfg-{}-{}.toml",
-            std::process::id(),
-            n
-        ));
+        let p = std::env::temp_dir().join(format!("cid-cfg-{}-{}.toml", std::process::id(), n));
         std::fs::write(&p, body).expect("write toml");
         p
     }
@@ -649,12 +796,67 @@ log_format = "pretty"
         assert_eq!(cfg.hash_type, ScriptHashType::Type);
         assert_eq!(cfg.poll_interval, Duration::from_secs(5));
         assert!(cfg.extra_cell_deps.is_empty());
+        assert!(cfg.type_id_code_deps.is_empty());
         assert!(cfg.process_type_code_hashes.is_empty());
         assert!(cfg.health_bind.is_none());
         assert_eq!(cfg.confirmation_depth, DEFAULT_CONFIRMATION_DEPTH);
         assert!(cfg.genesis_hash.is_none());
         assert!(!cfg.validate_genesis);
         assert_eq!(cfg.log_format, LogFormat::Json);
+    }
+
+    #[test]
+    fn type_id_args_derives_code_hash_and_code_deps() {
+        use cid_backend_core::type_id::type_id_script_hash;
+        let args = "aa".repeat(32);
+        let expected = type_id_script_hash(&[0xaau8; 32]);
+        let cfg = DaemonConfig::from_vars(|k| match k {
+            "CID_CKB_RPC_URL" => Some("http://127.0.0.1:8114".into()),
+            "CID_POLL_INTERVAL_SECS" => Some("5".into()),
+            "CID_LOCK_TYPE_ID_ARGS" => Some(args.clone()),
+            "CID_LOCK_TYPE_ID" => Some(hex::encode(expected)),
+            "CID_PROCESS_TYPE_ID_ARGS" => Some("bb".repeat(32)),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(cfg.cid_lock_code_hash, expected);
+        assert_eq!(cfg.hash_type, ScriptHashType::Type);
+        assert_eq!(cfg.type_id_code_deps.len(), 2);
+        assert_eq!(cfg.type_id_code_deps[0].label, "cid_lock");
+        assert_eq!(cfg.type_id_code_deps[1].label, "process_code");
+        let proc_derived = type_id_script_hash(&[0xbbu8; 32]);
+        assert!(cfg.process_type_code_hashes.contains(&proc_derived));
+        let loop_cfg = cfg.to_loop_config();
+        assert_eq!(loop_cfg.type_id_code_deps.len(), 2);
+        assert_eq!(loop_cfg.cid_code_hash, expected);
+    }
+
+    #[test]
+    fn type_id_without_args_rejected() {
+        let err = DaemonConfig::from_vars(|k| match k {
+            "CID_LOCK_TYPE_ID" => Some("cc".repeat(32)),
+            other => required_env(other),
+        })
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("type_id_args"), "{msg}");
+        assert!(
+            msg.contains("not treat type_id as args") || msg.contains("without type_id_args"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn type_id_hash_mismatch_fail_closed() {
+        let err = DaemonConfig::from_vars(|k| match k {
+            "CID_CKB_RPC_URL" => Some("http://127.0.0.1:8114".into()),
+            "CID_POLL_INTERVAL_SECS" => Some("1".into()),
+            "CID_LOCK_TYPE_ID_ARGS" => Some("11".repeat(32)),
+            "CID_LOCK_TYPE_ID" => Some("22".repeat(32)),
+            _ => None,
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("mismatch"), "{err}");
     }
 
     #[test]
@@ -693,10 +895,7 @@ log_format = "pretty"
         assert_eq!(cfg.process_type_code_hashes, vec![[0xccu8; 32]]);
         let loop_cfg = cfg.to_loop_config();
         assert_eq!(loop_cfg.extra_cell_deps.len(), 2);
-        assert_eq!(
-            cfg.extra_cell_deps[0].dep_type(),
-            DepType::Code.into()
-        );
+        assert_eq!(cfg.extra_cell_deps[0].dep_type(), DepType::Code.into());
     }
 
     #[test]
@@ -797,10 +996,7 @@ dep_type = "dep_group"
         );
         let p = write_toml(&body);
         let cfg = DaemonConfig::from_file_and_vars(Some(&p), |_| None).unwrap();
-        assert_eq!(
-            cfg.extra_cell_deps[0].dep_type(),
-            DepType::DepGroup.into()
-        );
+        assert_eq!(cfg.extra_cell_deps[0].dep_type(), DepType::DepGroup.into());
         let idx: u32 = cfg.extra_cell_deps[0].out_point().index().unpack();
         assert_eq!(idx, 2);
     }
@@ -837,10 +1033,7 @@ dep_type = "dep_group"
         assert_eq!(cfg.extra_cell_deps.len(), 1);
         let idx: u32 = cfg.extra_cell_deps[0].out_point().index().unpack();
         assert_eq!(idx, 3);
-        assert_eq!(
-            cfg.extra_cell_deps[0].dep_type(),
-            DepType::Code.into()
-        );
+        assert_eq!(cfg.extra_cell_deps[0].dep_type(), DepType::Code.into());
     }
 
     #[test]
@@ -872,7 +1065,10 @@ poll_interval_secs = 1
         let p = write_toml("secret = \"x\"\n");
         let err = DaemonConfig::from_file_and_vars(Some(&p), |_| None).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.to_ascii_lowercase().contains("unknown") || msg.contains("TOML"), "{msg}");
+        assert!(
+            msg.to_ascii_lowercase().contains("unknown") || msg.contains("TOML"),
+            "{msg}"
+        );
     }
 
     #[test]
@@ -883,7 +1079,10 @@ poll_interval_secs = 1
         )
         .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("cannot read") || msg.contains("No such"), "{msg}");
+        assert!(
+            msg.contains("cannot read") || msg.contains("No such"),
+            "{msg}"
+        );
     }
 
     #[test]
@@ -932,12 +1131,7 @@ poll_interval_secs = 1
             CliAction::Help
         );
         assert_eq!(
-            parse_cli(&[
-                "d".into(),
-                "--config".into(),
-                "n.toml".into()
-            ])
-            .unwrap(),
+            parse_cli(&["d".into(), "--config".into(), "n.toml".into()]).unwrap(),
             CliAction::Run {
                 config_path: Some(PathBuf::from("n.toml"))
             }
@@ -950,9 +1144,7 @@ poll_interval_secs = 1
         );
         assert_eq!(
             parse_cli(&["d".into()]).unwrap(),
-            CliAction::Run {
-                config_path: None
-            }
+            CliAction::Run { config_path: None }
         );
         assert!(parse_cli(&["d".into(), "--nope".into()]).is_err());
         assert!(parse_cli(&["d".into(), "--config".into()]).is_err());
@@ -982,13 +1174,7 @@ poll_interval_secs = 1
         assert_eq!(redacted, "http://127.0.0.1:8114");
         assert!(!redacted.contains("s3cret"));
         assert!(!redacted.contains("user:"));
-        assert_eq!(
-            rpc_endpoint_for_log("not-a-url"),
-            "<invalid-rpc-url>"
-        );
-        assert_eq!(
-            rpc_endpoint_for_log("ftp://127.0.0.1"),
-            "<invalid-rpc-url>"
-        );
+        assert_eq!(rpc_endpoint_for_log("not-a-url"), "<invalid-rpc-url>");
+        assert_eq!(rpc_endpoint_for_log("ftp://127.0.0.1"), "<invalid-rpc-url>");
     }
 }

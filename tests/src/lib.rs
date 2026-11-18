@@ -12,3 +12,4 @@ pub mod vertical_reorg;
 pub mod vertical_submit_conflict;
 pub mod vertical_submit_drop;
 pub mod vertical_submit_pending;
+pub mod vertical_type_id_deps;

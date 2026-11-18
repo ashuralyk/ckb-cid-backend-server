@@ -49,9 +49,11 @@ Success prints `local-chain execution tx committed:` and `local-chain closure ok
 | `CID_LOG_FORMAT` / `RUST_LOG` | optional | Structured logs (`docs/observability.md`) |
 | `CID_CONFIG` | optional | TOML path (`--config` wins). See `examples/cid.network.toml.example`. No keys. |
 
-Production/dev operators may put the same public RPC, lock, Process prefix, and cell-dep values in a TOML file. `network.genesis_hash` is declared identity only unless `validate_genesis = true`. The daemon does not auto-fill deployments.
+Production/dev operators may put the same public RPC / Type-ID / static cell-dep values in a TOML file. `network.genesis_hash` is declared identity only unless `validate_genesis = true`.
 
-`assemble` uses `extra_cell_deps` as-is and does not auto-fill script deps. `CkbRpc` always uses `CID_PROCESS_CODE_HASH` as a type-script prefix, then filters `calc_script_hash`; the args hash alone is usually not a usable prefix.
+**Local-chain fixture stays static `data1` cell deps** (CID lock ELF / Process ELF / always-success outpoints). Type-ID discovery (`*_TYPE_ID_ARGS`) is for `hash_type=type` networks; it is optional here and does not replace the local data1 path. On Type-ID networks, code CellDeps are resolved each tick from configured `type_id_args` (exact TYPE_ID type script); static `[[cell_deps]]` remain for extras.
+
+`assemble` uses the tick's merged CellDeps (Type-ID resolved + static). `CkbRpc` uses `CID_PROCESS_CODE_HASH` (and auto-derived Process code `type_id` when configured) as a type-script prefix, then filters `calc_script_hash`.
 
 State is memory-only. Restarting the daemon drops in-flight occupancy and full-rescans indexer `asc`.
 

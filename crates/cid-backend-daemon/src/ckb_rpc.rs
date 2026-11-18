@@ -70,13 +70,12 @@ impl CkbRpc {
     /// Fail-closed genesis identity: `get_block_hash("0x0")`.
     pub fn genesis_block_hash(&self) -> Result<[u8; 32], RpcError> {
         let result = self.call_node("get_block_hash", json!(["0x0"]))?;
-        let hex = result.as_str().ok_or_else(|| {
-            RpcError::Unavailable("get_block_hash: result not hex".into())
-        })?;
+        let hex = result
+            .as_str()
+            .ok_or_else(|| RpcError::Unavailable("get_block_hash: result not hex".into()))?;
         let bytes = decode_hex(hex)?;
-        <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
-            RpcError::Unavailable("get_block_hash: not 32 bytes".into())
-        })
+        <[u8; 32]>::try_from(bytes.as_slice())
+            .map_err(|_| RpcError::Unavailable("get_block_hash: not 32 bytes".into()))
     }
 
     /// Compare declared genesis to the node. RPC errors and mismatches both fail.
@@ -176,6 +175,22 @@ impl CkbRpc {
         });
         self.get_cells(&key)
     }
+
+    fn cells_by_exact_type_script(&self, type_script: &Script) -> Result<Vec<LiveCell>, RpcError> {
+        let ht: ScriptHashType = type_script
+            .hash_type()
+            .try_into()
+            .map_err(|_| RpcError::Unavailable("type script hash_type".into()))?;
+        let code: [u8; 32] = type_script.code_hash().unpack();
+        let args: Vec<u8> = type_script.args().unpack();
+        let key = json!({
+            "script": json_script(&code, ht, &args),
+            "script_type": "type",
+            "script_search_mode": "exact",
+            "with_data": true,
+        });
+        self.get_cells(&key)
+    }
 }
 
 impl Rpc for CkbRpc {
@@ -210,6 +225,23 @@ impl Rpc for CkbRpc {
                 .map(|ts| &script_hash32(&ts) == process_type_hash)
                 .unwrap_or(false)
         }))
+    }
+
+    fn list_live_cells_by_type_script(
+        &self,
+        type_script: &Script,
+    ) -> Result<Vec<LiveCell>, RpcError> {
+        let cells = self.cells_by_exact_type_script(type_script)?;
+        // Fail-closed filter: indexer "exact" still verified locally.
+        let want = script_hash32(type_script);
+        Ok(cells
+            .into_iter()
+            .filter(|c| {
+                c.type_script()
+                    .map(|ts| script_hash32(&ts) == want)
+                    .unwrap_or(false)
+            })
+            .collect())
     }
 
     fn submit_transaction(&self, tx: &TransactionView) -> Result<Byte32, RpcError> {
@@ -719,7 +751,7 @@ mod tests {
         Script::new_builder()
             .code_hash(PROC_CODE.pack())
             .hash_type(ScriptHashType::Type.into())
-            .args(vec![unique; 32].pack())
+            .args([unique; 32].to_vec().pack())
             .build()
     }
 
@@ -773,6 +805,59 @@ mod tests {
         assert_eq!(cells[1].capacity(), 200);
         let i0: u32 = cells[0].out_point.index().unpack();
         assert_eq!(i0, 0);
+    }
+
+    #[test]
+    fn finds_code_cell_by_exact_type_id_script_with_pagination() {
+        use cid_backend_core::type_id::{type_id_script, TYPE_ID_CODE_HASH};
+        let args = [0x7eu8; 32];
+        let ts = type_id_script(&args);
+        let type_json = script_json(&ts);
+        let page = Arc::new(AtomicUsize::new(0));
+        let page2 = page.clone();
+        let url = spawn_mock(Arc::new(move |method, params| {
+            assert_eq!(method, "get_cells");
+            let key = &params[0];
+            assert_eq!(key["script_type"], "type");
+            assert_eq!(key["script_search_mode"], "exact");
+            assert_eq!(key["script"]["hash_type"], "type");
+            assert_eq!(
+                key["script"]["code_hash"].as_str().unwrap(),
+                hex_bytes(&TYPE_ID_CODE_HASH)
+            );
+            assert_eq!(key["script"]["args"].as_str().unwrap(), hex_bytes(&args));
+            let n = page2.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                // Full page then a short page — must not truncate.
+                let mut objs = Vec::new();
+                for i in 0..100 {
+                    objs.push(indexer_cell(
+                        0x10,
+                        i as u32,
+                        lock_json([0; 32], &[]),
+                        Some(type_json.clone()),
+                        1,
+                        &[0x7f],
+                    ));
+                }
+                Ok(json!({"objects": objs, "last_cursor": "0xc0ffee"}))
+            } else {
+                Ok(cells_result(vec![indexer_cell(
+                    0x11,
+                    0,
+                    lock_json([0; 32], &[]),
+                    Some(type_json.clone()),
+                    42,
+                    &[0x7f, b'E', b'L', b'F'],
+                )]))
+            }
+        }));
+        let rpc = CkbRpc::new(&url, &url);
+        let cells = rpc
+            .list_live_cells_by_type_script(&ts)
+            .expect("exact type-id search");
+        assert_eq!(cells.len(), 101);
+        assert_eq!(cells[100].capacity(), 42);
     }
 
     #[test]
@@ -1043,6 +1128,7 @@ mod tests {
             hash_type: ScriptHashType::Type,
             poll_interval: Duration::from_secs(1),
             extra_cell_deps: vec![],
+            type_id_code_deps: vec![],
             confirmation_depth: depth,
         }
     }
@@ -1292,6 +1378,7 @@ mod tests {
             hash_type: ScriptHashType::Type,
             poll_interval: Duration::from_secs(1),
             extra_cell_deps: vec![],
+            type_id_code_deps: vec![],
             confirmation_depth: 1,
         };
         let mut first = DigestLoop::new(
@@ -1316,6 +1403,7 @@ mod tests {
                 hash_type: ScriptHashType::Type,
                 poll_interval: Duration::from_secs(1),
                 extra_cell_deps: vec![],
+                type_id_code_deps: vec![],
                 confirmation_depth: 1,
             },
             ProcessResolver::new(),
@@ -1517,6 +1605,7 @@ mod tests {
             hash_type: ScriptHashType::Type,
             poll_interval: Duration::from_secs(1),
             extra_cell_deps: vec![],
+            type_id_code_deps: vec![],
             confirmation_depth: 1,
         };
         let mut loop_ = DigestLoop::new(

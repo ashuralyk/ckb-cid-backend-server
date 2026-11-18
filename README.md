@@ -62,7 +62,11 @@ cargo run -p cid-backend-daemon -- --config examples/cid.network.toml.example
 
 `--config PATH` wins over `CID_CONFIG`. If neither is set, behaviour is the previous env-only load (`DaemonConfig::from_vars`). Precedence: **built-in defaults < TOML file < explicit non-empty `CID_*` env**. Copy [`examples/cid.network.toml.example`](examples/cid.network.toml.example) and replace every `<PLACEHOLDER>` — that example is **not** valid hex/URLs and will not start.
 
-`network.name` is a **log label only**. `network.genesis_hash` is the declared chain identity (that node’s `get_block_hash("0x0")`). File mode **requires** it (or `CID_GENESIS_HASH`). It is **not** verified unless `network.validate_genesis = true` (or `CID_VALIDATE_GENESIS=true`), in which case the daemon fail-closes on RPC error or mismatch. Logs use `genesis_status=declared_unverified` or `genesis.verified` accordingly. Cell deps and Process prefixes are **never** auto-discovered.
+`network.name` is a **log label only**. `network.genesis_hash` is the declared chain identity (that node’s `get_block_hash("0x0")`). File mode **requires** it (or `CID_GENESIS_HASH`). It is **not** verified unless `network.validate_genesis = true` (or `CID_VALIDATE_GENESIS=true`), in which case the daemon fail-closes on RPC error or mismatch. Logs use `genesis_status=declared_unverified` or `genesis.verified` accordingly.
+
+**Type-ID code cells (preferred for `hash_type=type`):** configure `cid_lock.type_id_args` / `process.type_id_args` (and optional `process_lock.type_id_args`) — the 32-byte TYPE_ID **type-script args** on each **code** cell. Optional `type_id` is the full type-script hash for fail-closed verification; it is **not** args. The daemon derives `code_hash` for `hash_type=type`, finds the live code cell via indexer **exact** type-script search each tick, and merges those CellDeps into assemble. Missing / ambiguous / mismatched / transport errors skip the tick (retry next poll) and do **not** permanently reject Intentions. Dispatcher deployment JSON is never auto-loaded. Live Process **state** cells are still matched by CID args `process_type_hash` (full type script hash), which is distinct from the Process **code** cell TYPE_ID.
+
+Static `[[cell_deps]]` / `CID_*_CELL_DEP` remain for extras and local data1 fixtures (always-success, xUDT, etc.).
 
 `config.loaded` logs `rpc` / `indexer` as scheme+host+port only (userinfo and path/query stripped).
 
@@ -74,14 +78,20 @@ cargo run -p cid-backend-daemon -- --config examples/cid.network.toml.example
 |----------|---------------|-------------------|
 | `CID_CKB_RPC_URL` | required | Node JSON-RPC |
 | `CID_INDEXER_URL` | optional | Indexer JSON-RPC; empty uses `CID_CKB_RPC_URL` |
-| `CID_LOCK_CODE_HASH` | required | CID lock `code_hash`, 32-byte hex (`0x` optional) |
-| `CID_LOCK_HASH_TYPE` | optional | `type` (default) / `data` / `data1` / `data2` |
+| `CID_LOCK_CODE_HASH` | required unless Type-ID | CID lock `code_hash`, 32-byte hex (`0x` optional); derived when `CID_LOCK_TYPE_ID_ARGS` is set |
+| `CID_LOCK_HASH_TYPE` | optional | `type` (default) / `data` / `data1` / `data2`; Type-ID mode requires `type` |
+| `CID_LOCK_TYPE_ID_ARGS` | optional | 32-byte TYPE_ID args for CID lock **code** cell |
+| `CID_LOCK_TYPE_ID` | optional | Full type-script hash verify (not args) |
+| `CID_PROCESS_TYPE_ID_ARGS` | optional | TYPE_ID args for Process **code** cell |
+| `CID_PROCESS_TYPE_ID` | optional | Full type-script hash verify for Process code |
+| `CID_PROCESS_LOCK_TYPE_ID_ARGS` | optional | TYPE_ID args for Process lock code cell |
+| `CID_PROCESS_LOCK_TYPE_ID` | optional | Full type-script hash verify for Process lock code |
 | `CID_POLL_INTERVAL_SECS` | required | Seconds between ticks, integer **≥ 1** |
-| `CID_LOCK_CELL_DEP` | optional; **needed at run** to execute CID lock | `<tx_hash>:<index>` CID lock code cell (`DepType::Code`) |
-| `CID_PROCESS_CODE_CELL_DEP` | optional; **needed at run** to execute Process type | Process ELF (or other Process type) code cell |
-| `CID_PROCESS_LOCK_CELL_DEP` | optional; **needed at run** to spend Process lock | Process lock code cell (local-chain uses always-success) |
+| `CID_LOCK_CELL_DEP` | optional static | `<tx_hash>:<index>` when not using Type-ID discovery |
+| `CID_PROCESS_CODE_CELL_DEP` | optional static | Process type code cell outpoint (static mode) |
+| `CID_PROCESS_LOCK_CELL_DEP` | optional static | Process lock code cell (local-chain: always-success) |
 | `CID_EXTRA_CELL_DEPS` | optional | Extra `<tx_hash>:<index>` list, comma-separated |
-| `CID_PROCESS_CODE_HASH` | optional; **needed at run** to find Process cells | Indexer type-script **code_hash prefix** for the Process type. Must match that type script's `hash_type` (data1 local-chain: ELF **data** hash; type: Type-ID code hash — not always an ELF hash). CID args store `calc_script_hash`, which is **not** this prefix. Comma-separated list allowed |
+| `CID_PROCESS_CODE_HASH` | optional | Indexer type-script **code_hash prefix** for live Process cells; Type-ID mode auto-adds the derived Process code `type_id` |
 | `CID_HEALTH_BIND` | optional | `host:port` (e.g. `127.0.0.1:9100`); unset or empty **disables** HTTP |
 | `CID_CONFIRMATION_DEPTH` | optional | Blocks after a committed Execution Tx before settle; default **24**, must be **≥ 1** |
 | `CID_LOG_FORMAT` | optional | `json` (default) or `pretty` (`text` is an alias for pretty) |
@@ -90,9 +100,9 @@ cargo run -p cid-backend-daemon -- --config examples/cid.network.toml.example
 | `CID_VALIDATE_GENESIS` | optional | `true`/`false`; overrides `network.validate_genesis` |
 | `RUST_LOG` | optional | `tracing` EnvFilter, default `info` |
 
-Cell-dep format: `<tx_hash>:<index>`; index may be decimal or `0x` hex. The four cell-dep variables are merged into `LoopConfig.extra_cell_deps`. `assemble` uses that list as-is and **does not** auto-fill script deps.
+Cell-dep format: `<tx_hash>:<index>`; index may be decimal or `0x` hex. Static cell-dep variables merge into `LoopConfig.extra_cell_deps`. Type-ID deps are resolved each tick and merged first (deduped by outpoint).
 
-`CID_PROCESS_CODE_HASH` is not a local-chain-only switch. `CkbRpc::get_live_process_by_type_hash` always searches indexer type prefixes from that list (plus a prefix search on the args `process_type_hash` itself), then filters `calc_script_hash`. The args hash is a full script hash, so using it as a type `code_hash` prefix usually finds nothing — set the Process type's actual `code_hash`.
+`CID_PROCESS_CODE_HASH` is not a local-chain-only switch. `CkbRpc::get_live_process_by_type_hash` always searches indexer type prefixes from that list (plus a prefix search on the args `process_type_hash` itself), then filters `calc_script_hash`. The args hash is a full script hash, so using it as a type `code_hash` prefix usually finds nothing — set the Process type's actual `code_hash` (or use Process `type_id_args` so it is derived).
 
 The daemon does **not** read `CID_PROCESS_EXAMPLE_PATH` / `CID_LOCAL_CHAIN_E2E` (test fixture / local-chain E2E switch). Production Process binaries come only from live Process cell data. `CkbRpc` talks JSON-RPC to `CID_CKB_RPC_URL` / `CID_INDEXER_URL`; tests use in-memory `FakeRpc`.
 
@@ -100,10 +110,11 @@ The daemon does **not** read `CID_PROCESS_EXAMPLE_PATH` / `CID_LOCAL_CHAIN_E2E` 
 
 ```bash
 export CID_CKB_RPC_URL=http://127.0.0.1:8114
-export CID_LOCK_CODE_HASH=   # 32-byte hex
 export CID_POLL_INTERVAL_SECS=5
-# By deployment: CID_LOCK_CELL_DEP / CID_PROCESS_*_CELL_DEP / CID_PROCESS_CODE_HASH
-# (query prefix + script deps; assemble does not invent them). See docs/local-dev-chain.md
+# Type-ID (preferred on hash_type=type networks):
+#   CID_LOCK_TYPE_ID_ARGS / CID_PROCESS_TYPE_ID_ARGS (+ optional *_TYPE_ID)
+# Or legacy static: CID_LOCK_CODE_HASH + CID_*_CELL_DEP + CID_PROCESS_CODE_HASH
+# See docs/local-dev-chain.md for the local data1 fixture path.
 cargo run -p cid-backend-daemon
 # same settings in TOML: cargo run -p cid-backend-daemon -- --config path/to/cid.toml
 ```

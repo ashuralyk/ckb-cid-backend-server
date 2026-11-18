@@ -38,9 +38,7 @@ fn main() {
         }
     };
     cid_backend_daemon::logging::init_tracing_with(config.log_format);
-    let genesis_hex = config
-        .genesis_hash
-        .map(|g| format!("0x{}", hex::encode(g)));
+    let genesis_hex = config.genesis_hash.map(|g| format!("0x{}", hex::encode(g)));
     tracing::info!(
         target: "cid_backend",
         event = "config.loaded",
@@ -56,7 +54,8 @@ fn main() {
         },
         rpc = %rpc_endpoint_for_log(&config.node_url),
         indexer = %rpc_endpoint_for_log(&config.indexer_url),
-        cell_deps = config.extra_cell_deps.len(),
+        static_cell_deps = config.extra_cell_deps.len(),
+        type_id_code_deps = config.type_id_code_deps.len(),
         process_prefixes = config.process_type_code_hashes.len(),
     );
     let stats = Arc::new(DaemonStats::new());

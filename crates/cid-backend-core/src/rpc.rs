@@ -74,6 +74,14 @@ pub trait Rpc {
         process_type_hash: &[u8; 32],
     ) -> Result<Option<LiveCell>, RpcError>;
 
+    /// Live cells whose **type** script exactly matches `type_script`
+    /// (code_hash + hash_type + args). Used for TYPE_ID code-cell discovery;
+    /// hash-only prefix search is insufficient.
+    fn list_live_cells_by_type_script(
+        &self,
+        type_script: &Script,
+    ) -> Result<Vec<LiveCell>, RpcError>;
+
     fn submit_transaction(&self, tx: &TransactionView) -> Result<Byte32, RpcError>;
 
     fn get_transaction_status(&self, tx_hash: &Byte32) -> Result<TxStatus, RpcError>;
