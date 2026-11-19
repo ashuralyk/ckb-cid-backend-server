@@ -185,7 +185,7 @@ mod tests {
             loop_with_resolver_and_code(rpc, ssri, default_loop_config(), 13, code_args);
         let report = loop_.tick();
         assert_eq!(report.submitted, 1, "{:?}", report.last_error);
-        let seen = loop_.ssri().seen_binaries.borrow().clone();
+        let seen = loop_.ssri().seen_binaries.lock().unwrap().clone();
         assert!(seen.iter().any(|b| b == &code_elf));
         assert!(seen.iter().all(|b| b != &state_elf));
     }
@@ -212,7 +212,8 @@ mod tests {
         assert!(loop_
             .ssri()
             .seen_binaries
-            .borrow()
+            .lock()
+            .unwrap()
             .iter()
             .any(|b| b.last() == Some(&0x01)));
 
@@ -221,9 +222,11 @@ mod tests {
         loop_.rpc().insert_cell(code_v2.clone());
         let entry15 = fixture_process_entry_with_code(15, code_args);
         loop_.register_process(entry15.clone());
-        if let Some(w) = loop_.workers_mut().get_mut(&entry15.identity_type_hash) {
-            w.resolver =
-                ProcessResolver::for_entry(entry15).with_fallback_binary(FIXTURE_ELF.to_vec());
+        if let Some(w) = loop_.workers().get(&entry15.identity_type_hash) {
+            w.with_state_mut(|state| {
+                state.resolver =
+                    ProcessResolver::for_entry(entry15).with_fallback_binary(FIXTURE_ELF.to_vec());
+            });
         }
         let hash2 = process_type_hash(15);
         loop_
@@ -235,13 +238,14 @@ mod tests {
             vec![0x00],
             code_args,
         ));
-        loop_.ssri().seen_binaries.borrow_mut().clear();
+        loop_.ssri().seen_binaries.lock().unwrap().clear();
 
         assert_eq!(loop_.tick().submitted, 1);
         assert!(loop_
             .ssri()
             .seen_binaries
-            .borrow()
+            .lock()
+            .unwrap()
             .iter()
             .any(|b| b.last() == Some(&0x02)));
     }

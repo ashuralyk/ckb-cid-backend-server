@@ -5,8 +5,8 @@
 //! spawn/stop commands for the digest loop.
 
 use cid_backend_core::{
-    type_id_script_hash, ProcessRegistration, ProcessRegistry, RegisterOutcome, RegistryError,
-    WorkerCommand,
+    type_id_script_hash, ProcessBusyMap, ProcessRegistration, ProcessRegistry, RegisterOutcome,
+    RegistryError, WorkerCommand,
 };
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
@@ -25,6 +25,8 @@ const MAX_API_WORKERS: usize = 32;
 pub struct RegistryApiState {
     pub registry: Arc<Mutex<ProcessRegistry>>,
     pub worker_cmds: Arc<Mutex<Vec<WorkerCommand>>>,
+    /// Shared with the digest loop for pending/idle checks (P1-6).
+    pub busy: ProcessBusyMap,
 }
 
 pub struct RegistryApiHandle {
@@ -233,9 +235,24 @@ fn register_process(
             return Ok(bad_request(format!("{e}\n").as_bytes()));
         }
     };
+    // Single critical section: registry persist + worker-cmd enqueue (P0-2).
+    // Lock order: registry → workers → worker_cmds.
     let outcome = {
         let mut reg = state.registry.lock().map_err(|_| ())?;
-        match reg.register(reg_entry.clone()) {
+        let hash = reg_entry.identity_type_hash();
+        if let Some(existing) = reg.get(&hash) {
+            let code_changing = existing.code_type_id_args != reg_entry.code_type_id_args
+                || existing.code_type_id != reg_entry.code_type_id;
+            if code_changing && state.busy.is_pending(&hash) {
+                return Ok((
+                    409,
+                    "Conflict",
+                    "text/plain; charset=utf-8",
+                    b"process has in-flight submits; defer code re-bind until idle\n".to_vec(),
+                ));
+            }
+        }
+        let outcome = match reg.register(reg_entry.clone()) {
             Ok(o) => o,
             Err(RegistryError::Full) => {
                 return Ok((
@@ -246,11 +263,18 @@ fn register_process(
                 ));
             }
             Err(e) => return Ok(bad_request(format!("{e}\n").as_bytes())),
-        }
-    };
-    if let Ok(mut q) = state.worker_cmds.lock() {
+        };
+        let mut q = state.worker_cmds.lock().map_err(|_| ())?;
+        // Cancel pending deletes for this identity before enqueueing Register (P0-1).
+        q.retain(|c| {
+            !matches!(
+                c,
+                WorkerCommand::Delete { hash: h, .. } if *h == hash
+            )
+        });
         q.push(WorkerCommand::Register(entry));
-    }
+        outcome
+    };
     let hash = reg_entry.identity_type_hash();
     tracing::info!(
         target: "cid_backend",
@@ -279,9 +303,8 @@ fn delete_process(
         if !reg.delete(&hash).map_err(|_| ())? {
             return Ok(not_found());
         }
-    }
-    if let Ok(mut q) = state.worker_cmds.lock() {
-        q.push(WorkerCommand::Delete(hash));
+        let mut q = state.worker_cmds.lock().map_err(|_| ())?;
+        q.push(WorkerCommand::delete(hash));
     }
     tracing::info!(
         target: "cid_backend",
@@ -538,6 +561,7 @@ mod tests {
         let state = RegistryApiState {
             registry: Arc::new(Mutex::new(reg)),
             worker_cmds: Arc::new(Mutex::new(Vec::new())),
+            busy: ProcessBusyMap::new(),
         };
         let handle = spawn_registry_api("127.0.0.1:0".parse().unwrap(), state.clone()).unwrap();
         std::thread::sleep(Duration::from_millis(50));
@@ -593,6 +617,7 @@ mod tests {
         let state = RegistryApiState {
             registry: Arc::new(Mutex::new(reg)),
             worker_cmds: Arc::new(Mutex::new(Vec::new())),
+            busy: ProcessBusyMap::new(),
         };
         let handle = spawn_registry_api("127.0.0.1:0".parse().unwrap(), state).unwrap();
         std::thread::sleep(Duration::from_millis(50));

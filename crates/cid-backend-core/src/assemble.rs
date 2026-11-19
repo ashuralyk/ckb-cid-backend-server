@@ -122,15 +122,49 @@ pub fn validate_assembled_tx(
         ));
     }
 
+    // Every draft input (intentions + process state) must appear; reject extras
+    // that were not part of the pre-formed draft (P1-8).
+    let mut expected: Vec<ckb_types::packed::OutPoint> =
+        intentions.iter().map(|i| i.out_point.clone()).collect();
+    expected.push(process.live_cell.out_point.clone());
+    if inputs.len() != expected.len() {
+        return Err(AssembleError::InvalidAssembled(format!(
+            "assembled input count {} != draft input count {}",
+            inputs.len(),
+            expected.len()
+        )));
+    }
+    for op in &expected {
+        if !inputs.iter().any(|i| i.as_slice() == op.as_slice()) {
+            return Err(AssembleError::InvalidAssembled(
+                "assembled inputs missing a draft out_point".into(),
+            ));
+        }
+    }
+    for op in &inputs {
+        if !expected.iter().any(|e| e.as_slice() == op.as_slice()) {
+            return Err(AssembleError::InvalidAssembled(
+                "assembled inputs include out_point not in draft".into(),
+            ));
+        }
+    }
+
+    let proc_lock = process.live_cell.lock();
     let has_process_recreate = assembled.outputs.iter().any(|out| {
-        out.type_()
+        let type_ok = out
+            .type_()
             .to_opt()
             .map(|t| script_hash32(&t) == process.type_hash)
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if !type_ok {
+            return false;
+        }
+        // Lock + type continuity for TYPE_ID recreate (P1-8).
+        out.lock().as_slice() == proc_lock.as_slice()
     });
     if !has_process_recreate {
         return Err(AssembleError::InvalidAssembled(
-            "missing process recreate output with matching TYPE_ID type hash".into(),
+            "missing process recreate output with matching TYPE_ID type hash and lock".into(),
         ));
     }
 

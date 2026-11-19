@@ -165,6 +165,7 @@ pub struct ProcessRegistry {
 impl ProcessRegistry {
     pub fn open(path: impl AsRef<Path>, max_entries: usize) -> Result<Self, RegistryError> {
         let path = path.as_ref().to_path_buf();
+        Self::clean_orphan_tmp(&path);
         let by_identity = if path.exists() {
             load_from_disk(&path)?
         } else {
@@ -231,17 +232,39 @@ impl ProcessRegistry {
                 RegisterOutcome::Updated
             }
         };
-        self.by_identity.insert(key, reg);
-        self.persist()?;
+        let previous = self.by_identity.insert(key, reg);
+        if let Err(e) = self.persist() {
+            // Roll back in-memory state on persist failure (P1-5).
+            match previous {
+                Some(prev) => {
+                    self.by_identity.insert(key, prev);
+                }
+                None => {
+                    self.by_identity.remove(&key);
+                }
+            }
+            return Err(e);
+        }
         Ok(outcome)
     }
 
     pub fn delete(&mut self, identity_hash: &[u8; 32]) -> Result<bool, RegistryError> {
-        let removed = self.by_identity.remove(identity_hash).is_some();
-        if removed {
-            self.persist()?;
+        let Some(removed) = self.by_identity.remove(identity_hash) else {
+            return Ok(false);
+        };
+        if let Err(e) = self.persist() {
+            self.by_identity.insert(*identity_hash, removed);
+            return Err(e);
         }
-        Ok(removed)
+        Ok(true)
+    }
+
+    /// Remove orphan `*.tmp` siblings left by a crashed persist (P3-16).
+    pub fn clean_orphan_tmp(path: &Path) {
+        let tmp = tmp_path(path);
+        if tmp.exists() {
+            let _ = fs::remove_file(&tmp);
+        }
     }
 
     fn persist(&self) -> Result<(), RegistryError> {
@@ -257,13 +280,22 @@ impl ProcessRegistry {
         };
         let json = serde_json::to_string_pretty(&doc)
             .map_err(|e| RegistryError::Corrupt(e.to_string()))?;
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         let tmp = tmp_path(&self.path);
         {
             let mut f = fs::File::create(&tmp)?;
             f.write_all(json.as_bytes())?;
             f.sync_all()?;
         }
-        fs::rename(tmp, &self.path)?;
+        fs::rename(&tmp, &self.path)?;
+        // Fsync parent directory so the rename itself is durable (P2-9).
+        if let Some(parent) = self.path.parent() {
+            if let Ok(dir) = fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
         Ok(())
     }
 }

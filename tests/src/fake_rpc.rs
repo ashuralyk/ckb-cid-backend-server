@@ -1,5 +1,5 @@
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 
 use cid_backend_core::host_query::HostQueryRpc;
 use cid_backend_core::rpc::{out_point_key, script_hash32, LiveCell, Rpc, RpcError, TxStatus};
@@ -30,18 +30,18 @@ struct Inner {
 }
 
 pub struct FakeRpc {
-    inner: RefCell<Inner>,
+    inner: Mutex<Inner>,
 }
 
 impl FakeRpc {
     pub fn new() -> Self {
         Self {
-            inner: RefCell::new(Inner::default()),
+            inner: Mutex::new(Inner::default()),
         }
     }
 
     pub fn insert_cell(&self, cell: LiveCell) {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.lock().unwrap();
         let key = out_point_key(&cell.out_point);
         if !inner.cells.contains_key(&key) {
             inner.order.push(cell.out_point.clone());
@@ -50,98 +50,99 @@ impl FakeRpc {
     }
 
     pub fn consume(&self, op: &OutPoint) {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.lock().unwrap();
         inner.cells.remove(&out_point_key(op));
         inner.order.retain(|o| o.as_slice() != op.as_slice());
     }
 
     pub fn inject_conflict_once(&self) {
-        self.inner.borrow_mut().fail_next_submit = true;
+        self.inner.lock().unwrap().fail_next_submit = true;
     }
 
     /// Submit succeeds but leaves inputs live and does not apply outputs (indexer lag / mempool).
     pub fn defer_commit(&self) {
-        self.inner.borrow_mut().defer_commit = true;
+        self.inner.lock().unwrap().defer_commit = true;
     }
 
     /// `get_transaction_status` returns Unavailable until restored (occupancy must be held).
     pub fn fail_status_queries(&self) {
-        self.inner.borrow_mut().fail_status_queries = true;
+        self.inner.lock().unwrap().fail_status_queries = true;
     }
 
     pub fn restore_status_queries(&self) {
-        self.inner.borrow_mut().fail_status_queries = false;
+        self.inner.lock().unwrap().fail_status_queries = false;
     }
 
     /// Next `submit_transaction` returns `SubmitRejected` (permanent for those cells).
     pub fn inject_reject_once(&self) {
-        self.inner.borrow_mut().reject_next_submit = true;
+        self.inner.lock().unwrap().reject_next_submit = true;
     }
 
     /// Next `dry_run_transaction` returns `SubmitRejected` (combo blacklist path).
     pub fn inject_dry_run_reject_once(&self) {
-        self.inner.borrow_mut().reject_next_dry_run = true;
+        self.inner.lock().unwrap().reject_next_dry_run = true;
     }
 
     /// Every submit that spends `op` returns `SubmitRejected` (A-fails / B-succeeds).
     pub fn reject_when_consuming(&self, op: &OutPoint) {
         self.inner
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .reject_inputs
             .insert(out_point_key(op));
     }
 
     /// Count of `submit_transaction` calls, including injected failures.
     pub fn submit_attempts(&self) -> usize {
-        self.inner.borrow().submit_attempts
+        self.inner.lock().unwrap().submit_attempts
     }
 
     pub fn dry_run_attempts(&self) -> usize {
-        self.inner.borrow().dry_run_attempts
+        self.inner.lock().unwrap().dry_run_attempts
     }
 
     /// Next `submit_transaction` returns `Unavailable` (transient).
     pub fn inject_unavailable_submit_once(&self) {
-        self.inner.borrow_mut().unavailable_next_submit = true;
+        self.inner.lock().unwrap().unavailable_next_submit = true;
     }
 
     pub fn tip(&self) -> u64 {
-        self.inner.borrow().tip
+        self.inner.lock().unwrap().tip
     }
 
     pub fn set_tip(&self, n: u64) {
-        self.inner.borrow_mut().tip = n;
+        self.inner.lock().unwrap().tip = n;
     }
 
     pub fn advance_tip(&self, delta: u64) {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.lock().unwrap();
         inner.tip = inner.tip.saturating_add(delta);
     }
 
     pub fn fail_tip_queries(&self) {
-        self.inner.borrow_mut().fail_tip_queries = true;
+        self.inner.lock().unwrap().fail_tip_queries = true;
     }
 
     pub fn restore_tip_queries(&self) {
-        self.inner.borrow_mut().fail_tip_queries = false;
+        self.inner.lock().unwrap().fail_tip_queries = false;
     }
 
     /// Next `list_live_cells_by_type_script` returns Unavailable.
     pub fn fail_type_script_queries(&self) {
-        self.inner.borrow_mut().fail_type_script_queries = true;
+        self.inner.lock().unwrap().fail_type_script_queries = true;
     }
 
     pub fn restore_type_script_queries(&self) {
-        self.inner.borrow_mut().fail_type_script_queries = false;
+        self.inner.lock().unwrap().fail_type_script_queries = false;
     }
 
     /// Next `get_transaction_status` rewinds the tip first (stale-tip settle).
     pub fn rewind_tip_on_next_status(&self, new_tip: u64) {
-        self.inner.borrow_mut().rewind_tip_on_status = Some(new_tip);
+        self.inner.lock().unwrap().rewind_tip_on_status = Some(new_tip);
     }
 
     pub fn live_cells(&self) -> Vec<LiveCell> {
-        let inner = self.inner.borrow();
+        let inner = self.inner.lock().unwrap();
         inner
             .order
             .iter()
@@ -150,17 +151,17 @@ impl FakeRpc {
     }
 
     pub fn has_cell(&self, op: &OutPoint) -> bool {
-        self.inner.borrow().cells.contains_key(&out_point_key(op))
+        self.inner.lock().unwrap().cells.contains_key(&out_point_key(op))
     }
 
     pub fn submitted(&self) -> Vec<TransactionView> {
-        self.inner.borrow().submitted.clone()
+        self.inner.lock().unwrap().submitted.clone()
     }
 
     /// Restore consumed inputs of `tx_hash`, drop its outputs, and mark the tx Dropped.
     /// Models a pool eviction after `submit_transaction` succeeded.
     pub fn simulate_drop(&self, tx_hash: &Byte32) {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.lock().unwrap();
         let key = tx_hash.as_slice().to_vec();
         inner.order.retain(|op| op.tx_hash() != *tx_hash);
         inner
@@ -182,7 +183,7 @@ impl FakeRpc {
     /// their inputs restored (reorg of confirming/committed txs).
     pub fn simulate_reorg(&self, new_tip: u64) {
         let to_drop: Vec<Byte32> = {
-            let inner = self.inner.borrow();
+            let inner = self.inner.lock().unwrap();
             inner
                 .tx_status
                 .iter()
@@ -194,7 +195,7 @@ impl FakeRpc {
                 })
                 .collect()
         };
-        self.inner.borrow_mut().tip = new_tip;
+        self.inner.lock().unwrap().tip = new_tip;
         for hash in to_drop {
             self.simulate_drop(&hash);
         }
@@ -202,7 +203,7 @@ impl FakeRpc {
 
     /// Apply a previously deferred submit: consume inputs and create outputs.
     pub fn commit_pending(&self, tx_hash: &Byte32) {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.lock().unwrap();
         let key = tx_hash.as_slice().to_vec();
         if inner.tx_status.get(&key) != Some(&TxStatus::Pending) {
             return;
@@ -262,7 +263,7 @@ impl Rpc for FakeRpc {
         hash_type: ScriptHashType,
     ) -> Result<Vec<LiveCell>, RpcError> {
         let expected_ht: ckb_types::packed::Byte = hash_type.into();
-        let inner = self.inner.borrow();
+        let inner = self.inner.lock().unwrap();
         let mut out = Vec::new();
         for op in &inner.order {
             let Some(cell) = inner.cells.get(&out_point_key(op)) else {
@@ -281,7 +282,7 @@ impl Rpc for FakeRpc {
         &self,
         process_type_hash: &[u8; 32],
     ) -> Result<Option<LiveCell>, RpcError> {
-        let inner = self.inner.borrow();
+        let inner = self.inner.lock().unwrap();
         for op in &inner.order {
             let Some(cell) = inner.cells.get(&out_point_key(op)) else {
                 continue;
@@ -300,7 +301,7 @@ impl Rpc for FakeRpc {
         type_script: &Script,
         max_results: usize,
     ) -> Result<Vec<LiveCell>, RpcError> {
-        let inner = self.inner.borrow();
+        let inner = self.inner.lock().unwrap();
         if inner.fail_type_script_queries {
             return Err(RpcError::Unavailable(
                 "injected type-script query unavailable".into(),
@@ -325,7 +326,7 @@ impl Rpc for FakeRpc {
     }
 
     fn dry_run_transaction(&self, _tx: &TransactionView) -> Result<(), RpcError> {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.lock().unwrap();
         inner.dry_run_attempts += 1;
         if inner.reject_next_dry_run {
             inner.reject_next_dry_run = false;
@@ -335,7 +336,7 @@ impl Rpc for FakeRpc {
     }
 
     fn submit_transaction(&self, tx: &TransactionView) -> Result<Byte32, RpcError> {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.lock().unwrap();
         inner.submit_attempts += 1;
         if inner.unavailable_next_submit {
             inner.unavailable_next_submit = false;
@@ -391,7 +392,7 @@ impl Rpc for FakeRpc {
     }
 
     fn get_transaction_status(&self, tx_hash: &Byte32) -> Result<TxStatus, RpcError> {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.lock().unwrap();
         if let Some(t) = inner.rewind_tip_on_status.take() {
             inner.tip = t;
         }
@@ -406,7 +407,7 @@ impl Rpc for FakeRpc {
     }
 
     fn tip_block_number(&self) -> Result<u64, RpcError> {
-        let inner = self.inner.borrow();
+        let inner = self.inner.lock().unwrap();
         if inner.fail_tip_queries {
             return Err(RpcError::Unavailable("injected tip unavailable".into()));
         }
@@ -416,12 +417,12 @@ impl Rpc for FakeRpc {
 
 impl HostQueryRpc for FakeRpc {
     fn get_live_cell(&self, out_point: &OutPoint) -> Result<Option<LiveCell>, RpcError> {
-        let inner = self.inner.borrow();
+        let inner = self.inner.lock().unwrap();
         Ok(inner.cells.get(&out_point_key(out_point)).cloned())
     }
 
     fn get_block_hash(&self, number: u64) -> Result<Option<[u8; 32]>, RpcError> {
-        let inner = self.inner.borrow();
+        let inner = self.inner.lock().unwrap();
         if inner.fail_tip_queries {
             return Err(RpcError::Unavailable("injected tip unavailable".into()));
         }

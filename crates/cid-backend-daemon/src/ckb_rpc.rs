@@ -1047,10 +1047,12 @@ mod tests {
 
     const PROC_CODE_ARGS: [u8; 32] = [0xCDu8; 32];
 
-    fn register_fixture_process<R: Rpc + HostQueryRpc, C: Clock, S: SsriHost>(
-        loop_: &mut DigestLoop<R, C, S>,
-        unique: u8,
-    ) {
+    fn register_fixture_process<R, C, S>(loop_: &mut DigestLoop<R, C, S>, unique: u8)
+    where
+        R: Rpc + HostQueryRpc + Send + Sync + 'static,
+        C: Clock,
+        S: SsriHost + Send + Sync + 'static,
+    {
         let identity = cid_backend_core::TypeIdIdentity::new([unique; 32]);
         let code = cid_backend_core::TypeIdIdentity::new(PROC_CODE_ARGS);
         let entry = cid_backend_core::ProcessEntry {
@@ -1061,9 +1063,11 @@ mod tests {
         };
         let hash = entry.identity_type_hash;
         loop_.register_process(entry.clone());
-        if let Some(w) = loop_.workers_mut().get_mut(&hash) {
-            w.resolver = cid_backend_core::ProcessResolver::for_entry(entry)
-                .with_fallback_binary(vec![0x7f, b'E', b'L', b'F', 1]);
+        if let Some(w) = loop_.workers().get(&hash) {
+            w.with_state_mut(|state| {
+                state.resolver = cid_backend_core::ProcessResolver::for_entry(entry)
+                    .with_fallback_binary(vec![0x7f, b'E', b'L', b'F', 1]);
+            });
         }
     }
 

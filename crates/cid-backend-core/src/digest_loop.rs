@@ -1,17 +1,14 @@
-use crate::assemble::{
-    assemble_digest_incompatible, execution_from_assembled, validate_assembled_tx, AssembleError,
-};
 use crate::code_deps::{resolve_execution_cell_deps, resolve_type_id_code_cell, CodeDepError};
 use crate::fee::CidLockIdentity;
-use crate::host_query::{seed_host_for_batch, HostQueryError, HostQueryRpc};
+use crate::host_query::HostQueryRpc;
 use crate::process::{ProcessEntry, ProcessResolver, ResolvedProcess};
+use crate::process_batch::{self, BatchOutcome, BatchReportDelta};
 use crate::rpc::{out_point_key, Rpc, RpcError, TxStatus};
 use crate::scan::{bucket_by_process_type_hash, scan_intentions_multi, ScannedIntention};
-use crate::ssri::{build_batch_draft, draft_cells_for_batch, SsriError, SsriHost};
-use crate::submit::{
-    combo_fingerprint, dry_run_gate, execution_code_key, submit_execution, DryRunGate, SubmitState,
-};
+use crate::ssri::{SsriError, SsriHost};
+use crate::submit::{combo_fingerprint, execution_code_key, SubmitState};
 use crate::type_id::TypeIdCodeDep;
+use crate::process_busy::ProcessBusyMap;
 use crate::workers::{WorkerPool, WorkerRemoveError};
 use ckb_types::core::ScriptHashType;
 use ckb_types::packed::{Byte32, CellDep};
@@ -90,21 +87,6 @@ pub struct TickReport {
     pub isolate_windows: usize,
 }
 
-enum BatchOutcome {
-    /// digest_ok submitted; Process input is occupied until settlement.
-    SubmittedProcess,
-    /// Submitted without spending Process (User Lock refund).
-    Submitted,
-    /// `SubmitRejected` for this exact Intention combo (caller isolates).
-    Rejected,
-    /// Combo already in `rejected_combos`; isolate without a new submit.
-    CachedRejected,
-    /// Conflict / Unavailable / assemble skip: remaining items may continue.
-    Continue,
-    /// Process recreate already occupied; stop digest_ok this tick.
-    ProcessOccupied,
-}
-
 pub trait Clock {
     fn sleep(&self, duration: Duration);
 }
@@ -127,40 +109,63 @@ impl Clock for RealClock {
 #[derive(Clone, Debug)]
 pub enum WorkerCommand {
     Register(ProcessEntry),
-    Delete([u8; 32]),
+    /// Disable Process. `generation` stamps the worker epoch when delete was
+    /// first deferred (`None` = fresh API delete). Re-register bumps generation
+    /// so a stale deferred delete is a no-op (P0-1).
+    Delete {
+        hash: [u8; 32],
+        generation: Option<u64>,
+    },
 }
 
-pub struct DigestLoop<R: Rpc + HostQueryRpc, C: Clock, S: SsriHost> {
-    rpc: R,
+impl WorkerCommand {
+    pub fn delete(hash: [u8; 32]) -> Self {
+        Self::Delete {
+            hash,
+            generation: None,
+        }
+    }
+}
+
+pub struct DigestLoop<R, C, S>
+where
+    R: Rpc + HostQueryRpc + Send + Sync + 'static,
+    C: Clock,
+    S: SsriHost + Send + Sync + 'static,
+{
+    rpc: Arc<R>,
     clock: C,
-    ssri: S,
+    ssri: Arc<S>,
     config: LoopConfig,
-    workers: WorkerPool,
+    workers: WorkerPool<R, S>,
     /// Optional shared command queue for live registry API updates.
     worker_cmds: Option<Arc<Mutex<Vec<WorkerCommand>>>>,
+    /// Optional shared pending map for registry API code-rebind checks (P1-6).
+    busy: Option<ProcessBusyMap>,
     last_tip: Option<u64>,
     tick_cell_deps: Vec<CellDep>,
     execution_code_key: Vec<u8>,
 }
 
-impl<R: Rpc + HostQueryRpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
+impl<R, C, S> DigestLoop<R, C, S>
+where
+    R: Rpc + HostQueryRpc + Send + Sync + 'static,
+    C: Clock,
+    S: SsriHost + Send + Sync + 'static,
+{
     pub fn new(rpc: R, clock: C, ssri: S, config: LoopConfig) -> Self {
-        Self::with_workers(
-            rpc,
-            clock,
-            ssri,
-            config,
-            WorkerPool::from_entries(vec![]),
-            None,
-        )
+        let rpc = Arc::new(rpc);
+        let ssri = Arc::new(ssri);
+        let workers = WorkerPool::new(rpc.clone(), ssri.clone());
+        Self::with_workers(rpc, clock, ssri, config, workers, None)
     }
 
     pub fn with_workers(
-        rpc: R,
+        rpc: Arc<R>,
         clock: C,
-        ssri: S,
+        ssri: Arc<S>,
         config: LoopConfig,
-        workers: WorkerPool,
+        workers: WorkerPool<R, S>,
         worker_cmds: Option<Arc<Mutex<Vec<WorkerCommand>>>>,
     ) -> Self {
         Self {
@@ -170,10 +175,29 @@ impl<R: Rpc + HostQueryRpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
             config,
             workers,
             worker_cmds,
+            busy: None,
             last_tip: None,
             tick_cell_deps: Vec::new(),
             execution_code_key: Vec::new(),
         }
+    }
+
+    pub fn with_workers_owned(
+        rpc: R,
+        clock: C,
+        ssri: S,
+        config: LoopConfig,
+        workers: WorkerPool<R, S>,
+        worker_cmds: Option<Arc<Mutex<Vec<WorkerCommand>>>>,
+    ) -> Self {
+        let rpc = Arc::new(rpc);
+        let ssri = Arc::new(ssri);
+        Self::with_workers(rpc, clock, ssri, config, workers, worker_cmds)
+    }
+
+    pub fn with_busy_map(mut self, busy: ProcessBusyMap) -> Self {
+        self.busy = Some(busy);
+        self
     }
 
     /// Seed one worker from `resolver` (tests / local fixtures).
@@ -186,26 +210,28 @@ impl<R: Rpc + HostQueryRpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
     ) -> Self {
         let entry = resolver.entry().clone();
         let hash = entry.identity_type_hash;
-        let mut pool = WorkerPool::from_entries(vec![entry]);
-        if let Some(w) = pool.get_mut(&hash) {
-            w.resolver = resolver;
+        let rpc = Arc::new(rpc);
+        let ssri = Arc::new(ssri);
+        let mut pool = WorkerPool::from_entries(vec![entry], rpc.clone(), ssri.clone());
+        if let Some(w) = pool.get(&hash) {
+            w.with_state_mut(|state| state.resolver = resolver);
         }
         Self::with_workers(rpc, clock, ssri, config, pool, None)
     }
 
     pub fn rpc(&self) -> &R {
-        &self.rpc
+        self.rpc.as_ref()
     }
 
     pub fn ssri(&self) -> &S {
-        &self.ssri
+        self.ssri.as_ref()
     }
 
-    pub fn workers(&self) -> &WorkerPool {
+    pub fn workers(&self) -> &WorkerPool<R, S> {
         &self.workers
     }
 
-    pub fn workers_mut(&mut self) -> &mut WorkerPool {
+    pub fn workers_mut(&mut self) -> &mut WorkerPool<R, S> {
         &mut self.workers
     }
 
@@ -231,9 +257,9 @@ impl<R: Rpc + HostQueryRpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
     pub fn unregister_process(
         &mut self,
         hash: &[u8; 32],
-    ) -> Result<Option<crate::workers::ProcessWorker>, WorkerRemoveError> {
+    ) -> Result<bool, WorkerRemoveError> {
         let removed = self.workers.try_remove(hash)?;
-        if removed.is_some() {
+        if removed {
             tracing::info!(
                 target: LOG_TARGET,
                 event = "process.disabled",
@@ -247,44 +273,87 @@ impl<R: Rpc + HostQueryRpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
         let Some(cmds) = &self.worker_cmds else {
             return;
         };
-        let batch = std::mem::take(&mut *cmds.lock().unwrap_or_else(|e| e.into_inner()));
+        // Fail closed on poisoned queue (P2-10).
+        let batch = match cmds.lock() {
+            Ok(mut g) => std::mem::take(&mut *g),
+            Err(_) => {
+                tracing::error!(target: LOG_TARGET, event = "worker_cmds.poisoned");
+                return;
+            }
+        };
         let mut requeue = Vec::new();
         for cmd in batch {
             match cmd {
                 WorkerCommand::Register(entry) => {
+                    let hash = entry.identity_type_hash;
                     let _ = self.register_process(entry);
+                    requeue.retain(|c| {
+                        !matches!(c, WorkerCommand::Delete { hash: h, .. } if *h == hash)
+                    });
                 }
-                WorkerCommand::Delete(hash) => match self.workers.try_remove(&hash) {
-                    Ok(Some(_)) => {
-                        tracing::info!(
-                            target: LOG_TARGET,
-                            event = "process.disabled",
-                            process_type_hash = %hex_pref(&hash),
-                        );
+                WorkerCommand::Delete { hash, generation } => {
+                    if let Some(want) = generation {
+                        if self.workers.generation(&hash) != Some(want) {
+                            tracing::info!(
+                                target: LOG_TARGET,
+                                event = "process.delete_stale",
+                                process_type_hash = %hex_pref(&hash),
+                            );
+                            continue;
+                        }
                     }
-                    Ok(None) => {}
-                    Err(WorkerRemoveError::InFlight) => {
-                        requeue.push(WorkerCommand::Delete(hash));
-                        tracing::info!(
-                            target: LOG_TARGET,
-                            event = "process.delete_deferred",
-                            process_type_hash = %hex_pref(&hash),
-                        );
+                    match self.workers.try_remove(&hash) {
+                        Ok(true) => {
+                            tracing::info!(
+                                target: LOG_TARGET,
+                                event = "process.disabled",
+                                process_type_hash = %hex_pref(&hash),
+                            );
+                        }
+                        Ok(false) => {}
+                        Err(WorkerRemoveError::InFlight) => {
+                            let gen = generation.or_else(|| self.workers.generation(&hash));
+                            requeue.push(WorkerCommand::Delete {
+                                hash,
+                                generation: gen,
+                            });
+                            tracing::info!(
+                                target: LOG_TARGET,
+                                event = "process.delete_deferred",
+                                process_type_hash = %hex_pref(&hash),
+                            );
+                        }
                     }
-                },
+                }
             }
         }
         if !requeue.is_empty() {
             if let Some(q) = &self.worker_cmds {
-                q.lock().unwrap_or_else(|e| e.into_inner()).extend(requeue);
+                match q.lock() {
+                    Ok(mut g) => g.extend(requeue),
+                    Err(_) => {
+                        tracing::error!(
+                            target: LOG_TARGET,
+                            event = "worker_cmds.poisoned_requeue",
+                        );
+                    }
+                }
             }
+        }
+    }
+
+    fn sync_busy_map(&self) {
+        if let Some(busy) = &self.busy {
+            busy.set_pending(self.workers.pending_hashes());
         }
     }
 
     pub fn state(&self) -> LoopState {
         let hashes = self.workers.hashes();
         let submit = if hashes.len() == 1 {
-            self.workers.get(&hashes[0]).map(|w| w.submit.clone())
+            self.workers
+                .get(&hashes[0])
+                .map(|w| w.with_state(|s| s.submit.clone()))
         } else {
             None
         };
@@ -351,8 +420,10 @@ impl<R: Rpc + HostQueryRpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
         if code_key != self.execution_code_key {
             if !self.execution_code_key.is_empty() || !code_key.is_empty() {
                 self.workers.for_each_mut(|w| {
-                    w.submit.rejected_combos.clear();
-                    w.isolate_expanded.clear();
+                    w.with_state_mut(|state| {
+                        state.submit.rejected_combos.clear();
+                        state.isolate_expanded.clear();
+                    });
                 });
             }
             self.execution_code_key = code_key;
@@ -367,7 +438,7 @@ impl<R: Rpc + HostQueryRpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
             .into_iter()
             .map(|id| (id.code_hash, id.hash_type))
             .collect();
-        let scanned = match scan_intentions_multi(&self.rpc, &scan_ids) {
+        let scanned = match scan_intentions_multi(self.rpc.as_ref(), &scan_ids) {
             Ok(v) => v,
             Err(RpcError::Unavailable(m)) => {
                 tracing::warn!(
@@ -401,10 +472,12 @@ impl<R: Rpc + HostQueryRpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
             .collect();
 
         self.workers.for_each_mut(|w| {
-            let pending_occupied = w.submit.pending_occupied_keys();
-            w.submit.in_flight.retain(|k| {
-                (live_keys.contains(k) || pending_occupied.contains(k))
-                    && !w.submit.rejected.contains(k)
+            w.with_state_mut(|state| {
+                let pending_occupied = state.submit.pending_occupied_keys();
+                state.submit.in_flight.retain(|k| {
+                    (live_keys.contains(k) || pending_occupied.contains(k))
+                        && !state.submit.rejected.contains(k)
+                });
             });
         });
 
@@ -420,11 +493,12 @@ impl<R: Rpc + HostQueryRpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                 continue;
             }
             let k = out_point_key(&i.out_point);
-            let w = self
+            let blocked = self
                 .workers
                 .get(&i.args.process_type_hash)
-                .expect("checked");
-            if w.submit.in_flight.contains(&k) || w.submit.rejected.contains(&k) {
+                .expect("checked")
+                .with_state(|w| w.submit.in_flight.contains(&k) || w.submit.rejected.contains(&k));
+            if blocked {
                 continue;
             }
             eligible.push(i);
@@ -436,6 +510,7 @@ impl<R: Rpc + HostQueryRpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
 
         self.tick_cell_deps.clear();
         self.clear_worker_tick_code();
+        self.sync_busy_map();
         report
     }
 
@@ -444,14 +519,18 @@ impl<R: Rpc + HostQueryRpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
             .workers
             .hashes()
             .into_iter()
-            .filter_map(|h| self.workers.get(&h).map(|w| (h, w.entry.code.clone())))
+            .filter_map(|h| {
+                self.workers
+                    .get(&h)
+                    .map(|w| (h, w.with_state(|s| s.entry.code.clone())))
+            })
             .collect();
         for (identity_hash, code) in snapshots {
             let spec = TypeIdCodeDep {
                 label: format!("worker_code_{}", hex_pref(&identity_hash)),
                 identity: code,
             };
-            let code_cell = match resolve_type_id_code_cell(&self.rpc, &spec) {
+            let code_cell = match resolve_type_id_code_cell(self.rpc.as_ref(), &spec) {
                 Ok(r) => Some(r.cell),
                 Err(e) => {
                     tracing::warn!(
@@ -463,15 +542,16 @@ impl<R: Rpc + HostQueryRpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                     None
                 }
             };
-            if let Some(w) = self.workers.get_mut(&identity_hash) {
-                w.resolver.set_tick_process_code(code_cell.as_ref());
+            if let Some(w) = self.workers.get(&identity_hash) {
+                w.with_state_mut(|state| state.resolver.set_tick_process_code(code_cell.as_ref()));
             }
         }
     }
 
     fn clear_worker_tick_code(&mut self) {
-        self.workers
-            .for_each_mut(|w| w.resolver.set_tick_process_code(None));
+        self.workers.for_each_mut(|w| {
+            w.with_state_mut(|state| state.resolver.set_tick_process_code(None));
+        });
     }
 
     fn refresh_cell_deps(&self) -> Result<crate::code_deps::ResolvedExecutionDeps, CodeDepError> {
@@ -483,7 +563,7 @@ impl<R: Rpc + HostQueryRpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
             });
         }
         resolve_execution_cell_deps(
-            &self.rpc,
+            self.rpc.as_ref(),
             &self.config.type_id_code_deps,
             &self.config.extra_cell_deps,
         )
@@ -500,14 +580,18 @@ impl<R: Rpc + HostQueryRpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
             let hashes: Vec<Vec<u8>> = self
                 .workers
                 .get(&process_hash)
-                .map(|w| w.submit.pending.keys().cloned().collect())
+                .map(|w| {
+                    w.with_state(|s| s.submit.pending.keys().cloned().collect())
+                })
                 .unwrap_or_default();
             for hash_bytes in hashes {
                 let tx_hash = match Byte32::from_slice(&hash_bytes) {
                     Ok(h) => h,
                     Err(_) => {
-                        if let Some(worker) = self.workers.get_mut(&process_hash) {
-                            worker.submit.pending.remove(&hash_bytes);
+                        if let Some(worker) = self.workers.get(&process_hash) {
+                            worker.with_state_mut(|state| {
+                                state.submit.pending.remove(&hash_bytes);
+                            });
                         }
                         continue;
                     }
@@ -515,15 +599,17 @@ impl<R: Rpc + HostQueryRpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                 let tx_hex = hex_pref(tx_hash.as_slice());
                 match self.rpc.get_transaction_status(&tx_hash) {
                     Ok(TxStatus::Dropped) => {
-                        let Some(worker) = self.workers.get_mut(&process_hash) else {
+                        let Some(worker) = self.workers.get(&process_hash) else {
                             continue;
                         };
-                        let seen_committed = worker
-                            .submit
-                            .pending
-                            .get(&hash_bytes)
-                            .map(|p| p.seen_committed)
-                            .unwrap_or(false);
+                        let seen_committed = worker.with_state(|state| {
+                            state
+                                .submit
+                                .pending
+                                .get(&hash_bytes)
+                                .map(|p| p.seen_committed)
+                                .unwrap_or(false)
+                        });
                         if seen_committed {
                             tracing::info!(
                                 target: LOG_TARGET,
@@ -537,31 +623,35 @@ impl<R: Rpc + HostQueryRpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                                 tx_hash = %tx_hex,
                             );
                         }
-                        if let Some(p) = worker.submit.pending.remove(&hash_bytes) {
-                            for k in p.consumed {
-                                worker.submit.in_flight.remove(&k);
-                            }
-                        }
-                    }
-                    Ok(TxStatus::Committed { block_number }) => {
-                        if let Some(worker) = self.workers.get_mut(&process_hash) {
-                            if let Some(p) = worker.submit.pending.get_mut(&hash_bytes) {
-                                if !p.seen_committed {
-                                    p.seen_committed = true;
-                                    tracing::info!(
-                                        target: LOG_TARGET,
-                                        event = "pending.committed",
-                                        tx_hash = %tx_hex,
-                                        block_number,
-                                    );
+                        worker.with_state_mut(|state| {
+                            if let Some(p) = state.submit.pending.remove(&hash_bytes) {
+                                for k in p.consumed {
+                                    state.submit.in_flight.remove(&k);
                                 }
                             }
+                        });
+                    }
+                    Ok(TxStatus::Committed { block_number }) => {
+                        if let Some(worker) = self.workers.get(&process_hash) {
+                            worker.with_state_mut(|state| {
+                                if let Some(p) = state.submit.pending.get_mut(&hash_bytes) {
+                                    if !p.seen_committed {
+                                        p.seen_committed = true;
+                                        tracing::info!(
+                                            target: LOG_TARGET,
+                                            event = "pending.committed",
+                                            tx_hash = %tx_hex,
+                                            block_number,
+                                        );
+                                    }
+                                }
+                            });
                         }
                         let start_tip = tip;
                         let Some(fresh_tip) = self.refresh_tip_only() else {
                             continue;
                         };
-                        let Some(worker) = self.workers.get_mut(&process_hash) else {
+                        let Some(worker) = self.workers.get(&process_hash) else {
                             continue;
                         };
                         if start_tip.map(|s| fresh_tip < s).unwrap_or(false) {
@@ -596,7 +686,9 @@ impl<R: Rpc + HostQueryRpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                                 confirmations,
                                 depth,
                             );
-                            worker.submit.pending.remove(&hash_bytes);
+                            worker.with_state_mut(|state| {
+                                state.submit.pending.remove(&hash_bytes);
+                            });
                         } else {
                             tracing::debug!(
                                 target: LOG_TARGET,
@@ -665,8 +757,8 @@ impl<R: Rpc + HostQueryRpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
         }
 
         let process = {
-            let worker = self.workers.get_mut(&hash).expect("exists");
-            match worker.resolver.resolve(&self.rpc, &hash) {
+            let worker = self.workers.get(&hash).expect("exists");
+            match worker.with_state_mut(|state| state.resolver.resolve(self.rpc.as_ref(), &hash)) {
                 Ok(Some(p)) => p,
                 Ok(None) => {
                     tracing::warn!(
@@ -717,16 +809,17 @@ impl<R: Rpc + HostQueryRpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
 
         const MAX_ATTEMPTS: u32 = 64;
         let mut attempts = 0u32;
-        {
-            let worker = self.workers.get_mut(&hash).expect("exists");
-            if worker.isolate_resume.is_none() {
-                worker.isolate_expanded.clear();
-            }
+        if let Some(worker) = self.workers.get(&hash) {
+            worker.with_state_mut(|state| {
+                if state.isolate_resume.is_none() {
+                    state.isolate_expanded.clear();
+                }
+            });
         }
         let resume_key = self
             .workers
             .get(&hash)
-            .and_then(|w| w.isolate_resume.clone());
+            .and_then(|w| w.with_state(|s| s.isolate_resume.clone()));
         let bucket = Self::rotate_bucket(bucket, resume_key.as_ref());
         let resume = self.isolate_window(
             hash,
@@ -738,12 +831,15 @@ impl<R: Rpc + HostQueryRpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
             &mut attempts,
             MAX_ATTEMPTS,
         );
-        let worker = self.workers.get_mut(&hash).expect("exists");
-        if let Some(k) = resume {
-            worker.isolate_resume = Some(k);
-        } else {
-            worker.isolate_resume = None;
-            worker.isolate_expanded.clear();
+        if let Some(worker) = self.workers.get(&hash) {
+            worker.with_state_mut(|state| {
+                if let Some(k) = resume {
+                    state.isolate_resume = Some(k);
+                } else {
+                    state.isolate_resume = None;
+                    state.isolate_expanded.clear();
+                }
+            });
         }
     }
 
@@ -768,7 +864,9 @@ impl<R: Rpc + HostQueryRpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                 .filter(|i| {
                     self.workers
                         .get(&hash)
-                        .map(|w| !w.submit.in_flight.contains(&out_point_key(&i.out_point)))
+                        .map(|w| {
+                            w.with_state(|s| !s.submit.in_flight.contains(&out_point_key(&i.out_point)))
+                        })
                         .unwrap_or(true)
                 })
                 .collect();
@@ -784,7 +882,7 @@ impl<R: Rpc + HostQueryRpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
             let already = self
                 .workers
                 .get(&hash)
-                .map(|w| w.isolate_expanded.contains(&fp))
+                .map(|w| w.with_state(|s| s.isolate_expanded.contains(&fp)))
                 .unwrap_or(false);
             if already {
                 if !rest.is_empty() {
@@ -816,7 +914,8 @@ impl<R: Rpc + HostQueryRpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                     }
                     return items.first().map(|i| out_point_key(&i.out_point));
                 }
-                let outcome = self.process_batch(hash, process, window.clone(), report);
+                let outcome =
+                    self.dispatch_process_batch(hash, process, window.clone(), report);
                 if !matches!(outcome, BatchOutcome::CachedRejected) {
                     *attempts += 1;
                 }
@@ -856,8 +955,8 @@ impl<R: Rpc + HostQueryRpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                     }
                 }
                 BatchOutcome::Rejected | BatchOutcome::CachedRejected => {
-                    if let Some(w) = self.workers.get_mut(&hash) {
-                        w.isolate_expanded.insert(fp);
+                    if let Some(w) = self.workers.get(&hash) {
+                        w.with_state_mut(|state| state.isolate_expanded.insert(fp));
                     }
                     let mut drop_first = window[1..].to_vec();
                     drop_first.extend(rest);
@@ -913,458 +1012,54 @@ impl<R: Rpc + HostQueryRpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
         batch: &[ScannedIntention],
         process: &ResolvedProcess,
     ) -> bool {
-        let ops: Vec<_> = batch.iter().map(|i| i.out_point.clone()).collect();
-        let fp = combo_fingerprint(
-            &ops,
-            Some(&process.live_cell.out_point),
-            &self.execution_code_key,
-        );
-        self.workers
-            .get(hash)
-            .map(|w| w.submit.rejected_combos.contains(&fp))
-            .unwrap_or(false)
+        self.workers.get(hash).map_or(false, |w| {
+            w.with_state(|state| {
+                process_batch::window_combo_cached(
+                    state,
+                    batch,
+                    process,
+                    &self.execution_code_key,
+                )
+            })
+        })
     }
 
-    fn handle_incompatible_refunds(
-        &mut self,
-        hash: [u8; 32],
-        batch: &[ScannedIntention],
-        code: i8,
-        report: &mut TickReport,
-    ) -> BatchOutcome {
-        let mut by_identity: Vec<(CidLockIdentity, Vec<ScannedIntention>)> = Vec::new();
-        for item in batch {
-            let id = item.lock_identity();
-            if let Some((_, group)) = by_identity.iter_mut().find(|(existing, _)| *existing == id) {
-                group.push(item.clone());
-            } else {
-                by_identity.push((id, vec![item.clone()]));
-            }
-        }
-
-        if by_identity.len() > 1 {
-            tracing::info!(
-                target: LOG_TARGET,
-                event = "refund.partition",
-                code,
-                groups = by_identity.len(),
-            );
-        }
-
-        let mut submitted = false;
-        for (_id, group) in by_identity {
-            if group.is_empty() {
-                continue;
-            }
-            match self.assemble_and_submit_refund(hash, &group, code, report) {
-                BatchOutcome::Submitted => submitted = true,
-                BatchOutcome::Rejected => return BatchOutcome::Rejected,
-                BatchOutcome::CachedRejected => return BatchOutcome::CachedRejected,
-                _ => {}
-            }
-        }
-
-        if submitted {
-            BatchOutcome::Submitted
-        } else {
-            BatchOutcome::Continue
+    fn apply_batch_report(report: &mut TickReport, delta: &BatchReportDelta) {
+        report.submitted += delta.submitted;
+        report.skipped += delta.skipped;
+        report.conflicts += delta.conflicts;
+        if delta.last_error.is_some() {
+            report.last_error = delta.last_error.clone();
         }
     }
 
-    fn assemble_and_submit_refund(
-        &mut self,
-        hash: [u8; 32],
-        group: &[ScannedIntention],
-        code: i8,
-        report: &mut TickReport,
-    ) -> BatchOutcome {
-        let worker = match self.workers.get_mut(&hash) {
-            Some(w) => w,
-            None => return BatchOutcome::Continue,
-        };
-        let skeleton = match assemble_digest_incompatible(group, &self.tick_cell_deps) {
-            Ok(s) => {
-                let out_sum: u64 =
-                    s.tx.outputs()
-                        .into_iter()
-                        .map(|o| {
-                            let c: u64 = o.capacity().unpack();
-                            c
-                        })
-                        .sum();
-                let in_sum: u64 = group.iter().map(|i| i.capacity).sum();
-                let fee = in_sum.saturating_sub(out_sum);
-                tracing::info!(
-                    target: LOG_TARGET,
-                    event = "refund.path",
-                    code,
-                    path = "user_lock",
-                    fee,
-                    n = group.len(),
-                );
-                s
-            }
-            Err(e) => {
-                tracing::warn!(
-                    target: LOG_TARGET,
-                    event = "refund.path",
-                    code,
-                    path = "unbuildable",
-                    error = %e,
-                );
-                report.skipped += group.len();
-                return BatchOutcome::Continue;
-            }
-        };
-
-        let intent_ops: Vec<_> = group.iter().map(|i| i.out_point.clone()).collect();
-        let fp = combo_fingerprint(&intent_ops, None, &self.execution_code_key);
-        if worker.submit.rejected_combos.contains(&fp) {
-            return BatchOutcome::CachedRejected;
-        }
-        let consumed: Vec<_> = skeleton
-            .tx
-            .inputs()
-            .into_iter()
-            .map(|i| i.previous_output())
-            .collect();
-        match dry_run_gate(&self.rpc, &skeleton.tx) {
-            DryRunGate::Rejected(m) => {
-                worker.submit.rejected_combos.insert(fp);
-                tracing::warn!(
-                    target: LOG_TARGET,
-                    event = "dry_run.rejected",
-                    error = %m,
-                    n = group.len(),
-                );
-                report.last_error = Some(format!("dry-run rejected: {m}"));
-                return BatchOutcome::Rejected;
-            }
-            DryRunGate::Skip(m) => {
-                tracing::warn!(
-                    target: LOG_TARGET,
-                    event = "tick.skip",
-                    reason = "dry_run_unavailable",
-                    error = %m,
-                );
-                report.last_error = Some(format!("dry-run: {m}"));
-                report.skipped += group.len();
-                return BatchOutcome::Continue;
-            }
-            DryRunGate::Proceed => {}
-        }
-        match submit_execution(&self.rpc, &skeleton, &mut worker.submit, &consumed) {
-            Ok(hash) => {
-                tracing::info!(
-                    target: LOG_TARGET,
-                    event = "submit.ok",
-                    tx_hash = %hex_pref(hash.as_slice()),
-                );
-                report.submitted += 1;
-                BatchOutcome::Submitted
-            }
-            Err(RpcError::Conflict(m)) => {
-                tracing::warn!(
-                    target: LOG_TARGET,
-                    event = "submit.conflict",
-                    error = %m,
-                );
-                report.conflicts += 1;
-                report.last_error = Some(format!("submit conflict: {m}"));
-                BatchOutcome::Continue
-            }
-            Err(RpcError::SubmitRejected(m)) => {
-                worker.submit.rejected_combos.insert(fp);
-                tracing::warn!(
-                    target: LOG_TARGET,
-                    event = "submit.rejected",
-                    error = %m,
-                    n = group.len(),
-                );
-                report.last_error = Some(format!("submit rejected: {m}"));
-                BatchOutcome::Rejected
-            }
-            Err(e) => {
-                tracing::warn!(
-                    target: LOG_TARGET,
-                    event = "tick.skip",
-                    reason = "submit_failed",
-                    error = %e,
-                );
-                report.last_error = Some(format!("submit failed: {e}"));
-                report.skipped += group.len();
-                BatchOutcome::Continue
-            }
-        }
-    }
-
-    fn process_batch(
-        &mut self,
+    fn dispatch_process_batch(
+        &self,
         hash: [u8; 32],
         process: &ResolvedProcess,
         batch: Vec<ScannedIntention>,
         report: &mut TickReport,
     ) -> BatchOutcome {
-        if self.window_combo_cached(&hash, &batch, process) {
-            tracing::debug!(
-                target: LOG_TARGET,
-                event = "submit.rejected_combo",
-                n = batch.len(),
-            );
-            return BatchOutcome::CachedRejected;
-        }
-
-        if self
-            .workers
-            .get(&hash)
-            .map(|w| w.submit.pending_occupies(&process.live_cell.out_point))
-            .unwrap_or(false)
-        {
-            tracing::warn!(
-                target: LOG_TARGET,
-                event = "tick.skip",
-                reason = "process_occupied",
-            );
-            report.skipped += batch.len();
-            return BatchOutcome::ProcessOccupied;
-        }
-
-        let draft = build_batch_draft(&batch, process);
-        let cells = draft_cells_for_batch(&batch, process);
-        let tip = match self.rpc.tip_block_number() {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!(
-                    target: LOG_TARGET,
-                    event = "tick.skip",
-                    reason = "tip_block_number",
-                    error = %e,
-                );
-                report.last_error = Some(format!("tip block: {e}"));
-                report.skipped += batch.len();
-                return BatchOutcome::Continue;
-            }
+        let worker = match self.workers.get(&hash) {
+            Some(w) => w,
+            None => return BatchOutcome::Continue,
         };
-        let host = match seed_host_for_batch(&self.rpc, &cells, tip) {
-            Ok(h) => h,
-            Err(e) => {
-                let reason = match &e {
-                    HostQueryError::Rpc(_) => "host_query_rpc",
-                    HostQueryError::MissingLiveCell(_) => "host_query_missing_cell",
-                    HostQueryError::MissingBlockHash { .. } => "host_query_missing_tip_hash",
-                };
-                tracing::warn!(
-                    target: LOG_TARGET,
-                    event = "tick.skip",
-                    reason,
-                    error = %e,
-                );
-                report.last_error = Some(format!("host seed: {e}"));
-                report.skipped += batch.len();
-                return BatchOutcome::Continue;
-            }
-        };
-
         let max_size = if self.config.max_assembled_tx_bytes == 0 {
             DEFAULT_MAX_ASSEMBLED_TX_BYTES
         } else {
             self.config.max_assembled_tx_bytes
         };
-
-        let assemble_outcome = self.ssri.assemble(&process.binary, &draft, host);
-        let skeleton = match assemble_outcome {
-            Ok(assembled) => {
-                match validate_assembled_tx(&assembled, &batch, process, max_size) {
-                    Ok(()) => {}
-                    Err(AssembleError::SizeLimit { size, max }) => {
-                        tracing::warn!(
-                            target: LOG_TARGET,
-                            event = "assemble.invalid",
-                            reason = "size_limit",
-                            size,
-                            max,
-                        );
-                        return self.record_invalid_assembled_reject(hash, &batch, process, report);
-                    }
-                    Err(AssembleError::InvalidAssembled(m)) => {
-                        tracing::warn!(
-                            target: LOG_TARGET,
-                            event = "assemble.invalid",
-                            reason = "guest_tx",
-                            error = %m,
-                        );
-                        return self.record_invalid_assembled_reject(hash, &batch, process, report);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            target: LOG_TARGET,
-                            event = "tick.skip",
-                            reason = "validate_assembled",
-                            error = %e,
-                        );
-                        report.skipped += batch.len();
-                        return BatchOutcome::Continue;
-                    }
-                }
-                match execution_from_assembled(&assembled) {
-                    Ok(s) => s,
-                    Err(AssembleError::InvalidAssembled(m)) => {
-                        tracing::warn!(
-                            target: LOG_TARGET,
-                            event = "assemble.invalid",
-                            reason = "execution_skeleton",
-                            error = %m,
-                        );
-                        return self.record_invalid_assembled_reject(hash, &batch, process, report);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            target: LOG_TARGET,
-                            event = "tick.skip",
-                            reason = "execution_from_assembled",
-                            error = %e,
-                        );
-                        report.skipped += batch.len();
-                        return BatchOutcome::Continue;
-                    }
-                }
-            }
-            Err(SsriError::Incompatible(code)) => {
-                tracing::info!(
-                    target: LOG_TARGET,
-                    event = "ssri.incompatible",
-                    code,
-                );
-                return self.handle_incompatible_refunds(hash, &batch, code, report);
-            }
-            Err(SsriError::Unusable(m)) => {
-                tracing::warn!(
-                    target: LOG_TARGET,
-                    event = "tick.skip",
-                    reason = "ssri_unusable",
-                    error = %m,
-                );
-                report.skipped += batch.len();
-                return BatchOutcome::Continue;
-            }
-        };
-
-        let consumed_process = skeleton
-            .tx
-            .inputs()
-            .into_iter()
-            .any(|i| i.previous_output() == process.live_cell.out_point);
-        let intent_ops: Vec<_> = batch.iter().map(|i| i.out_point.clone()).collect();
-        let process_op = consumed_process.then(|| process.live_cell.out_point.clone());
-        let fp = combo_fingerprint(&intent_ops, process_op.as_ref(), &self.execution_code_key);
-        let worker = self.workers.get_mut(&hash).expect("exists");
-        if worker.submit.rejected_combos.contains(&fp) {
-            tracing::debug!(
-                target: LOG_TARGET,
-                event = "submit.rejected_combo",
-                n = batch.len(),
-            );
-            return BatchOutcome::CachedRejected;
-        }
-        let consumed: Vec<_> = skeleton
-            .tx
-            .inputs()
-            .into_iter()
-            .map(|i| i.previous_output())
-            .collect();
-        match dry_run_gate(&self.rpc, &skeleton.tx) {
-            DryRunGate::Rejected(m) => {
-                worker.submit.rejected_combos.insert(fp);
-                tracing::warn!(
-                    target: LOG_TARGET,
-                    event = "dry_run.rejected",
-                    error = %m,
-                    n = batch.len(),
-                );
-                report.last_error = Some(format!("dry-run rejected: {m}"));
-                return BatchOutcome::Rejected;
-            }
-            DryRunGate::Skip(m) => {
-                tracing::warn!(
-                    target: LOG_TARGET,
-                    event = "tick.skip",
-                    reason = "dry_run_unavailable",
-                    error = %m,
-                );
-                report.last_error = Some(format!("dry-run: {m}"));
-                report.skipped += batch.len();
-                return BatchOutcome::Continue;
-            }
-            DryRunGate::Proceed => {}
-        }
-        match submit_execution(&self.rpc, &skeleton, &mut worker.submit, &consumed) {
-            Ok(hash) => {
-                tracing::info!(
-                    target: LOG_TARGET,
-                    event = "submit.ok",
-                    tx_hash = %hex_pref(hash.as_slice()),
-                );
-                report.submitted += 1;
-                if consumed_process {
-                    BatchOutcome::SubmittedProcess
-                } else {
-                    BatchOutcome::Submitted
-                }
-            }
-            Err(RpcError::Conflict(m)) => {
-                tracing::warn!(
-                    target: LOG_TARGET,
-                    event = "submit.conflict",
-                    error = %m,
-                );
-                report.conflicts += 1;
-                report.last_error = Some(format!("submit conflict: {m}"));
-                BatchOutcome::Continue
-            }
-            Err(RpcError::SubmitRejected(m)) => {
-                worker.submit.rejected_combos.insert(fp);
-                tracing::warn!(
-                    target: LOG_TARGET,
-                    event = "submit.rejected",
-                    error = %m,
-                    n = batch.len(),
-                );
-                report.last_error = Some(format!("submit rejected: {m}"));
-                BatchOutcome::Rejected
-            }
-            Err(e) => {
-                tracing::warn!(
-                    target: LOG_TARGET,
-                    event = "tick.skip",
-                    reason = "submit_failed",
-                    error = %e,
-                );
-                report.last_error = Some(format!("submit failed: {e}"));
-                report.skipped += batch.len();
-                BatchOutcome::Continue
-            }
-        }
-    }
-
-    fn record_invalid_assembled_reject(
-        &mut self,
-        hash: [u8; 32],
-        batch: &[ScannedIntention],
-        process: &ResolvedProcess,
-        report: &mut TickReport,
-    ) -> BatchOutcome {
-        let intent_ops: Vec<_> = batch.iter().map(|i| i.out_point.clone()).collect();
-        let fp = combo_fingerprint(
-            &intent_ops,
-            Some(&process.live_cell.out_point),
-            &self.execution_code_key,
+        let (outcome, delta) = worker.run_batch(
+            process.clone(),
+            batch,
+            self.execution_code_key.clone(),
+            self.tick_cell_deps.clone(),
+            max_size,
         );
-        if let Some(w) = self.workers.get_mut(&hash) {
-            w.submit.rejected_combos.insert(fp);
-        }
-        report.skipped += batch.len();
-        BatchOutcome::Rejected
+        Self::apply_batch_report(report, &delta);
+        outcome
     }
+
 }
 
 pub(crate) fn confirmation_count(tip: u64, commit_block: u64) -> u64 {
@@ -1469,12 +1164,14 @@ mod worker_cmd_tests {
     #[test]
     fn worker_command_register_and_delete_take_effect_on_tick() {
         let cmds = Arc::new(Mutex::new(Vec::new()));
+        let rpc = Arc::new(EmptyRpc);
+        let ssri = Arc::new(NopSsri);
         let mut loop_ = DigestLoop::with_workers(
-            EmptyRpc,
+            rpc.clone(),
             NopClock,
-            NopSsri,
+            ssri.clone(),
             cfg(),
-            WorkerPool::from_entries(vec![]),
+            WorkerPool::new(rpc, ssri),
             Some(cmds.clone()),
         );
         assert!(loop_.workers().is_empty());
@@ -1488,7 +1185,7 @@ mod worker_cmd_tests {
             "register must spawn worker"
         );
 
-        cmds.lock().unwrap().push(WorkerCommand::Delete(hash));
+        cmds.lock().unwrap().push(WorkerCommand::delete(hash));
         let _ = loop_.tick();
         assert!(
             !loop_.workers().contains(&hash),
@@ -1501,24 +1198,45 @@ mod worker_cmd_tests {
         let cmds = Arc::new(Mutex::new(Vec::new()));
         let e = entry([0x33; 32], [0x44; 32]);
         let hash = e.identity_type_hash;
-        let mut pool = WorkerPool::from_entries(vec![e]);
-        pool.get_mut(&hash).unwrap().submit.pending.insert(
-            vec![0x01],
-            crate::submit::PendingTx {
-                consumed: vec![],
-                created: vec![],
-                seen_committed: false,
-            },
-        );
-        let mut loop_ =
-            DigestLoop::with_workers(EmptyRpc, NopClock, NopSsri, cfg(), pool, Some(cmds.clone()));
-        cmds.lock().unwrap().push(WorkerCommand::Delete(hash));
+        let rpc = Arc::new(EmptyRpc);
+        let ssri = Arc::new(NopSsri);
+        let mut pool = WorkerPool::from_entries(vec![e], rpc.clone(), ssri.clone());
+        pool.get(&hash).unwrap().with_state_mut(|w| {
+            w.submit.pending.insert(
+                vec![0x01],
+                crate::submit::PendingTx {
+                    consumed: vec![],
+                    created: vec![],
+                    seen_committed: false,
+                },
+            );
+        });
+        let mut loop_ = DigestLoop::with_workers(rpc, NopClock, ssri, cfg(), pool, Some(cmds.clone()));
+        cmds.lock().unwrap().push(WorkerCommand::delete(hash));
         let _ = loop_.tick();
         assert!(
             loop_.workers().contains(&hash),
             "in-flight delete must stay deferred"
         );
         assert_eq!(cmds.lock().unwrap().len(), 1);
-        assert!(matches!(cmds.lock().unwrap()[0], WorkerCommand::Delete(_)));
+        assert!(matches!(
+            cmds.lock().unwrap()[0],
+            WorkerCommand::Delete { .. }
+        ));
+
+        // P0-1: re-register must invalidate the deferred delete.
+        let e2 = entry([0x33; 32], [0x44; 32]);
+        cmds.lock().unwrap().push(WorkerCommand::Register(e2));
+        let _ = loop_.tick();
+        assert!(
+            loop_.workers().contains(&hash),
+            "re-register must keep worker; stale delete must not apply"
+        );
+        assert!(
+            cmds.lock().unwrap().iter().all(|c| {
+                !matches!(c, WorkerCommand::Delete { hash: h, .. } if *h == hash)
+            }),
+            "no stale Delete may remain after re-register"
+        );
     }
 }

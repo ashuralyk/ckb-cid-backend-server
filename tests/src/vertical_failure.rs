@@ -669,17 +669,19 @@ mod tests {
             "later valid Intention in the poison bucket must still progress under max={n}"
         );
         let good_worker = loop_.workers().get(&good_hash).expect("good worker");
-        assert!(good_worker.submit.pending_occupies(&good.out_point));
+        assert!(good_worker.with_state(|s| s.submit.pending_occupies(&good.out_point)));
         let poison_worker = loop_.workers().get(&poison_hash).expect("poison worker");
-        assert!(poison_worker.submit.pending_occupies(&later.out_point));
-        assert!(!good_worker
-            .submit
-            .rejected
-            .contains(&out_point_key(&good.out_point)));
-        assert!(!poison_worker
-            .submit
-            .rejected
-            .contains(&out_point_key(&later.out_point)));
+        assert!(poison_worker.with_state(|s| s.submit.pending_occupies(&later.out_point)));
+        assert!(!good_worker.with_state(|s| {
+            s.submit
+                .rejected
+                .contains(&out_point_key(&good.out_point))
+        }));
+        assert!(!poison_worker.with_state(|s| {
+            s.submit
+                .rejected
+                .contains(&out_point_key(&later.out_point))
+        }));
     }
 
     #[test]

@@ -38,6 +38,9 @@ pub struct DaemonConfig {
     pub health_bind: Option<SocketAddr>,
     /// Optional Process registry HTTP API bind. Unset/empty disables the listener.
     pub api_bind: Option<SocketAddr>,
+    /// When false (default), `api_bind` must be loopback. Explicit opt-in required
+    /// for non-loopback binds (P1-7).
+    pub allow_non_loopback_api: bool,
     /// On-disk Process registry JSON path (atomic write+rename).
     pub registry_path: PathBuf,
     /// Max registered Processes.
@@ -349,6 +352,9 @@ struct ObserveSection {
     /// Process registry HTTP API bind (POST/GET/DELETE /v1/processes).
     #[serde(default)]
     api_bind: Option<String>,
+    /// Explicit opt-in for non-loopback `api_bind` (default false).
+    #[serde(default)]
+    allow_non_loopback_api: Option<bool>,
     #[serde(default)]
     log_format: Option<String>,
 }
@@ -648,13 +654,25 @@ fn merge<F: Fn(&str) -> Option<String>>(
         },
     };
 
+    let allow_non_loopback_api = match nonempty(&get, "CID_ALLOW_NON_LOOPBACK_API") {
+        Some(s) => parse_bool_flag(&s, "CID_ALLOW_NON_LOOPBACK_API")?,
+        None => observe.allow_non_loopback_api.unwrap_or(false),
+    };
+
     let api_bind = match nonempty(&get, "CID_API_BIND") {
-        Some(s) => Some(parse_health_bind(&s)?),
+        Some(s) => Some(parse_socket_bind(&s, "CID_API_BIND")?),
         None => match observe.api_bind.filter(|s| !s.trim().is_empty()) {
-            Some(s) => Some(parse_health_bind(&s)?),
+            Some(s) => Some(parse_socket_bind(&s, "observe.api_bind")?),
             None => None,
         },
     };
+    if let Some(addr) = api_bind {
+        if !addr.ip().is_loopback() && !allow_non_loopback_api {
+            return Err(ConfigError::Invalid(
+                "api_bind / CID_API_BIND is not loopback; set                  observe.allow_non_loopback_api = true or CID_ALLOW_NON_LOOPBACK_API=true                  to expose the unauthenticated registry API (keyless; no signing keys,                  but register/delete enables Process workers)".into(),
+            ));
+        }
+    }
 
     let registry_path = match nonempty(&get, "CID_REGISTRY_PATH") {
         Some(s) => PathBuf::from(s),
@@ -771,6 +789,7 @@ fn merge<F: Fn(&str) -> Option<String>>(
         process_type_code_hashes,
         health_bind,
         api_bind,
+        allow_non_loopback_api,
         registry_path,
         registry_max_entries,
         confirmation_depth,
@@ -868,19 +887,26 @@ fn file_cell_deps(rows: &[CellDepFile]) -> Result<Vec<CellDep>, ConfigError> {
     Ok(out)
 }
 
-fn parse_bool_flag(s: &str, key: &str) -> Result<bool, ConfigError> {
-    match s.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" => Ok(true),
-        "0" | "false" | "no" => Ok(false),
-        other => Err(ConfigError::Invalid(format!(
-            "{key}={other} (want true/false)"
-        ))),
-    }
+fn parse_health_bind(s: &str) -> Result<SocketAddr, ConfigError> {
+    parse_socket_bind(s, "CID_HEALTH_BIND")
 }
 
-fn parse_health_bind(s: &str) -> Result<SocketAddr, ConfigError> {
-    s.parse::<SocketAddr>()
-        .map_err(|_| ConfigError::Invalid(format!("CID_HEALTH_BIND={s} (want host:port)")))
+fn parse_socket_bind(s: &str, label: &str) -> Result<SocketAddr, ConfigError> {
+    s.parse::<SocketAddr>().map_err(|_| {
+        ConfigError::Invalid(format!(
+            "{label}={s} (want host:port, e.g. 127.0.0.1:9101)"
+        ))
+    })
+}
+
+fn parse_bool_flag(s: &str, label: &str) -> Result<bool, ConfigError> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        other => Err(ConfigError::Invalid(format!(
+            "{label}={other} (want true/false)"
+        ))),
+    }
 }
 
 fn parse_poll_secs(raw: &str) -> Result<u64, ConfigError> {
