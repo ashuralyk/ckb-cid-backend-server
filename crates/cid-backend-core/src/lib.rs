@@ -9,6 +9,7 @@ pub mod scan;
 pub mod ssri;
 pub mod submit;
 pub mod type_id;
+pub mod workers;
 
 pub use assemble::{
     assemble_digest_incompatible, execution_from_assembled, validate_assembled_tx, AssembleError,
@@ -35,14 +36,17 @@ pub use fee::{
     required_fee, tx_size_in_block, with_capacity, CidLockIdentity, FeeGuard, FeeGuardError,
     RefundFeeMode, DEFAULT_FEE_RATE, MAX_FEE_RATE, MAX_REFUND_FEE,
 };
-pub use process::{ProcessResolver, ResolvedProcess, SsriBinarySource};
+pub use process::{ProcessEntry, ProcessResolver, ResolvedProcess};
 pub use rpc::{out_point_key, script_hash32, LiveCell, Rpc, RpcError, TxStatus};
 pub use scan::{
     bucket_by_process_type_hash, decode_cells, scan_intentions, scan_intentions_multi,
     ScannedIntention,
 };
-pub use ssri::{map_executor_error, to_intention_input, EmbeddedSsri, SsriError, SsriHost};
+pub use ssri::{
+    build_batch_draft, draft_cells_for_batch, map_executor_error, EmbeddedSsri, SsriError, SsriHost,
+};
 pub use submit::{combo_fingerprint, execution_code_key, submit_execution, PendingTx, SubmitState};
+pub use workers::{ProcessWorker, WorkerPool};
 pub use type_id::{
     type_id_script, type_id_script_hash, TypeIdCodeDep, TypeIdIdentity, TYPE_ID_CODE_HASH,
 };

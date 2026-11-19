@@ -1,5 +1,9 @@
+use crate::process::ResolvedProcess;
 use crate::scan::ScannedIntention;
-use cid_process_executor::{ExecutorError, IntentionInput, PartialTx, ProcessExecutor};
+use cid_process_executor::{
+    build_draft_tx, AssembledTx, DraftCell, ExecutorError, MockHost, ProcessExecutor,
+};
+use ckb_types::packed::Script;
 use ckb_types::prelude::*;
 use std::fmt;
 
@@ -34,8 +38,9 @@ pub trait SsriHost {
     fn assemble(
         &self,
         binary: &[u8],
-        intentions: &[IntentionInput],
-    ) -> Result<PartialTx, SsriError>;
+        draft_tx: &[u8],
+        host: MockHost,
+    ) -> Result<AssembledTx, SsriError>;
 }
 
 pub struct EmbeddedSsri;
@@ -50,22 +55,52 @@ impl SsriHost for EmbeddedSsri {
     fn assemble(
         &self,
         binary: &[u8],
-        intentions: &[IntentionInput],
-    ) -> Result<PartialTx, SsriError> {
+        draft_tx: &[u8],
+        host: MockHost,
+    ) -> Result<AssembledTx, SsriError> {
         ProcessExecutor::new(binary.to_vec())
-            .assemble(intentions)
+            .assemble(draft_tx, host)
             .map_err(map_executor_error)
     }
 }
 
-pub fn to_intention_input(scanned: &ScannedIntention) -> IntentionInput {
-    IntentionInput {
-        out_point: scanned.out_point.clone(),
-        lock_args: scanned.lock_args.clone(),
-        capacity: scanned.capacity,
-        data: scanned.data.clone(),
-        type_script: scanned.type_script.as_ref().map(|s| s.as_slice().to_vec()),
+fn intention_draft_cell(intent: &ScannedIntention) -> DraftCell {
+    let lock = Script::new_builder()
+        .code_hash(intent.lock_code_hash.pack())
+        .hash_type(intent.lock_hash_type.into())
+        .args(intent.lock_args.pack())
+        .build();
+    let mut output = ckb_types::packed::CellOutput::new_builder()
+        .capacity(intent.capacity.pack())
+        .lock(lock);
+    if let Some(ts) = &intent.type_script {
+        output = output.type_(Some(ts.clone()).pack());
     }
+    DraftCell {
+        out_point: intent.out_point.clone(),
+        output: output.build(),
+        data: intent.data.clone(),
+    }
+}
+
+/// Draft input cells for one batch: intentions (ASC) then the live Process state cell.
+pub fn draft_cells_for_batch(
+    intentions: &[ScannedIntention],
+    process: &ResolvedProcess,
+) -> Vec<DraftCell> {
+    let mut cells: Vec<DraftCell> = intentions.iter().map(intention_draft_cell).collect();
+    let live = &process.live_cell;
+    cells.push(DraftCell {
+        out_point: live.out_point.clone(),
+        output: live.output.clone(),
+        data: live.data.clone(),
+    });
+    cells
+}
+
+/// Molecule `Transaction` draft whose inputs are the batch draft cells (empty outputs/deps).
+pub fn build_batch_draft(intentions: &[ScannedIntention], process: &ResolvedProcess) -> Vec<u8> {
+    build_draft_tx(&draft_cells_for_batch(intentions, process))
 }
 
 #[cfg(test)]
@@ -99,23 +134,28 @@ mod tests {
             .get_batch_bounds(&[])
             .expect_err("empty binary");
         assert!(matches!(err, SsriError::Unusable(_)));
-        let err = EmbeddedSsri.assemble(&[0xff; 8], &[]).expect_err("garbage");
+        let err = EmbeddedSsri
+            .assemble(&[0xff; 8], &[], MockHost::new())
+            .expect_err("garbage");
         assert!(matches!(err, SsriError::Unusable(_)));
     }
 
     /// Real RISC-V guest via ckb-vm. Ignored locally unless the pinned fixture is
     /// present *and* the test is selected (`--ignored` / `--include-ignored`).
-    /// CI builds the ELF from pin `d9ee77805f7ac930ab149648bed70f484a9886de`
-    /// and must run this test; missing fixture panics (job fails).
     #[ignore = "requires pinned cid_process_example RISC-V guest; CI builds it; see tests/fixtures/README.md"]
     #[test]
     fn real_example_binary_batch_bounds_and_assemble() {
+        use crate::host_query::seed_mock_host_from_live_cells;
+        use crate::process::{ProcessEntry, ProcessResolver, ResolvedProcess};
+        use crate::rpc::{script_hash32, LiveCell};
+        use crate::type_id::{type_id_script, type_id_script_hash, TypeIdIdentity};
+        use cid_protocol::{CidArgs, Payload, Script as CidScript};
+        use ckb_types::core::ScriptHashType;
+        use ckb_types::packed::{Byte32, CellOutput, OutPoint};
+
         let bin = load_example_binary().unwrap_or_else(|| {
             panic!(
                 "cid_process_example missing while the real SSRI guest test was selected. \
-                 CI must build it from pin d9ee77805f7ac930ab149648bed70f484a9886de \
-                 (CID_PROCESS_EXAMPLE_PATH or tests/fixtures/cid_process_example). \
-                 Locally this test is #[ignore]; do not treat a skip as a real-SSRI pass. \
                  See tests/fixtures/README.md."
             );
         });
@@ -124,65 +164,161 @@ mod tests {
             "cid_process_example must be a RISC-V ELF (got {} bytes)",
             bin.len()
         );
-        eprintln!(
-            "real SSRI guest: {} bytes, executing Process.batch / Process.assemble via ckb-vm",
-            bin.len()
-        );
 
         let (min, max) = EmbeddedSsri
             .get_batch_bounds(&bin)
             .expect("Process.batch via ckb-vm");
-        assert_eq!(
-            (min, max),
-            (1, 4),
-            "cid_process_example BATCH_MIN/BATCH_MAX"
+        assert_eq!((min, max), (1, 4));
+
+        let state_args = [0xCDu8; 32];
+        let code_args = [0xABu8; 32];
+        let type_hash = type_id_script_hash(&state_args);
+        let code_hash = type_id_script_hash(&code_args);
+        let lock = Script::new_builder()
+            .code_hash(code_hash.pack())
+            .hash_type(ScriptHashType::Type.into())
+            .args(Vec::<u8>::new().pack())
+            .build();
+        let state_type = type_id_script(&state_args);
+        let state_out = OutPoint::new_builder()
+            .tx_hash(Byte32::from_slice(&[0x77; 32]).unwrap())
+            .index(0u32.pack())
+            .build();
+        let state = LiveCell {
+            out_point: state_out.clone(),
+            output: CellOutput::new_builder()
+                .capacity(500_0000_0000u64.pack())
+                .lock(lock)
+                .type_(Some(state_type).pack())
+                .build(),
+            data: vec![],
+        };
+        let code_out = OutPoint::new_builder()
+            .tx_hash(Byte32::from_slice(&[0x42; 32]).unwrap())
+            .index(0u32.pack())
+            .build();
+        let code_cell = LiveCell {
+            out_point: code_out,
+            output: state.output.clone(),
+            data: bin.clone(),
+        };
+        let entry = ProcessEntry {
+            identity_type_hash: type_hash,
+            identity: TypeIdIdentity::new(state_args),
+            code: TypeIdIdentity::new(code_args),
+            ssri_elf_path: None,
+        };
+        let resolved = ResolvedProcess {
+            type_hash,
+            live_cell: state,
+            binary: bin.clone(),
+            code_cell: Some(code_cell.clone()),
+        };
+
+        let user = CidScript {
+            code_hash: [0x42; 32],
+            hash_type: 1,
+            args: vec![0xEE],
+        };
+        let args = CidArgs::new(type_hash, user, Payload { data: vec![0xAA] });
+        let lock_args = args.encode().unwrap();
+        let intent_out = OutPoint::new_builder()
+            .tx_hash(Byte32::from_slice(&[0x10; 32]).unwrap())
+            .index(0u32.pack())
+            .build();
+        let intent = ScannedIntention {
+            out_point: intent_out.clone(),
+            capacity: 100_0000_0000,
+            type_script: None,
+            data: vec![0xAA],
+            lock_args,
+            args,
+            lock_code_hash: [0xC1; 32],
+            lock_hash_type: ScriptHashType::Type,
+        };
+
+        let draft = build_batch_draft(std::slice::from_ref(&intent), &resolved);
+        let tip = (0u64, [0xAB; 32]);
+        let host = seed_mock_host_from_live_cells(
+            &[
+                (
+                    intent_out,
+                    intention_draft_cell(&intent).output,
+                    intent.data.clone(),
+                ),
+                (
+                    state_out,
+                    resolved.live_cell.output.clone(),
+                    resolved.live_cell.data.clone(),
+                ),
+            ],
+            Some(tip),
         );
 
         let err = EmbeddedSsri
-            .assemble(&bin, &[])
-            .expect_err("n=0 is below BATCH_MIN");
-        assert!(
-            matches!(err, SsriError::Incompatible(21)),
-            "empty assemble must be Incompatible(21), got {err:?}"
-        );
+            .assemble(&bin, &[], host.clone())
+            .expect_err("empty draft");
+        assert!(matches!(err, SsriError::Incompatible(21)));
 
-        let one = cid_process_executor::IntentionInput {
-            lock_args: vec![0x01, 0x02],
-            capacity: 100_0000_0000,
-            data: vec![0xAA],
-            ..Default::default()
-        };
-        let partial = EmbeddedSsri
-            .assemble(&bin, &[one])
+        let assembled = EmbeddedSsri
+            .assemble(&bin, &draft, host)
             .expect("Process.assemble n=1 via ckb-vm");
-        assert_eq!(partial.outputs.len(), 1, "one beneficiary output");
-        assert_eq!(partial.outputs_data, vec![vec![0xAA]]);
-        let cap: u64 = partial.outputs[0].capacity().unpack();
+        assert_eq!(assembled.outputs.len(), 2, "beneficiary + process recreate");
+        let cap: u64 = assembled.outputs[0].capacity().unpack();
         assert_eq!(cap, 100_0000_0000);
-        eprintln!(
-            "real SSRI guest executed: Process.batch=({min},{max}) n=0 Incompatible(21) n=1 assemble ok"
-        );
+
+        let _ = ProcessResolver::for_entry(entry);
+        let _ = script_hash32;
     }
 
-    /// Type-ID Process code mode must execute the **code cell** ELF via ckb-vm,
-    /// not a divergent state-cell payload. Uses the same pinned guest as
-    /// `real_example_binary_batch_bounds_and_assemble`.
+    /// SSRI ELF must come from the Process **code** cell, not divergent state payload.
     #[ignore = "requires pinned cid_process_example RISC-V guest; CI builds it; see tests/fixtures/README.md"]
     #[test]
-    fn real_ssri_guest_binds_to_type_id_process_code_cell() {
-        use crate::process::ProcessResolver;
+    fn real_ssri_guest_binds_to_process_code_cell() {
+        use crate::process::{ProcessEntry, ProcessResolver};
         use crate::rpc::{LiveCell, Rpc, RpcError, TxStatus};
-        use crate::type_id::type_id_script_hash;
+        use crate::type_id::{type_id_script, type_id_script_hash, TypeIdIdentity};
         use ckb_types::core::{ScriptHashType, TransactionView};
         use ckb_types::packed::{Byte32, CellOutput, OutPoint, Script};
         use ckb_types::prelude::*;
 
         let bin = load_example_binary().unwrap_or_else(|| {
             panic!(
-                "cid_process_example missing while the Type-ID SSRI bind test was selected. \
+                "cid_process_example missing while the Process-as-lock bind test was selected. \
                  See tests/fixtures/README.md."
             );
         });
+
+        let state_args = [0xCDu8; 32];
+        let code_args = [0xABu8; 32];
+        let type_hash = type_id_script_hash(&state_args);
+        let code_type_hash = type_id_script_hash(&code_args);
+        let lock = Script::new_builder()
+            .code_hash(code_type_hash.pack())
+            .hash_type(ScriptHashType::Type.into())
+            .args(Vec::<u8>::new().pack())
+            .build();
+        let state_type = type_id_script(&state_args);
+        let state = LiveCell {
+            out_point: OutPoint::new_builder()
+                .tx_hash(Byte32::from_slice(&[0x77; 32]).unwrap())
+                .index(0u32.pack())
+                .build(),
+            output: CellOutput::new_builder()
+                .capacity(500_0000_0000u64.pack())
+                .lock(lock)
+                .type_(Some(state_type).pack())
+                .build(),
+            data: vec![0x7f, b'E', b'L', b'F', 0xDE, 0xAD],
+        };
+        let code = LiveCell {
+            out_point: OutPoint::new_builder()
+                .tx_hash(Byte32::from_slice(&[0x42; 32]).unwrap())
+                .index(0u32.pack())
+                .build(),
+            output: state.output.clone(),
+            data: bin.clone(),
+        };
 
         struct OneProcess {
             cell: LiveCell,
@@ -219,52 +355,20 @@ mod tests {
             }
         }
 
-        let type_id_args = [0xABu8; 32];
-        let expected = type_id_script_hash(&type_id_args);
-        let ts = Script::new_builder()
-            .code_hash(expected.pack())
-            .hash_type(ScriptHashType::Type.into())
-            .args([0xCDu8; 32].to_vec().pack())
-            .build();
-        let hash = crate::rpc::script_hash32(&ts);
-        // Divergent state payload that looks like an ELF but is not the guest.
-        let state = LiveCell {
-            out_point: OutPoint::new_builder()
-                .tx_hash(Byte32::from_slice(&[0x77; 32]).unwrap())
-                .index(0u32.pack())
-                .build(),
-            output: CellOutput::new_builder()
-                .capacity(500_0000_0000u64.pack())
-                .lock(
-                    Script::new_builder()
-                        .code_hash([0u8; 32].pack())
-                        .hash_type(ScriptHashType::Type.into())
-                        .args(Vec::<u8>::new().pack())
-                        .build(),
-                )
-                .type_(Some(ts).pack())
-                .build(),
-            data: vec![0x7f, b'E', b'L', b'F', 0xDE, 0xAD],
-        };
-        let code = LiveCell {
-            out_point: OutPoint::new_builder()
-                .tx_hash(Byte32::from_slice(&[0x42; 32]).unwrap())
-                .index(0u32.pack())
-                .build(),
-            output: state.output.clone(),
-            data: bin.clone(),
-        };
         let rpc = OneProcess { cell: state };
-        let mut resolver = ProcessResolver::with_type_id_process_code(expected);
+        let entry = ProcessEntry {
+            identity_type_hash: type_hash,
+            identity: TypeIdIdentity::new(state_args),
+            code: TypeIdIdentity::new(code_args),
+            ssri_elf_path: None,
+        };
+        let mut resolver = ProcessResolver::for_entry(entry);
         resolver.set_tick_process_code(Some(&code));
-        let resolved = resolver.resolve(&rpc, &hash).unwrap().expect("resolved");
-        assert_eq!(
-            resolved.binary, bin,
-            "SSRI binary must be Type-ID code cell"
-        );
+        let resolved = resolver.resolve(&rpc, &type_hash).unwrap().expect("resolved");
+        assert_eq!(resolved.binary, bin, "SSRI binary must be code cell ELF");
         let (min, max) = EmbeddedSsri
             .get_batch_bounds(&resolved.binary)
-            .expect("Process.batch via ckb-vm on Type-ID code ELF");
+            .expect("Process.batch via ckb-vm");
         assert_eq!((min, max), (1, 4));
     }
 
