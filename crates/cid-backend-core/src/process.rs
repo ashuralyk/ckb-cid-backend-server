@@ -261,7 +261,6 @@ mod tests {
     use crate::type_id::type_id_script_hash;
     use ckb_types::core::{ScriptHashType, TransactionView};
     use ckb_types::packed::{Byte32, CellOutput, OutPoint, Script};
-    use ckb_types::prelude::*;
     use std::cell::RefCell;
 
     struct TestRpc {
