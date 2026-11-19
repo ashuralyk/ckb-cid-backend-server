@@ -5,7 +5,7 @@
 # Pin must match workspace.dependencies cid-process-executor / cid-protocol rev.
 set -euo pipefail
 
-PIN="${CID_DISPATCHER_REV:-5e98f123b1e3374d0e550130c3b09a5a878090f0}"
+PIN="${CID_DISPATCHER_REV:-b7c6f7e622c2664fcb0e6625dd4891e7df59900a}"
 CLANG="${CLANG:-clang-18}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEST="${CID_PROCESS_EXAMPLE_PATH:-$ROOT/tests/fixtures/cid_process_example}"

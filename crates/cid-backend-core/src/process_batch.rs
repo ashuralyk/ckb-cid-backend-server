@@ -9,7 +9,10 @@ use crate::host_query::{seed_host_for_batch, HostQueryError, HostQueryRpc};
 use crate::process::ResolvedProcess;
 use crate::rpc::{Rpc, RpcError};
 use crate::scan::ScannedIntention;
-use crate::ssri::{build_batch_draft, draft_cells_for_batch, SsriError, SsriHost};
+use crate::ssri::{
+    build_batch_draft, draft_cell_deps_for_batch, draft_cells_for_batch, SsriError, SsriHost,
+    UNSUPPORTED_FUNDING_LOCK,
+};
 use crate::submit::{combo_fingerprint, dry_run_gate, submit_execution, DryRunGate};
 use crate::workers::ProcessWorkerState;
 use ckb_types::packed::CellDep;
@@ -105,7 +108,20 @@ where
         return (BatchOutcome::ProcessOccupied, report);
     }
 
-    let draft = build_batch_draft(&batch, process);
+    let cell_deps = draft_cell_deps_for_batch(process, tick_cell_deps);
+    if cell_deps.is_empty() {
+        tracing::warn!(
+            target: LOG_TARGET,
+            event = "tick.skip",
+            reason = "cell_deps_required",
+        );
+        report.last_error = Some(
+            "cell_deps required for submit: resolve CID/Process code deps into the draft".into(),
+        );
+        report.skipped += batch.len();
+        return (BatchOutcome::Continue, report);
+    }
+    let draft = build_batch_draft(&batch, process, &cell_deps);
     let cells = draft_cells_for_batch(&batch, process);
     let tip = match rpc.tip_block_number() {
         Ok(t) => t,
@@ -229,6 +245,16 @@ where
                 event = "ssri.incompatible",
                 code,
             );
+            // UnsupportedFundingLock (38): permanent per-combo — do not refund.
+            if code == UNSUPPORTED_FUNDING_LOCK {
+                return record_invalid_assembled_reject(
+                    worker,
+                    &batch,
+                    process,
+                    execution_code_key,
+                    &mut report,
+                );
+            }
             return handle_incompatible_refunds(
                 rpc,
                 hash,

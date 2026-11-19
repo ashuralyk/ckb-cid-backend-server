@@ -708,8 +708,10 @@ mod tests {
             _: &[u8],
             _: u32,
             _: &[u8],
-        ) -> Result<(Vec<cid_backend_core::rpc::LiveCell>, Vec<u8>), cid_backend_core::rpc::RpcError>
-        {
+        ) -> Result<
+            (Vec<cid_backend_core::IndexedLiveCell>, Vec<u8>),
+            cid_backend_core::rpc::RpcError,
+        > {
             Err(RpcError::Unavailable("indexer down".into()))
         }
     }
@@ -760,11 +762,22 @@ mod tests {
     }
 
     fn loop_cfg() -> LoopConfig {
+        use ckb_types::core::DepType;
+        use ckb_types::packed::{Byte32, CellDep, OutPoint};
+        use ckb_types::prelude::*;
         LoopConfig {
             cid_code_hash: [0xC1; 32],
             hash_type: ScriptHashType::Type,
             poll_interval: Duration::from_secs(1),
-            extra_cell_deps: vec![],
+            extra_cell_deps: vec![CellDep::new_builder()
+                .out_point(
+                    OutPoint::new_builder()
+                        .tx_hash(Byte32::from_slice(&[0xDEu8; 32]).unwrap())
+                        .index(0u32.pack())
+                        .build(),
+                )
+                .dep_type(DepType::Code.into())
+                .build()],
             type_id_code_deps: vec![],
             confirmation_depth: 1,
             max_assembled_tx_bytes: 512 * 1024,

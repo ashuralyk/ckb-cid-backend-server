@@ -1,11 +1,13 @@
 use crate::process::ResolvedProcess;
 use crate::scan::ScannedIntention;
-use cid_process_executor::{
-    build_draft_tx, AssembledTx, DraftCell, ExecutorError, MockHost, ProcessExecutor,
-};
-use ckb_types::packed::Script;
+use cid_process_executor::{AssembledTx, DraftCell, ExecutorError, MockHost, ProcessExecutor};
+use ckb_types::core::DepType;
+use ckb_types::packed::{CellDep, CellInput, RawTransaction, Script, Transaction};
 use ckb_types::prelude::*;
 use std::fmt;
+
+/// Process guest exit: funding lock is not AlwaysSuccess(Data1) / is Process lock.
+pub const UNSUPPORTED_FUNDING_LOCK: i8 = 38;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SsriError {
@@ -98,9 +100,70 @@ pub fn draft_cells_for_batch(
     cells
 }
 
-/// Molecule `Transaction` draft whose inputs are the batch draft cells (empty outputs/deps).
-pub fn build_batch_draft(intentions: &[ScannedIntention], process: &ResolvedProcess) -> Vec<u8> {
-    build_draft_tx(&draft_cells_for_batch(intentions, process))
+/// Merge resolved Process code + tick CellDeps (CID / Type-ID / static extras).
+///
+/// Submit drafts must carry non-empty code deps (calculator
+/// `process_digest_ok_with_extras` rejects empty `cell_deps`).
+pub fn draft_cell_deps_for_batch(
+    process: &ResolvedProcess,
+    tick_cell_deps: &[CellDep],
+) -> Vec<CellDep> {
+    let mut deps = Vec::with_capacity(tick_cell_deps.len() + 1);
+    for dep in tick_cell_deps {
+        if !deps
+            .iter()
+            .any(|d: &CellDep| d.out_point().as_slice() == dep.out_point().as_slice())
+        {
+            deps.push(dep.clone());
+        }
+    }
+    if let Some(code) = &process.code_cell {
+        let dep = CellDep::new_builder()
+            .out_point(code.out_point.clone())
+            .dep_type(DepType::Code.into())
+            .build();
+        if !deps
+            .iter()
+            .any(|d| d.out_point().as_slice() == dep.out_point().as_slice())
+        {
+            deps.push(dep);
+        }
+    }
+    deps
+}
+
+/// Molecule `Transaction` draft: batch inputs plus required code `cell_deps`.
+///
+/// The Process guest copies `cell_deps` / `header_deps` from the draft into the
+/// assembled tx. Empty `cell_deps` is rejected by the calculator submit entry;
+/// callers should pass [`draft_cell_deps_for_batch`] and fail closed if empty.
+pub fn build_batch_draft(
+    intentions: &[ScannedIntention],
+    process: &ResolvedProcess,
+    cell_deps: &[CellDep],
+) -> Vec<u8> {
+    build_draft_tx_with_cell_deps(&draft_cells_for_batch(intentions, process), cell_deps)
+}
+
+fn build_draft_tx_with_cell_deps(cells: &[DraftCell], cell_deps: &[CellDep]) -> Vec<u8> {
+    let inputs: Vec<CellInput> = cells
+        .iter()
+        .map(|c| {
+            CellInput::new_builder()
+                .previous_output(c.out_point.clone())
+                .build()
+        })
+        .collect();
+    Transaction::new_builder()
+        .raw(
+            RawTransaction::new_builder()
+                .inputs(inputs.pack())
+                .cell_deps(cell_deps.to_vec().pack())
+                .build(),
+        )
+        .build()
+        .as_slice()
+        .to_vec()
 }
 
 #[cfg(test)]
@@ -237,7 +300,11 @@ mod tests {
             lock_hash_type: ScriptHashType::Type,
         };
 
-        let draft = build_batch_draft(std::slice::from_ref(&intent), &resolved);
+        let code_dep = ckb_types::packed::CellDep::new_builder()
+            .out_point(code_cell.out_point.clone())
+            .dep_type(ckb_types::core::DepType::Code.into())
+            .build();
+        let draft = build_batch_draft(std::slice::from_ref(&intent), &resolved, &[code_dep]);
         let tip = (0u64, [0xAB; 32]);
         let host = seed_mock_host_from_live_cells(
             &[

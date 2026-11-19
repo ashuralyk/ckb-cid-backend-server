@@ -88,12 +88,24 @@ pub fn fixture_process_entry_with_code(unique: u8, code_args: [u8; 32]) -> Proce
     }
 }
 
+/// Placeholder code CellDep so FakeRpc drafts satisfy non-empty cell_deps.
+pub fn placeholder_code_dep() -> ckb_types::packed::CellDep {
+    use ckb_types::core::DepType;
+    use ckb_types::packed::CellDep;
+    CellDep::new_builder()
+        .out_point(out_point(0xDE, 0))
+        .dep_type(DepType::Code.into())
+        .build()
+}
+
 pub fn default_loop_config() -> LoopConfig {
+    // Calculator submit rejects empty cell_deps; FakeRpc verticals attach a
+    // placeholder code dep so drafts always carry CID/Process-shaped deps.
     LoopConfig {
         cid_code_hash: CID_CODE,
         hash_type: ScriptHashType::Type,
         poll_interval: Duration::from_secs(1),
-        extra_cell_deps: vec![],
+        extra_cell_deps: vec![placeholder_code_dep()],
         type_id_code_deps: vec![],
         confirmation_depth: 1,
         max_assembled_tx_bytes: 512 * 1024,

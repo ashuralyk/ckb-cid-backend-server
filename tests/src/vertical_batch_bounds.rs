@@ -32,7 +32,7 @@ mod tests {
             cid_code_hash: CID_CODE,
             hash_type: ScriptHashType::Type,
             poll_interval: Duration::from_secs(1),
-            extra_cell_deps: vec![],
+            extra_cell_deps: vec![crate::helpers::placeholder_code_dep()],
             type_id_code_deps: vec![],
             confirmation_depth: 1,
             max_assembled_tx_bytes: 512 * 1024,

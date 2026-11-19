@@ -176,9 +176,13 @@ fn mimic_assemble(
 
     let witnesses: Vec<ckb_types::packed::Bytes> =
         (0..inputs.len()).map(|_| Default::default()).collect();
+    // Preserve draft cell_deps / header_deps (Process.assemble copies them).
     let bytes = Transaction::new_builder()
         .raw(
             RawTransaction::new_builder()
+                .version(draft.raw().version())
+                .cell_deps(draft.raw().cell_deps())
+                .header_deps(draft.raw().header_deps())
                 .inputs(inputs.pack())
                 .outputs(outputs.pack())
                 .outputs_data(outputs_data.iter().map(|d| d.as_slice().pack()).pack())

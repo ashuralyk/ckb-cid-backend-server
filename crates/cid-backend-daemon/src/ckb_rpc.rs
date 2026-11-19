@@ -8,7 +8,7 @@
 
 use crate::config::{ConfigError, DaemonConfig};
 use cid_backend_core::host_query::{
-    search_key_molecule_to_json, HostQueryRpc, DEFAULT_HOST_QUERY_PAGE_LIMIT,
+    search_key_molecule_to_json, HostQueryRpc, IndexedLiveCell, DEFAULT_HOST_QUERY_PAGE_LIMIT,
     DEFAULT_HOST_QUERY_TIMEOUT_SECS,
 };
 use cid_backend_core::rpc::{script_hash32, LiveCell, Rpc, RpcError, TxStatus};
@@ -433,7 +433,7 @@ impl HostQueryRpc for CkbRpc {
         search_key_molecule: &[u8],
         limit: u32,
         after: &[u8],
-    ) -> Result<(Vec<LiveCell>, Vec<u8>), RpcError> {
+    ) -> Result<(Vec<IndexedLiveCell>, Vec<u8>), RpcError> {
         let _ = DEFAULT_HOST_QUERY_TIMEOUT_SECS;
         let search_key = search_key_molecule_to_json(search_key_molecule)?;
         let page_limit = u64::from(limit.clamp(1, DEFAULT_HOST_QUERY_PAGE_LIMIT));
@@ -449,7 +449,7 @@ impl HostQueryRpc for CkbRpc {
             .ok_or_else(|| RpcError::Unavailable("get_cells: missing objects".into()))?;
         let mut cells = Vec::with_capacity(objects.len());
         for obj in objects {
-            cells.push(live_cell_from_indexer(obj)?);
+            cells.push(indexed_live_cell_from_indexer(obj)?);
         }
         let next = result
             .get("last_cursor")
@@ -737,6 +737,10 @@ fn parse_hash_type(s: &str) -> Result<ScriptHashType, RpcError> {
 }
 
 fn live_cell_from_indexer(obj: &Value) -> Result<LiveCell, RpcError> {
+    Ok(indexed_live_cell_from_indexer(obj)?.cell)
+}
+
+fn indexed_live_cell_from_indexer(obj: &Value) -> Result<IndexedLiveCell, RpcError> {
     let op = obj
         .get("out_point")
         .ok_or_else(|| RpcError::Unavailable("indexer cell missing out_point".into()))?;
@@ -747,10 +751,24 @@ fn live_cell_from_indexer(obj: &Value) -> Result<LiveCell, RpcError> {
         Some(Value::String(s)) => decode_hex(s)?,
         _ => Vec::new(),
     };
-    Ok(LiveCell {
-        out_point: json_to_out_point(op)?,
-        output: json_to_output(output)?,
-        data,
+    let block_number = obj
+        .get("block_number")
+        .map(parse_uint)
+        .transpose()?
+        .unwrap_or(0);
+    let tx_index = obj
+        .get("tx_index")
+        .map(parse_uint)
+        .transpose()?
+        .unwrap_or(0) as u32;
+    Ok(IndexedLiveCell {
+        cell: LiveCell {
+            out_point: json_to_out_point(op)?,
+            output: json_to_output(output)?,
+            data,
+        },
+        block_number,
+        tx_index,
     })
 }
 
@@ -965,6 +983,7 @@ mod tests {
     use cid_backend_core::ssri::{SsriError, SsriHost};
     use cid_process_executor::{AssembledTx, MockHost};
     use cid_protocol::{CidArgs, Payload, Script as CidScript};
+    use ckb_types::packed::CellDep;
     use serde_json::json;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -1712,12 +1731,24 @@ mod tests {
         );
     }
 
+    fn placeholder_code_dep() -> CellDep {
+        CellDep::new_builder()
+            .out_point(
+                OutPoint::new_builder()
+                    .tx_hash(Byte32::from_slice(&[0xDEu8; 32]).unwrap())
+                    .index(0u32.pack())
+                    .build(),
+            )
+            .dep_type(DepType::Code.into())
+            .build()
+    }
+
     fn digest_loop_cfg(depth: u64) -> LoopConfig {
         LoopConfig {
             cid_code_hash: CID_CODE,
             hash_type: ScriptHashType::Type,
             poll_interval: Duration::from_secs(1),
-            extra_cell_deps: vec![],
+            extra_cell_deps: vec![placeholder_code_dep()],
             type_id_code_deps: vec![],
             confirmation_depth: depth,
             max_assembled_tx_bytes: 512 * 1024,
@@ -2044,7 +2075,7 @@ mod tests {
             cid_code_hash: CID_CODE,
             hash_type: ScriptHashType::Type,
             poll_interval: Duration::from_secs(1),
-            extra_cell_deps: vec![],
+            extra_cell_deps: vec![placeholder_code_dep()],
             type_id_code_deps: vec![],
             confirmation_depth: 1,
             max_assembled_tx_bytes: 512 * 1024,
@@ -2070,7 +2101,7 @@ mod tests {
                 cid_code_hash: CID_CODE,
                 hash_type: ScriptHashType::Type,
                 poll_interval: Duration::from_secs(1),
-                extra_cell_deps: vec![],
+                extra_cell_deps: vec![placeholder_code_dep()],
                 type_id_code_deps: vec![],
                 confirmation_depth: 1,
                 max_assembled_tx_bytes: 512 * 1024,
@@ -2286,7 +2317,7 @@ mod tests {
             cid_code_hash: CID_CODE,
             hash_type: ScriptHashType::Type,
             poll_interval: Duration::from_secs(1),
-            extra_cell_deps: vec![],
+            extra_cell_deps: vec![placeholder_code_dep()],
             type_id_code_deps: vec![],
             confirmation_depth: 1,
             max_assembled_tx_bytes: 512 * 1024,

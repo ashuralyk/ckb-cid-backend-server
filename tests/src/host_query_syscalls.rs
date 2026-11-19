@@ -268,6 +268,59 @@ mod tests {
         assert_eq!(pag_mock.objects.len(), 1);
     }
 
+    /// MockHost / indexer order is `(block_number, tx_index, output_index)`;
+    /// FakeRpc + RpcHostQuery must emit the same order and `tx_index` metadata.
+    #[test]
+    fn fakerpc_get_cells_orders_by_block_tx_output_index_and_emits_tx_index() {
+        let rpc = FakeRpc::new();
+        let lock_code = [0xCCu8; 32];
+        let lock = lock_script(lock_code, ScriptHashType::Type, vec![]);
+        // Insert out of order: later block first, then earlier block with higher
+        // tx_index before lower, then same tx with higher output_index first.
+        let c_high_out = live_cell(out_point(0x20, 1), lock.clone(), None, 50, vec![]);
+        let c_low_out = live_cell(out_point(0x20, 0), lock.clone(), None, 50, vec![]);
+        let c_later_block = live_cell(out_point(0x21, 0), lock.clone(), None, 50, vec![]);
+        let c_same_block_hi_tx = live_cell(out_point(0x22, 0), lock.clone(), None, 50, vec![]);
+        rpc.insert_cell(c_later_block.clone());
+        rpc.insert_cell(c_same_block_hi_tx.clone());
+        rpc.insert_cell(c_high_out.clone());
+        rpc.insert_cell(c_low_out.clone());
+        rpc.set_cell_index_meta(&c_later_block.out_point, 2, 0);
+        rpc.set_cell_index_meta(&c_same_block_hi_tx.out_point, 1, 5);
+        rpc.set_cell_index_meta(&c_high_out.out_point, 1, 1);
+        rpc.set_cell_index_meta(&c_low_out.out_point, 1, 1);
+
+        let key = SearchKey {
+            script: HqScript {
+                code_hash: lock_code,
+                hash_type: 1,
+                args: vec![],
+            },
+            script_type: ScriptType::Lock,
+            script_search_mode: Some(SearchMode::Prefix),
+            filter: None,
+            with_data: Some(false),
+            group_by_transaction: None,
+        };
+        let key_bytes = serde_molecule::to_vec(&key, false).unwrap();
+        let hq = RpcHostQuery::new(&rpc);
+        let page = HostQuery::get_cells(&hq, &key_bytes, 0, 10, &[]).unwrap();
+        let pag: Pagination = serde_molecule::from_slice(&page, false).unwrap();
+        assert_eq!(pag.objects.len(), 4);
+        let keys: Vec<(u64, u32, u32)> = pag
+            .objects
+            .iter()
+            .map(|o| (o.block_number, o.tx_index, o.out_point.index))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![(1, 1, 0), (1, 1, 1), (1, 5, 0), (2, 0, 0)],
+            "expected (block_number, tx_index, output_index) ascending"
+        );
+        assert_eq!(pag.objects[0].tx_index, 1);
+        assert_eq!(pag.objects[2].tx_index, 5);
+    }
+
     /// Drive the real `ProcessExecutor` guest so find_cell / find_cell_data /
     /// get_block_hash syscalls run inside ckb-vm (example Process assemble path).
     #[test]

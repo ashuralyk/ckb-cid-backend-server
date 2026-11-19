@@ -127,7 +127,7 @@ dependencies = [
 [[package]]
 name = "cid-process-executor"
 version = "0.1.0"
-source = "git+https://github.com/ashuralyk/ckb-common-intention-dispatcher?rev=5e98f123b1e3374d0e550130c3b09a5a878090f0#5e98f123b1e3374d0e550130c3b09a5a878090f0"
+source = "git+https://github.com/ashuralyk/ckb-common-intention-dispatcher?rev=b7c6f7e622c2664fcb0e6625dd4891e7df59900a#b7c6f7e622c2664fcb0e6625dd4891e7df59900a"
 dependencies = [
  "anyhow",
  "ckb-hash 1.1.1",
@@ -141,7 +141,7 @@ dependencies = [
 [[package]]
 name = "cid-protocol"
 version = "0.1.0"
-source = "git+https://github.com/ashuralyk/ckb-common-intention-dispatcher?rev=5e98f123b1e3374d0e550130c3b09a5a878090f0#5e98f123b1e3374d0e550130c3b09a5a878090f0"
+source = "git+https://github.com/ashuralyk/ckb-common-intention-dispatcher?rev=b7c6f7e622c2664fcb0e6625dd4891e7df59900a#b7c6f7e622c2664fcb0e6625dd4891e7df59900a"
 dependencies = [
  "serde",
  "serde_molecule",
