@@ -114,6 +114,7 @@ struct PendingBatch {
     window: Vec<ScannedIntention>,
     rest: Vec<ScannedIntention>,
     min: u32,
+    refund_only: bool,
 }
 
 /// Completed RunBatch poll result for the digest loop.
@@ -125,6 +126,7 @@ pub struct PolledBatch {
     pub window: Vec<ScannedIntention>,
     pub rest: Vec<ScannedIntention>,
     pub min: u32,
+    pub refund_only: bool,
 }
 
 /// Handle to a Process worker thread.
@@ -190,6 +192,7 @@ impl ProcessWorker {
                     window: pending.window,
                     rest: pending.rest,
                     min: pending.min,
+                    refund_only: pending.refund_only,
                 })
             }
             Err(mpsc::TryRecvError::Empty) => None,
@@ -207,6 +210,7 @@ impl ProcessWorker {
                     window: pending.window,
                     rest: pending.rest,
                     min: pending.min,
+                    refund_only: pending.refund_only,
                 })
             }
         }
@@ -266,6 +270,7 @@ impl ProcessWorker {
             window: batch,
             rest,
             min,
+            refund_only,
         });
         Ok(())
     }
