@@ -1,10 +1,23 @@
-use cid_backend_core::rpc::LiveCell;
+use std::time::Duration;
+
+use cid_backend_core::digest_loop::{DigestLoop, LoopConfig, NopClock};
+use cid_backend_core::process::{ProcessEntry, ProcessResolver};
+use cid_backend_core::rpc::{LiveCell, Rpc};
+use cid_backend_core::ssri::SsriHost;
+use cid_backend_core::type_id::{
+    type_id_script, type_id_script_hash, TypeIdIdentity, TYPE_ID_CODE_HASH,
+};
 use cid_protocol::{CidArgs, Payload, Script as CidScript};
 use ckb_types::core::ScriptHashType;
 use ckb_types::packed::{Byte32, CellOutput, OutPoint, Script};
 use ckb_types::prelude::*;
 
 pub const CID_CODE: [u8; 32] = [0xC1; 32];
+
+/// Fixed TYPE_ID args for the Process **code** cell (lock on state cell).
+pub const PROC_CODE_ARGS: [u8; 32] = [0xCD; 32];
+
+pub const FIXTURE_ELF: &[u8] = &[0x7f, b'E', b'L', b'F', 1];
 
 pub fn out_point(tx_fill: u8, index: u32) -> OutPoint {
     OutPoint::new_builder()
@@ -49,14 +62,125 @@ pub fn user_lock() -> CidScript {
     }
 }
 
-pub fn process_type_script(unique: u8) -> Script {
-    lock_script([0x51; 32], ScriptHashType::Type, vec![unique; 32])
+pub fn state_args(unique: u8) -> [u8; 32] {
+    [unique; 32]
 }
 
-/// Process state type script bound to a Type-ID–deployed Process **code**
-/// (`hash_type=type`, `code_hash` = derived TYPE_ID script hash).
-pub fn process_type_script_for_code(code_hash: [u8; 32], unique: u8) -> Script {
-    lock_script(code_hash, ScriptHashType::Type, vec![unique; 32])
+/// Process state TYPE_ID type script (identity = `calc_script_hash` = Intention `process_type_hash`).
+pub fn process_type_script(unique: u8) -> Script {
+    type_id_script(&state_args(unique))
+}
+
+pub fn process_type_hash(unique: u8) -> [u8; 32] {
+    type_id_script_hash(&state_args(unique))
+}
+
+pub fn fixture_process_entry(unique: u8) -> ProcessEntry {
+    fixture_process_entry_with_code(unique, PROC_CODE_ARGS)
+}
+
+pub fn fixture_process_entry_with_code(unique: u8, code_args: [u8; 32]) -> ProcessEntry {
+    let state = state_args(unique);
+    ProcessEntry {
+        identity_type_hash: type_id_script_hash(&state),
+        identity: TypeIdIdentity::new(state),
+        code: TypeIdIdentity::new(code_args),
+        ssri_elf_path: None,
+    }
+}
+
+pub fn default_loop_config() -> LoopConfig {
+    LoopConfig {
+        cid_code_hash: CID_CODE,
+        hash_type: ScriptHashType::Type,
+        poll_interval: Duration::from_secs(1),
+        extra_cell_deps: vec![],
+        type_id_code_deps: vec![],
+        confirmation_depth: 1,
+        max_assembled_tx_bytes: 512 * 1024,
+    }
+}
+
+pub fn digest_loop_empty<R: Rpc, S: SsriHost>(
+    rpc: R,
+    ssri: S,
+    config: LoopConfig,
+) -> DigestLoop<R, NopClock, S> {
+    DigestLoop::new(rpc, NopClock, ssri, config)
+}
+
+pub fn register_fixture(loop_: &mut DigestLoop<impl Rpc, impl cid_backend_core::digest_loop::Clock, impl SsriHost>, unique: u8) {
+    let entry = fixture_process_entry(unique);
+    loop_.register_process(entry);
+    if let Some(w) = loop_.workers_mut().get_mut(&fixture_process_entry(unique).identity_type_hash) {
+        w.resolver = ProcessResolver::for_entry(fixture_process_entry(unique))
+            .with_fallback_binary(FIXTURE_ELF.to_vec());
+    }
+}
+
+pub fn loop_with_resolver<R: Rpc, S: SsriHost>(
+    rpc: R,
+    ssri: S,
+    config: LoopConfig,
+    unique: u8,
+) -> DigestLoop<R, NopClock, S> {
+    let entry = fixture_process_entry(unique);
+    DigestLoop::new_with_resolver(
+        rpc,
+        NopClock,
+        ssri,
+        config,
+        ProcessResolver::for_entry(entry).with_fallback_binary(FIXTURE_ELF.to_vec()),
+    )
+}
+
+pub fn loop_with_resolver_and_code<R: Rpc, S: SsriHost>(
+    rpc: R,
+    ssri: S,
+    config: LoopConfig,
+    unique: u8,
+    code_args: [u8; 32],
+) -> DigestLoop<R, NopClock, S> {
+    let entry = fixture_process_entry_with_code(unique, code_args);
+    DigestLoop::new_with_resolver(
+        rpc,
+        NopClock,
+        ssri,
+        config,
+        ProcessResolver::for_entry(entry).with_fallback_binary(FIXTURE_ELF.to_vec()),
+    )
+}
+
+/// Process state cell: Process-as-lock (lock = Process code TYPE_ID type-script hash).
+pub fn process_cell(unique: u8, capacity: u64, data: Vec<u8>) -> LiveCell {
+    process_cell_for_code(unique, capacity, data, PROC_CODE_ARGS)
+}
+
+pub fn process_cell_for_code(
+    unique: u8,
+    capacity: u64,
+    data: Vec<u8>,
+    code_args: [u8; 32],
+) -> LiveCell {
+    let entry = fixture_process_entry_with_code(unique, code_args);
+    let lock = Script::new_builder()
+        .code_hash(entry.code.type_script_hash().pack())
+        .hash_type(ScriptHashType::Type.into())
+        .args(Vec::<u8>::new().pack())
+        .build();
+    let ts = type_id_script(&entry.identity.args);
+    live_cell(
+        out_point(0x50, unique as u32),
+        lock,
+        Some(ts),
+        capacity,
+        data,
+    )
+}
+
+/// @deprecated — use `process_type_script` / `process_cell_for_code` with registry entry instead.
+pub fn process_type_script_for_code(_code_hash: [u8; 32], unique: u8) -> Script {
+    process_type_script(unique)
 }
 
 pub fn cid_lock_args(process_type_hash: [u8; 32]) -> Vec<u8> {
@@ -88,30 +212,5 @@ pub fn intention_cell_with_lock(
         None,
         capacity,
         vec![],
-    )
-}
-
-pub fn process_cell(unique: u8, capacity: u64, data: Vec<u8>) -> LiveCell {
-    live_cell(
-        out_point(0x50, unique as u32),
-        lock_script([0u8; 32], ScriptHashType::Type, vec![]),
-        Some(process_type_script(unique)),
-        capacity,
-        data,
-    )
-}
-
-pub fn process_cell_for_code(
-    unique: u8,
-    capacity: u64,
-    data: Vec<u8>,
-    code_hash: [u8; 32],
-) -> LiveCell {
-    live_cell(
-        out_point(0x50, unique as u32),
-        lock_script([0u8; 32], ScriptHashType::Type, vec![]),
-        Some(process_type_script_for_code(code_hash, unique)),
-        capacity,
-        data,
     )
 }

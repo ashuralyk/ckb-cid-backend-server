@@ -9,7 +9,7 @@ mod tests {
     use ckb_types::prelude::*;
 
     use crate::fake_rpc::FakeRpc;
-    use crate::helpers::{intention_cell, process_cell, process_type_script, user_lock, CID_CODE};
+    use crate::helpers::{intention_cell, process_cell, process_type_script, user_lock, CID_CODE, loop_with_resolver};
     use crate::scripted_ssri::ScriptedSsri;
 
     #[test]
@@ -22,9 +22,8 @@ mod tests {
         rpc.insert_cell(intent.clone());
         rpc.insert_cell(proc.clone());
 
-        let mut loop_ = DigestLoop::new(
+        let mut loop_ = loop_with_resolver(
             rpc,
-            NopClock,
             ScriptedSsri::incompatible(21),
             LoopConfig {
                 cid_code_hash: CID_CODE,
@@ -33,11 +32,9 @@ mod tests {
                 extra_cell_deps: vec![],
                 type_id_code_deps: vec![],
                 confirmation_depth: 1,
-                fee_rate: 1000,
-                bounded_refund_locks: vec![],
-                extra_scan_locks: vec![],
+                max_assembled_tx_bytes: 512 * 1024,
             },
-            ProcessResolver::new(),
+            3,
         );
         let report = loop_.tick();
         assert_eq!(report.submitted, 1);

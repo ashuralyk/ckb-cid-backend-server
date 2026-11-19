@@ -9,7 +9,7 @@ mod tests {
     use ckb_types::prelude::*;
 
     use crate::fake_rpc::FakeRpc;
-    use crate::helpers::{intention_cell, process_cell, process_type_script, CID_CODE};
+    use crate::helpers::{intention_cell, process_cell, process_type_script, CID_CODE, loop_with_resolver};
     use crate::scripted_ssri::ScriptedSsri;
 
     fn cfg(depth: u64) -> LoopConfig {
@@ -20,9 +20,7 @@ mod tests {
             extra_cell_deps: vec![],
             type_id_code_deps: vec![],
             confirmation_depth: depth,
-            fee_rate: 1000,
-            bounded_refund_locks: vec![],
-            extra_scan_locks: vec![],
+            max_assembled_tx_bytes: 512 * 1024,
         }
     }
 
@@ -36,12 +34,11 @@ mod tests {
         let proc = process_cell(22, 200_0000_0000, vec![0x7f, b'E', b'L', b'F', 22]);
         rpc.insert_cell(intent.clone());
         rpc.insert_cell(proc.clone());
-        let mut loop_ = DigestLoop::new(
+        let mut loop_ = loop_with_resolver(
             rpc,
-            NopClock,
             ScriptedSsri::mimic((1, 4)),
             cfg(3),
-            ProcessResolver::new(),
+            22,
         );
 
         assert_eq!(loop_.tick().submitted, 1);
@@ -50,7 +47,7 @@ mod tests {
         loop_.rpc().advance_tip(1);
         let confirming = loop_.tick();
         assert_eq!(confirming.submitted, 0);
-        assert!(loop_.state().submit.pending_occupies(&proc.out_point));
+        assert!(loop_.state().submit.as_ref().unwrap().pending_occupies(&proc.out_point));
         assert_eq!(loop_.rpc().submitted().len(), 1);
 
         loop_.rpc().simulate_drop(&tx_hash);
@@ -74,7 +71,7 @@ mod tests {
         assert_eq!(loop_.rpc().submitted().len(), 2);
         assert!(loop_
             .state()
-            .submit
+            .submit.as_ref().unwrap()
             .in_flight
             .contains(&out_point_key(&proc.out_point)));
     }
@@ -88,12 +85,11 @@ mod tests {
         let proc = process_cell(23, 200_0000_0000, vec![0x7f, b'E', b'L', b'F', 23]);
         rpc.insert_cell(intent.clone());
         rpc.insert_cell(proc.clone());
-        let mut loop_ = DigestLoop::new(
+        let mut loop_ = loop_with_resolver(
             rpc,
-            NopClock,
             ScriptedSsri::mimic((1, 4)),
             cfg(1),
-            ProcessResolver::new(),
+            23,
         );
 
         assert_eq!(loop_.tick().submitted, 1);
@@ -103,8 +99,8 @@ mod tests {
         assert!(
             !loop_
                 .state()
-                .submit
-                .pending
+                .submit.as_ref().unwrap()
+            .pending
                 .contains_key(tx_hash.as_slice()),
             "depth 1 settles on first committed sight at tip"
         );
@@ -136,12 +132,11 @@ mod tests {
         for i in 1..=4 {
             rpc.insert_cell(intention_cell(i, hash, 100_0000_0000));
         }
-        let mut loop_ = DigestLoop::new(
+        let mut loop_ = loop_with_resolver(
             rpc,
-            NopClock,
             ScriptedSsri::mimic((2, 2)),
             cfg(4),
-            ProcessResolver::new(),
+            24,
         );
 
         assert_eq!(loop_.tick().submitted, 1);
@@ -150,13 +145,13 @@ mod tests {
         loop_.rpc().advance_tip(2);
         assert_eq!(loop_.rpc().tip(), 12);
         assert_eq!(loop_.tick().submitted, 0);
-        assert!(loop_.state().submit.pending_occupies(&proc.out_point));
+        assert!(loop_.state().submit.as_ref().unwrap().pending_occupies(&proc.out_point));
 
         loop_.rpc().set_tip(10);
         let rewound = loop_.tick();
         assert_eq!(rewound.submitted, 0, "tip rewind must not settle");
         assert_eq!(loop_.rpc().submitted().len(), 1);
-        assert!(loop_.state().submit.pending_occupies(&proc.out_point));
+        assert!(loop_.state().submit.as_ref().unwrap().pending_occupies(&proc.out_point));
         assert_eq!(loop_.state().last_tip, Some(10));
 
         loop_.rpc().advance_tip(3);
@@ -176,12 +171,11 @@ mod tests {
         let proc = process_cell(25, 200_0000_0000, vec![0x7f, b'E', b'L', b'F', 25]);
         rpc.insert_cell(intent.clone());
         rpc.insert_cell(proc.clone());
-        let mut loop_ = DigestLoop::new(
+        let mut loop_ = loop_with_resolver(
             rpc,
-            NopClock,
             ScriptedSsri::mimic((1, 4)),
             cfg(4),
-            ProcessResolver::new(),
+            25,
         );
 
         assert_eq!(loop_.tick().submitted, 1);
