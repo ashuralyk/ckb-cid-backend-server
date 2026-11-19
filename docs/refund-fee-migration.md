@@ -48,10 +48,13 @@ demands exact capacity.
 ## Enabling bounded refunds (after revised lock ships)
 
 1. Deploy the audited CID lock that enforces PR #12 rules (OWNER redeploy).
-2. Point primary `cid_lock.code_hash` / Type-ID at the **new** deployed hash.
+2. Point primary CID identity at the **new** deployed lock — prefer
+   `cid_lock.type_id_args` so scan `code_hash` is the Type-ID type-script hash
+   with `hash_type=type` (CellDeps refresh across upgrades). Do not point the
+   primary at a stale binary `data_hash` on Type-ID networks.
 3. Add that identity to `[[cid_lock.bounded_refund_locks]]` (or
    `CID_BOUNDED_REFUND_LOCKS=0x…:hash_type`). Never list undeployed candidates.
-4. Optionally list old locks under `[[cid_lock.legacy_scan_locks]]` so the
+4. List old data-hash locks under `[[cid_lock.legacy_scan_locks]]` so the
    daemon continues draining exact-refund Intentions after redeploy.
 5. Keep `digest_ok` Process fee path unchanged (`loop.fee_rate`).
 

@@ -10,16 +10,21 @@
 # unless validate_genesis = true (then the daemon fail-closes on mismatch
 # or RPC error).
 #
-# Contract code discovery (preferred for hash_type=type deployments):
+# Contract code discovery (preferred for Type-ID / hash_type=type networks):
 #   type_id_args = 32-byte TYPE_ID type-script args on the CODE cell
 #   type_id      = optional full type-script hash (calc_script_hash of
 #                  built-in TYPE_ID + type_id_args). Fail-closed check only.
 #   NEVER put a full type_id hash into type_id_args.
+# Intention scan identity when type_id_args is set:
+#   code_hash = derived type_id, hash_type = type
+#   (NOT the binary data_hash — that only appears via legacy_scan_locks or an
+#    explicit data/data1/data2 primary for local fixtures.)
 # Live Process *state* cells are still found by process_type_hash from CID
 # args (full type script hash) + process type code_hash prefixes — that is
 # not the same as the Process CODE cell's TYPE_ID identity.
 # Daemon never loads dispatcher deployment JSON and never auto-discovers
 # from chain without these configured identities. No keys. No signing.
+# Filled testnet example: examples/cid.testnet.toml
 
 [network]
 name = "<NETWORK_LABEL>"
@@ -31,22 +36,26 @@ url = "<CKB_NODE_JSON_RPC_URL>"
 # indexer_url = "<CKB_INDEXER_JSON_RPC_URL>"  # omit to use url
 
 [cid_lock]
-# Type-ID deploy (hash_type=type): set type_id_args; code_hash is derived.
+# Type-ID deploy (preferred): set type_id_args; scan code_hash is derived;
+# hash_type is forced to type; live code CellDep refreshed each tick.
 type_id_args = "<CID_LOCK_TYPE_ID_ARGS_32>"
 type_id = "<CID_LOCK_TYPE_ID_FULL_HASH_32>"   # optional verify; must match derived
-# Legacy / local data1 fixtures (no Type-ID discovery for this role):
-# code_hash = "<CID_LOCK_CODE_HASH_32>"
+# Local / fixture data-hash primary (ALLOWED without type_id_args; no auto
+# CellDep refresh for this role — use static [[cell_deps]] / CID_*_CELL_DEP):
+# code_hash = "<CID_LOCK_DATA_HASH_32>"
 # hash_type = "data1"
+# Ambiguous mixes fail closed (type_id_args + data1 hash_type; type_id without
+# type_id_args; code_hash ≠ derived type_id when both set).
 # Bounded Incompatible refund fee allowlist (≤ 0.01 CKB / Intention).
 # Empty (default) = exact refund for all locks. List ONLY audited deployed
 # identities that enforce contract PR #12 (F>=S). Never undeployed candidates.
 # See docs/refund-fee-migration.md.
 # [[cid_lock.bounded_refund_locks]]
-# code_hash = "<AUDITED_DEPLOYED_CID_LOCK_HASH_32>"
-# hash_type = "data1"
-# Optional: keep scanning legacy exact-refund locks after redeploy.
+# code_hash = "<AUDITED_DEPLOYED_CID_LOCK_TYPE_ID_OR_HASH_32>"
+# hash_type = "type"
+# Optional: keep scanning legacy data-hash Intentions after Type-ID redeploy.
 # [[cid_lock.legacy_scan_locks]]
-# code_hash = "<LEGACY_CID_LOCK_HASH_32>"
+# code_hash = "<LEGACY_CID_LOCK_DATA_HASH_32>"
 # hash_type = "data1"
 
 [process]

@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use cid_backend_core::process::ProcessResolver;
-    use cid_backend_core::rpc::{script_hash32, Rpc};
+    use cid_backend_core::rpc::script_hash32;
     use ckb_types::core::ScriptHashType;
 
     use crate::fake_rpc::FakeRpc;

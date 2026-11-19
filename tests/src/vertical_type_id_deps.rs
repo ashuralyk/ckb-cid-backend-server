@@ -1,5 +1,7 @@
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::inconsistent_digit_grouping)]
+
     use std::time::Duration;
 
     use cid_backend_core::code_deps::PROCESS_CODE_LABEL;
@@ -15,8 +17,8 @@ mod tests {
 
     use crate::fake_rpc::FakeRpc;
     use crate::helpers::{
-        intention_cell, process_cell, process_cell_for_code, process_type_script,
-        process_type_script_for_code, CID_CODE,
+        intention_cell, intention_cell_with_lock, process_cell, process_cell_for_code,
+        process_type_script, process_type_script_for_code, CID_CODE,
     };
     use crate::scripted_ssri::ScriptedSsri;
 
@@ -641,5 +643,193 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("dep_type"));
+    }
+
+    fn type_ref_cfg(cid_args: [u8; 32], type_id_code_deps: Vec<TypeIdCodeDep>) -> LoopConfig {
+        LoopConfig {
+            cid_code_hash: type_id_script_hash(&cid_args),
+            hash_type: ScriptHashType::Type,
+            poll_interval: Duration::from_secs(1),
+            extra_cell_deps: vec![],
+            type_id_code_deps,
+            confirmation_depth: 1,
+            fee_rate: 1000,
+            bounded_refund_locks: vec![],
+            extra_scan_locks: vec![],
+        }
+    }
+
+    /// Primary scan identity is the Type-ID type-script hash (`hash_type=type`).
+    /// DigestOk deducts fee from the Process recreate (Type-ID Process code ELF).
+    #[test]
+    fn type_referenced_intention_digest_ok_with_process_fee() {
+        use cid_backend_core::{fee_for_size, tx_size_in_block};
+
+        let cid_args = [0xc1; 32];
+        let proc_args = [0xc2; 32];
+        let cid_lock_hash = type_id_script_hash(&cid_args);
+        let rpc = FakeRpc::new();
+        let intent_cap = 100_0000_0000u64;
+        let proc_cap = 200_0000_0000u64;
+        let (hash, proc) =
+            process_for_type_id(21, proc_cap, vec![0x7f, b'E', b'L', b'F', 21], proc_args);
+        let intent =
+            intention_cell_with_lock(21, hash, intent_cap, cid_lock_hash, ScriptHashType::Type);
+        let cid_code = code_cell(0x81, cid_args, vec![0x7f, b'E', b'L', b'F', 0x11]);
+        let proc_code = code_cell(0x82, proc_args, vec![0x7f, b'E', b'L', b'F', 0x22]);
+        rpc.insert_cell(intent);
+        rpc.insert_cell(proc);
+        rpc.insert_cell(cid_code.clone());
+        rpc.insert_cell(proc_code.clone());
+
+        let mut loop_ = DigestLoop::new(
+            rpc,
+            NopClock,
+            ScriptedSsri::mimic((1, 4)),
+            type_ref_cfg(
+                cid_args,
+                vec![
+                    TypeIdCodeDep {
+                        label: "cid_lock".into(),
+                        identity: TypeIdIdentity::new(cid_args),
+                    },
+                    TypeIdCodeDep {
+                        label: PROCESS_CODE_LABEL.into(),
+                        identity: TypeIdIdentity::new(proc_args),
+                    },
+                ],
+            ),
+            process_code_resolver(proc_args),
+        );
+        let report = loop_.tick();
+        assert_eq!(report.submitted, 1, "{:?}", report.last_error);
+        let tx = &loop_.rpc().submitted()[0];
+        assert_eq!(tx.inputs().len(), 2, "no fee input");
+        let caps: Vec<u64> = tx
+            .outputs()
+            .into_iter()
+            .map(|o| o.capacity().unpack())
+            .collect();
+        assert_eq!(caps[0], intent_cap, "beneficiary untouched");
+        assert!(caps[1] < proc_cap, "Process recreate pays fee");
+        let paid = proc_cap - caps[1];
+        let need = fee_for_size(tx_size_in_block(tx), 1000);
+        assert!(paid >= need, "paid={paid} need={need}");
+        let deps: Vec<_> = tx.cell_deps().into_iter().collect();
+        assert!(deps.iter().any(|d| d.out_point() == cid_code.out_point));
+        assert!(deps.iter().any(|d| d.out_point() == proc_code.out_point));
+    }
+
+    /// Upgrade replaces the code-cell outpoint (new data hash) under the same
+    /// Type ID. The still-live type-referenced Intention is scanned and
+    /// executed with the new CellDep.
+    #[test]
+    fn type_referenced_intention_survives_code_cell_upgrade() {
+        let cid_args = [0xc3; 32];
+        let proc_args = [0xc4; 32];
+        let cid_lock_hash = type_id_script_hash(&cid_args);
+        let rpc = FakeRpc::new();
+        let (hash, proc) = process_for_type_id(
+            22,
+            200_0000_0000,
+            vec![0x7f, b'E', b'L', b'F', 22],
+            proc_args,
+        );
+        let intent =
+            intention_cell_with_lock(22, hash, 100_0000_0000, cid_lock_hash, ScriptHashType::Type);
+        let code_v1 = code_cell(0x83, cid_args, vec![0x7f, b'E', b'L', b'F', 1]);
+        let proc_code = code_cell(0x84, proc_args, vec![0x7f, b'E', b'L', b'F', 0x22]);
+        rpc.insert_cell(intent.clone());
+        rpc.insert_cell(proc);
+        rpc.insert_cell(code_v1.clone());
+        rpc.insert_cell(proc_code);
+
+        // Upgrade before digest: same Type ID args, new outpoint / data.
+        rpc.consume(&code_v1.out_point);
+        let code_v2 = code_cell(0x85, cid_args, vec![0x7f, b'E', b'L', b'F', 2]);
+        rpc.insert_cell(code_v2.clone());
+
+        let mut loop_ = DigestLoop::new(
+            rpc,
+            NopClock,
+            ScriptedSsri::mimic((1, 4)),
+            type_ref_cfg(
+                cid_args,
+                vec![
+                    TypeIdCodeDep {
+                        label: "cid_lock".into(),
+                        identity: TypeIdIdentity::new(cid_args),
+                    },
+                    TypeIdCodeDep {
+                        label: PROCESS_CODE_LABEL.into(),
+                        identity: TypeIdIdentity::new(proc_args),
+                    },
+                ],
+            ),
+            process_code_resolver(proc_args),
+        );
+        let report = loop_.tick();
+        assert_eq!(report.submitted, 1, "{:?}", report.last_error);
+        assert!(
+            !loop_.rpc().has_cell(&intent.out_point),
+            "same Intention must be consumed"
+        );
+        let dep = loop_.rpc().submitted()[0].cell_deps().get(0).unwrap();
+        assert_eq!(dep.out_point(), code_v2.out_point);
+        assert_ne!(dep.out_point(), code_v1.out_point);
+    }
+
+    /// Data1 (binary data_hash) Intentions are not scanned under a Type-ID
+    /// primary identity unless listed in `extra_scan_locks` / legacy_scan_locks.
+    #[test]
+    fn data1_intention_ignored_unless_legacy_scan_locks() {
+        let cid_args = [0xc5; 32];
+        let cid_lock_hash = type_id_script_hash(&cid_args);
+        let legacy_data_hash = [0xd1; 32];
+        let rpc = FakeRpc::new();
+        let ts = process_type_script(23);
+        let hash = script_hash32(&ts);
+        let data1_intent = intention_cell_with_lock(
+            23,
+            hash,
+            100_0000_0000,
+            legacy_data_hash,
+            ScriptHashType::Data1,
+        );
+        rpc.insert_cell(data1_intent.clone());
+        rpc.insert_cell(process_cell(
+            23,
+            200_0000_0000,
+            vec![0x7f, b'E', b'L', b'F', 23],
+        ));
+        rpc.insert_cell(code_cell(0x86, cid_args, vec![0x7f, b'E', b'L', b'F']));
+
+        let mut loop_ = DigestLoop::new(
+            rpc,
+            NopClock,
+            ScriptedSsri::mimic((1, 4)),
+            type_ref_cfg(
+                cid_args,
+                vec![TypeIdCodeDep {
+                    label: "cid_lock".into(),
+                    identity: TypeIdIdentity::new(cid_args),
+                }],
+            ),
+            ProcessResolver::new(),
+        );
+        let report = loop_.tick();
+        assert_eq!(report.submitted, 0, "data1 must not match type primary");
+        assert_eq!(report.scanned, 0);
+        assert!(loop_.rpc().has_cell(&data1_intent.out_point));
+
+        loop_.config_mut().extra_scan_locks = vec![cid_backend_core::CidLockIdentity::new(
+            legacy_data_hash,
+            ScriptHashType::Data1,
+        )];
+        // Keep primary type-ref for CellDep; legacy identity unlocks the scan.
+        assert_eq!(loop_.config().cid_code_hash, cid_lock_hash);
+        let report2 = loop_.tick();
+        assert_eq!(report2.submitted, 1, "{:?}", report2.last_error);
+        assert!(!loop_.rpc().has_cell(&data1_intent.out_point));
     }
 }
