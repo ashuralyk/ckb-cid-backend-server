@@ -7,7 +7,7 @@ const DEFAULT_MAX_ASSEMBLED_TX_BYTES: usize = 512 * 1024;
 use crate::fee::{CidLockIdentity, RefundPolicy};
 use crate::host_query::HostQueryRpc;
 use crate::process::ResolvedProcess;
-use crate::rpc::{Rpc, RpcError};
+use crate::rpc::{out_point_key, Rpc, RpcError};
 use crate::scan::ScannedIntention;
 use crate::ssri::{
     build_batch_draft, draft_cell_deps_for_batch, draft_cells_for_batch, SsriError, SsriHost,
@@ -40,6 +40,9 @@ pub enum BatchOutcome {
     CachedRejected,
     Continue,
     ProcessOccupied,
+    /// Soft retry (e.g. [`AssembleError::RefundFeeUnaffordable`]): do **not**
+    /// cache `rejected_combos` and do **not** trigger isolate drop_first/shrink.
+    RetryLater,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -62,6 +65,8 @@ pub struct ProcessBatchParams<'a> {
     pub max_assembled_tx_bytes: usize,
     pub job_epoch: u64,
     pub epoch: Arc<AtomicU64>,
+    /// Skip SSRI assemble; run DigestIncompatible refunds only (below-min leftovers).
+    pub refund_only: bool,
 }
 
 fn batch_cancelled(epoch: &AtomicU64, job_epoch: u64) -> bool {
@@ -110,13 +115,14 @@ where
         max_assembled_tx_bytes,
         job_epoch,
         epoch,
+        refund_only,
     } = params;
     let mut report = BatchReportDelta::default();
 
     // Narrow lock: cache / occupancy prechecks only.
     {
         let worker = state.lock().expect("process worker state");
-        if window_combo_cached(&worker, &batch, process, execution_code_key) {
+        if !refund_only && window_combo_cached(&worker, &batch, process, execution_code_key) {
             tracing::debug!(
                 target: LOG_TARGET,
                 event = "submit.rejected_combo",
@@ -133,6 +139,25 @@ where
             report.skipped += batch.len();
             return (BatchOutcome::ProcessOccupied, report);
         }
+    }
+
+    if refund_only {
+        tracing::info!(
+            target: LOG_TARGET,
+            event = "refund.below_min_retry",
+            n = batch.len(),
+        );
+        return handle_incompatible_refunds(
+            rpc.as_ref(),
+            hash,
+            &state,
+            &batch,
+            INCOMPATIBLE_BATCH,
+            execution_code_key,
+            tick_cell_deps,
+            refund_policy,
+            &mut report,
+        );
     }
 
     let cell_deps = draft_cell_deps_for_batch(process, tick_cell_deps);
@@ -446,6 +471,7 @@ fn handle_incompatible_refunds<R: Rpc + HostQueryRpc>(
     }
 
     let mut submitted = false;
+    let mut retry_later = false;
     let mut rejection = None;
     for (_id, group) in by_identity {
         if group.is_empty() {
@@ -464,6 +490,7 @@ fn handle_incompatible_refunds<R: Rpc + HostQueryRpc>(
         );
         match outcome {
             BatchOutcome::Submitted => submitted = true,
+            BatchOutcome::RetryLater => retry_later = true,
             BatchOutcome::Rejected => rejection = Some(outcome),
             BatchOutcome::CachedRejected => {
                 rejection.get_or_insert(outcome);
@@ -474,7 +501,11 @@ fn handle_incompatible_refunds<R: Rpc + HostQueryRpc>(
 
     // Each group was authorized by the same guest result. Finish independent
     // refunds even when another identity has to be split and retried.
-    let outcome = rejection.unwrap_or(if submitted {
+    // Fee-unaffordable groups must not become Rejected (no isolate shrink) and
+    // stay marked for below-min refund retries on later ticks (P2/P3).
+    let outcome = rejection.unwrap_or(if retry_later {
+        BatchOutcome::RetryLater
+    } else if submitted {
         BatchOutcome::Submitted
     } else {
         BatchOutcome::Continue
@@ -523,9 +554,16 @@ fn assemble_and_submit_refund<R: Rpc + HostQueryRpc>(
             }
             Err(e @ AssembleError::RefundFeeUnaffordable { .. }) => {
                 tracing::warn!(target: LOG_TARGET, event = "refund.fee_unaffordable", error = %e);
-                // Reuse the split path without caching an unaffordable window.
+                // Non-permanent: do not cache rejected_combos and do not isolate-split
+                // (shrinking cannot raise fee budget). Mark for below-min retry.
                 report.last_error = Some(e.to_string());
-                return BatchOutcome::Rejected;
+                let mut worker = state.lock().expect("process worker state");
+                for item in group {
+                    worker
+                        .pending_incompatible_refund
+                        .insert(out_point_key(&item.out_point));
+                }
+                return BatchOutcome::RetryLater;
             }
             Err(e) => {
                 tracing::warn!(
@@ -589,6 +627,11 @@ fn assemble_and_submit_refund<R: Rpc + HostQueryRpc>(
                 event = "submit.ok",
                 tx_hash = %hex_pref(tx_hash.as_slice()),
             );
+            for item in group {
+                worker
+                    .pending_incompatible_refund
+                    .remove(&out_point_key(&item.out_point));
+            }
             report.submitted += 1;
             BatchOutcome::Submitted
         }
