@@ -635,6 +635,7 @@ mod tests {
     }
 
     struct EmptyRpc;
+    cid_backend_core::impl_host_query_rpc_stubs!(EmptyRpc);
     impl Rpc for EmptyRpc {
         fn list_live_intentions(
             &self,
@@ -668,6 +669,38 @@ mod tests {
     }
 
     struct DownRpc;
+
+    impl cid_backend_core::HostQueryRpc for DownRpc {
+        fn get_live_cell(
+            &self,
+            _: &ckb_types::packed::OutPoint,
+        ) -> Result<Option<cid_backend_core::rpc::LiveCell>, cid_backend_core::rpc::RpcError> {
+            Err(RpcError::Unavailable("indexer down".into()))
+        }
+
+        fn get_block_hash(&self, _: u64) -> Result<Option<[u8; 32]>, cid_backend_core::rpc::RpcError> {
+            Err(RpcError::Unavailable("indexer down".into()))
+        }
+
+        fn get_header_by_number(&self, _: u64) -> Result<Option<Vec<u8>>, cid_backend_core::rpc::RpcError> {
+            Err(RpcError::Unavailable("indexer down".into()))
+        }
+
+        fn get_header(&self, _: &[u8; 32]) -> Result<Option<Vec<u8>>, cid_backend_core::rpc::RpcError> {
+            Err(RpcError::Unavailable("indexer down".into()))
+        }
+
+        fn get_cells_page(
+            &self,
+            _: &[u8],
+            _: u32,
+            _: &[u8],
+        ) -> Result<(Vec<cid_backend_core::rpc::LiveCell>, Vec<u8>), cid_backend_core::rpc::RpcError>
+        {
+            Err(RpcError::Unavailable("indexer down".into()))
+        }
+    }
+
     impl Rpc for DownRpc {
         fn list_live_intentions(
             &self,

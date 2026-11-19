@@ -1,6 +1,18 @@
 //! RPC-backed SSRI host-query helpers for seeding [`MockHost`] in offline tests
 //! and live digest execution. Syscall numbers match ckb-ssri-std / the pinned
-//! `cid-process-executor` VM; see `docs/ssri-backend-interface.md`.
+//! `cid-process-executor` VM; see upstream `docs/ssri-backend-interface.md`.
+//!
+//! ## Syscall → [`HostQueryRpc`] mapping
+//!
+//! | Syscall | Number | Trait surface |
+//! |---------|--------|---------------|
+//! | `find_cell_by_out_point` | 2287 | [`get_live_cell`] + [`encode_cell_output`] |
+//! | `find_cell_data_by_out_point` | 2297 | [`get_live_cell`] + [`encode_cell_data`] |
+//! | `get_live_cell` | 2317 | [`get_live_cell`] |
+//! | `get_header` | 2327 | [`get_header`] |
+//! | `get_header_by_number` | 2337 | [`get_header_by_number`] |
+//! | `get_block_hash` | 2347 | [`get_block_hash`] |
+//! | `get_cells` | 2367 | [`get_cells_page`] |
 
 use crate::rpc::{LiveCell, RpcError};
 use cid_process_executor::{DraftCell, MockHost};
@@ -75,6 +87,15 @@ pub trait HostQueryRpc {
 
 /// Populate [`MockHost`] from chain live cells referenced by `draft_cells`, plus
 /// optional tip block hash.
+/// Seed [`MockHost`] for one assemble batch using live RPC at `tip_number`.
+pub fn seed_host_for_batch<R: HostQueryRpc>(
+    rpc: &R,
+    draft_cells: &[DraftCell],
+    tip_number: u64,
+) -> Result<MockHost, HostQueryError> {
+    seed_mock_host_for_draft(rpc, draft_cells, Some(tip_number))
+}
+
 pub fn seed_mock_host_for_draft<R: HostQueryRpc>(
     rpc: &R,
     draft_cells: &[DraftCell],
@@ -126,6 +147,48 @@ pub fn encode_cell_data(data: &[u8]) -> Vec<u8> {
 /// 32-byte block hash for `get_block_hash` syscall load.
 pub fn encode_block_hash(hash: &[u8; 32]) -> Vec<u8> {
     hash.to_vec()
+}
+
+/// Stub [`HostQueryRpc`] for in-memory `Rpc` test doubles (empty / `None` responses).
+#[macro_export]
+macro_rules! impl_host_query_rpc_stubs {
+    ($ty:ty) => {
+        impl $crate::HostQueryRpc for $ty {
+            fn get_live_cell(
+                &self,
+                _: &ckb_types::packed::OutPoint,
+            ) -> Result<Option<$crate::rpc::LiveCell>, $crate::rpc::RpcError> {
+                Ok(None)
+            }
+
+            fn get_block_hash(
+                &self,
+                _: u64,
+            ) -> Result<Option<[u8; 32]>, $crate::rpc::RpcError> {
+                Ok(None)
+            }
+
+            fn get_header_by_number(
+                &self,
+                _: u64,
+            ) -> Result<Option<Vec<u8>>, $crate::rpc::RpcError> {
+                Ok(None)
+            }
+
+            fn get_header(&self, _: &[u8; 32]) -> Result<Option<Vec<u8>>, $crate::rpc::RpcError> {
+                Ok(None)
+            }
+
+            fn get_cells_page(
+                &self,
+                _: &[u8],
+                _: u32,
+                _: &[u8],
+            ) -> Result<(Vec<$crate::rpc::LiveCell>, Vec<u8>), $crate::rpc::RpcError> {
+                Ok((Vec::new(), Vec::new()))
+            }
+        }
+    };
 }
 
 #[cfg(test)]
@@ -221,6 +284,21 @@ mod tests {
         assert_eq!(got.output.as_slice(), cell.output.as_slice());
         assert_eq!(got.data, cell.data);
         assert_eq!(host.get_block_hash(99), Some([0xAB; 32]));
+    }
+
+    #[test]
+    fn seed_host_for_batch_matches_seed_for_draft() {
+        let live = live_at(0x22, 50_000_000_000);
+        let mut rpc = StubHostRpc::new();
+        rpc.insert(live.clone());
+        rpc.insert_hash(7, [0x77; 32]);
+        let draft = DraftCell {
+            out_point: live.out_point.clone(),
+            output: live.output.clone(),
+            data: live.data.clone(),
+        };
+        let host = seed_host_for_batch(&rpc, &[draft], 7).expect("seed");
+        assert_eq!(host.get_block_hash(7), Some([0x77; 32]));
     }
 
     #[test]

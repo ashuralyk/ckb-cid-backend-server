@@ -3,7 +3,7 @@ use crate::assemble::{
 };
 use crate::code_deps::{resolve_execution_cell_deps, resolve_type_id_code_cell, CodeDepError};
 use crate::fee::CidLockIdentity;
-use crate::host_query::seed_mock_host_from_live_cells;
+use crate::host_query::{seed_host_for_batch, HostQueryError, HostQueryRpc};
 use crate::process::{ProcessEntry, ProcessResolver, ResolvedProcess};
 use crate::rpc::{out_point_key, Rpc, RpcError, TxStatus};
 use crate::scan::{bucket_by_process_type_hash, scan_intentions_multi, ScannedIntention};
@@ -128,7 +128,7 @@ pub enum WorkerCommand {
     Delete([u8; 32]),
 }
 
-pub struct DigestLoop<R: Rpc, C: Clock, S: SsriHost> {
+pub struct DigestLoop<R: Rpc + HostQueryRpc, C: Clock, S: SsriHost> {
     rpc: R,
     clock: C,
     ssri: S,
@@ -141,7 +141,7 @@ pub struct DigestLoop<R: Rpc, C: Clock, S: SsriHost> {
     execution_code_key: Vec<u8>,
 }
 
-impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
+impl<R: Rpc + HostQueryRpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
     pub fn new(rpc: R, clock: C, ssri: S, config: LoopConfig) -> Self {
         Self::with_workers(
             rpc,
@@ -1104,12 +1104,39 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
 
         let draft = build_batch_draft(&batch, process);
         let cells = draft_cells_for_batch(&batch, process);
-        let live: Vec<_> = cells
-            .iter()
-            .map(|c| (c.out_point.clone(), c.output.clone(), c.data.clone()))
-            .collect();
-        let tip_hash = [0u8; 32];
-        let host = seed_mock_host_from_live_cells(&live, Some((0, tip_hash)));
+        let tip = match self.rpc.tip_block_number() {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    event = "tick.skip",
+                    reason = "tip_block_number",
+                    error = %e,
+                );
+                report.last_error = Some(format!("tip block: {e}"));
+                report.skipped += batch.len();
+                return BatchOutcome::Continue;
+            }
+        };
+        let host = match seed_host_for_batch(&self.rpc, &cells, tip) {
+            Ok(h) => h,
+            Err(e) => {
+                let reason = match &e {
+                    HostQueryError::Rpc(_) => "host_query_rpc",
+                    HostQueryError::MissingLiveCell(_) => "host_query_missing_cell",
+                    HostQueryError::MissingBlockHash { .. } => "host_query_missing_tip_hash",
+                };
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    event = "tick.skip",
+                    reason,
+                    error = %e,
+                );
+                report.last_error = Some(format!("host seed: {e}"));
+                report.skipped += batch.len();
+                return BatchOutcome::Continue;
+            }
+        };
 
         let max_size = if self.config.max_assembled_tx_bytes == 0 {
             DEFAULT_MAX_ASSEMBLED_TX_BYTES
@@ -1320,6 +1347,7 @@ mod worker_cmd_tests {
     use std::time::Duration;
 
     struct EmptyRpc;
+    crate::impl_host_query_rpc_stubs!(EmptyRpc);
     impl Rpc for EmptyRpc {
         fn list_live_intentions(
             &self,
