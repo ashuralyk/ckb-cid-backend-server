@@ -396,10 +396,9 @@ fn close_stream(stream: TcpStream) {
 mod tests {
     use super::*;
     use cid_backend_core::digest_loop::{DigestLoop, LoopConfig, NopClock};
-    use cid_backend_core::process::ProcessResolver;
     use cid_backend_core::rpc::{LiveCell, Rpc, RpcError, TxStatus};
     use cid_backend_core::ssri::{SsriError, SsriHost};
-    use cid_process_executor::{IntentionInput, PartialTx};
+    use cid_process_executor::{AssembledTx, MockHost};
     use ckb_types::core::{ScriptHashType, TransactionView};
     use ckb_types::packed::Byte32;
     use std::io::{Read, Write};
@@ -636,6 +635,7 @@ mod tests {
     }
 
     struct EmptyRpc;
+    cid_backend_core::impl_host_query_rpc_stubs!(EmptyRpc);
     impl Rpc for EmptyRpc {
         fn list_live_intentions(
             &self,
@@ -657,6 +657,9 @@ mod tests {
         ) -> Result<Vec<LiveCell>, RpcError> {
             Ok(Vec::new())
         }
+        fn dry_run_transaction(&self, _: &TransactionView) -> Result<(), RpcError> {
+            Ok(())
+        }
         fn submit_transaction(&self, _: &TransactionView) -> Result<Byte32, RpcError> {
             Err(RpcError::Unavailable("no".into()))
         }
@@ -669,6 +672,51 @@ mod tests {
     }
 
     struct DownRpc;
+
+    impl cid_backend_core::HostQueryRpc for DownRpc {
+        fn get_live_cell(
+            &self,
+            _: &ckb_types::packed::OutPoint,
+        ) -> Result<Option<cid_backend_core::rpc::LiveCell>, cid_backend_core::rpc::RpcError>
+        {
+            Err(RpcError::Unavailable("indexer down".into()))
+        }
+
+        fn get_block_hash(
+            &self,
+            _: u64,
+        ) -> Result<Option<[u8; 32]>, cid_backend_core::rpc::RpcError> {
+            Err(RpcError::Unavailable("indexer down".into()))
+        }
+
+        fn get_header_by_number(
+            &self,
+            _: u64,
+        ) -> Result<Option<Vec<u8>>, cid_backend_core::rpc::RpcError> {
+            Err(RpcError::Unavailable("indexer down".into()))
+        }
+
+        fn get_header(
+            &self,
+            _: &[u8; 32],
+        ) -> Result<Option<Vec<u8>>, cid_backend_core::rpc::RpcError> {
+            Err(RpcError::Unavailable("indexer down".into()))
+        }
+
+        fn get_cells_page(
+            &self,
+            _: &[u8],
+            _: u64,
+            _: u32,
+            _: &[u8],
+        ) -> Result<
+            (Vec<cid_backend_core::IndexedLiveCell>, Vec<u8>),
+            cid_backend_core::rpc::RpcError,
+        > {
+            Err(RpcError::Unavailable("indexer down".into()))
+        }
+    }
+
     impl Rpc for DownRpc {
         fn list_live_intentions(
             &self,
@@ -690,6 +738,9 @@ mod tests {
         ) -> Result<Vec<LiveCell>, RpcError> {
             Err(RpcError::Unavailable("indexer down".into()))
         }
+        fn dry_run_transaction(&self, _: &TransactionView) -> Result<(), RpcError> {
+            Ok(())
+        }
         fn submit_transaction(&self, _: &TransactionView) -> Result<Byte32, RpcError> {
             Err(RpcError::Unavailable("down".into()))
         }
@@ -706,37 +757,50 @@ mod tests {
         fn get_batch_bounds(&self, _: &[u8]) -> Result<(u32, u32), SsriError> {
             Ok((1, 1))
         }
-        fn assemble(&self, _: &[u8], _: &[IntentionInput]) -> Result<PartialTx, SsriError> {
+        fn assemble(&self, _: &[u8], _: &[u8], _: MockHost) -> Result<AssembledTx, SsriError> {
             Err(SsriError::Unusable("noop".into()))
         }
     }
 
     fn loop_cfg() -> LoopConfig {
+        use ckb_types::core::DepType;
+        use ckb_types::packed::{Byte32, CellDep, OutPoint};
+        use ckb_types::prelude::*;
         LoopConfig {
             cid_code_hash: [0xC1; 32],
             hash_type: ScriptHashType::Type,
             poll_interval: Duration::from_secs(1),
-            extra_cell_deps: vec![],
+            extra_cell_deps: vec![CellDep::new_builder()
+                .out_point(
+                    OutPoint::new_builder()
+                        .tx_hash(Byte32::from_slice(&[0xDEu8; 32]).unwrap())
+                        .index(0u32.pack())
+                        .build(),
+                )
+                .dep_type(DepType::Code.into())
+                .build()],
             type_id_code_deps: vec![],
             confirmation_depth: 1,
-            fee_rate: 1000,
-            bounded_refund_locks: vec![],
             extra_scan_locks: vec![],
+            refund_policy: Default::default(),
+            max_assembled_tx_bytes: 512 * 1024,
         }
     }
 
     #[test]
     fn mock_tick_increments_metrics_and_sets_ready() {
-        let mut loop_ = DigestLoop::new(
-            EmptyRpc,
-            NopClock,
-            NoopSsri,
-            loop_cfg(),
-            ProcessResolver::new(),
-        );
+        let mut loop_ = DigestLoop::new(EmptyRpc, NopClock, NoopSsri, loop_cfg());
         let stats = DaemonStats::new();
         let report = loop_.tick();
-        stats.observe(&report, loop_.state().submit.pending.len());
+        stats.observe(
+            &report,
+            loop_
+                .state()
+                .submit
+                .as_ref()
+                .map(|s| s.pending.len())
+                .unwrap_or(0),
+        );
         let snap = stats.snapshot();
         assert_eq!(snap.ticks, 1);
         assert!(report.scan_ok);
@@ -747,13 +811,7 @@ mod tests {
 
     #[test]
     fn unavailable_mock_tick_is_not_ready() {
-        let mut loop_ = DigestLoop::new(
-            DownRpc,
-            NopClock,
-            NoopSsri,
-            loop_cfg(),
-            ProcessResolver::new(),
-        );
+        let mut loop_ = DigestLoop::new(DownRpc, NopClock, NoopSsri, loop_cfg());
         let stats = DaemonStats::new();
         let report = loop_.tick();
         stats.observe(&report, 0);

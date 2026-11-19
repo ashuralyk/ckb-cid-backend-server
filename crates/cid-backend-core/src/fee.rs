@@ -65,7 +65,10 @@
 //! ## Fee sizing
 //!
 //! CKB tx-pool admission uses `serialized_size_in_block` (molecule bytes +
-//! 4-byte vector offset) and `floor(fee_rate * size / 1000)`. We charge
+//! 4-byte vector offset) and `floor(fee_rate * size / 1000)`. For
+//! `digest_ok`, the Process guest owns fee
+//! (`floor((len+4)*1000/1000)` at `FEE_RATE=1000`); this daemon never rewrites
+//! capacity or witnesses on that path. For Incompatible refunds we charge
 //! `ceil(size * fee_rate / 1000)`. Capacity is fixed-width so one
 //! measure-after-structure pass is stable. Submit must re-check the sized
 //! skeleton (see [`FeeGuard`]) — empty-witness sizing is only valid if later
@@ -108,6 +111,32 @@ impl CidLockIdentity {
         Self {
             code_hash,
             hash_type,
+        }
+    }
+}
+
+/// Daemon fee policy for Incompatible refunds. DigestOk fees belong to the guest.
+#[derive(Clone, Debug)]
+pub struct RefundPolicy {
+    pub fee_rate: u64,
+    pub bounded_locks: Vec<CidLockIdentity>,
+}
+
+impl Default for RefundPolicy {
+    fn default() -> Self {
+        Self {
+            fee_rate: DEFAULT_FEE_RATE,
+            bounded_locks: Vec::new(),
+        }
+    }
+}
+
+impl RefundPolicy {
+    pub fn mode_for(&self, id: &CidLockIdentity) -> RefundFeeMode {
+        if lock_allows_bounded_refund(&self.bounded_locks, id) {
+            RefundFeeMode::Bounded
+        } else {
+            RefundFeeMode::Exact
         }
     }
 }

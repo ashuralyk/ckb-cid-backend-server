@@ -89,6 +89,11 @@ pub trait Rpc {
         max_results: usize,
     ) -> Result<Vec<LiveCell>, RpcError>;
 
+    /// Pre-flight verify via node `test_tx_pool_accept` and/or `estimate_cycles`
+    /// (adapter-specific). Permanent script/pool verify failures must surface as
+    /// `SubmitRejected`; transient RPC issues as `Unavailable`.
+    fn dry_run_transaction(&self, tx: &TransactionView) -> Result<(), RpcError>;
+
     fn submit_transaction(&self, tx: &TransactionView) -> Result<Byte32, RpcError>;
 
     fn get_transaction_status(&self, tx_hash: &Byte32) -> Result<TxStatus, RpcError>;
