@@ -37,7 +37,7 @@ The daemon continuously digests CID Intentions:
 
 Out of scope: timeout-burn proxy, multi-sig fee sponsor, official ssri-server, multi-instance coordination, testnet/mainnet ops scripts.
 
-Upstream git pin (`cid-process-executor` / `cid-protocol`): `d9ee77805f7ac930ab149648bed70f484a9886de`.
+Upstream git pin (`cid-process-executor` / `cid-protocol`): `0e1272b11c6be2e3e08a3fb5f614a5f2751f180a`.
 
 ---
 

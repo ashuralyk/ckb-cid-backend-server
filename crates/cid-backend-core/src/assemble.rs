@@ -269,9 +269,8 @@ mod tests {
         outputs: Vec<CellOutput>,
         outputs_data: Vec<Vec<u8>>,
     ) -> AssembledTx {
-        let witnesses: Vec<ckb_types::packed::Bytes> = (0..inputs.len())
-            .map(|_| Bytes::default())
-            .collect();
+        let witnesses: Vec<ckb_types::packed::Bytes> =
+            (0..inputs.len()).map(|_| Bytes::default()).collect();
         let bytes = Transaction::new_builder()
             .raw(
                 RawTransaction::new_builder()

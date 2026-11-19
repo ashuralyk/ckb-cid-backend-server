@@ -260,9 +260,9 @@ where
                 event = "ssri.incompatible",
                 code,
             );
-            let mut worker = state.lock().expect("process worker state");
             // UnsupportedFundingLock (38): permanent per-combo — do not refund.
             if code == UNSUPPORTED_FUNDING_LOCK {
+                let mut worker = state.lock().expect("process worker state");
                 return record_invalid_assembled_reject(
                     &mut worker,
                     &batch,
@@ -271,10 +271,11 @@ where
                     &mut report,
                 );
             }
+            // Refund path: unlock around dry-run + submit like digest_ok (P2).
             return handle_incompatible_refunds(
                 rpc.as_ref(),
                 hash,
-                &mut worker,
+                &state,
                 &batch,
                 code,
                 execution_code_key,
@@ -409,7 +410,7 @@ where
 fn handle_incompatible_refunds<R: Rpc + HostQueryRpc>(
     rpc: &R,
     hash: [u8; 32],
-    worker: &mut ProcessWorkerState,
+    state: &Arc<Mutex<ProcessWorkerState>>,
     batch: &[ScannedIntention],
     code: i8,
     execution_code_key: &[u8],
@@ -443,7 +444,7 @@ fn handle_incompatible_refunds<R: Rpc + HostQueryRpc>(
         let outcome = assemble_and_submit_refund(
             rpc,
             hash,
-            worker,
+            state,
             &group,
             code,
             execution_code_key,
@@ -470,7 +471,7 @@ fn handle_incompatible_refunds<R: Rpc + HostQueryRpc>(
 fn assemble_and_submit_refund<R: Rpc + HostQueryRpc>(
     rpc: &R,
     _hash: [u8; 32],
-    worker: &mut ProcessWorkerState,
+    state: &Arc<Mutex<ProcessWorkerState>>,
     group: &[ScannedIntention],
     code: i8,
     execution_code_key: &[u8],
@@ -514,8 +515,11 @@ fn assemble_and_submit_refund<R: Rpc + HostQueryRpc>(
 
     let intent_ops: Vec<_> = group.iter().map(|i| i.out_point.clone()).collect();
     let fp = combo_fingerprint(&intent_ops, None, execution_code_key);
-    if worker.submit.rejected_combos.contains(&fp) {
-        return BatchOutcome::CachedRejected;
+    {
+        let worker = state.lock().expect("process worker state");
+        if worker.submit.rejected_combos.contains(&fp) {
+            return BatchOutcome::CachedRejected;
+        }
     }
     let consumed: Vec<_> = skeleton
         .tx
@@ -523,8 +527,10 @@ fn assemble_and_submit_refund<R: Rpc + HostQueryRpc>(
         .into_iter()
         .map(|i| i.previous_output())
         .collect();
+    // Dry-run without holding the state mutex (P2).
     match dry_run_gate(rpc, &skeleton.tx) {
         DryRunGate::Rejected(m) => {
+            let mut worker = state.lock().expect("process worker state");
             worker.submit.rejected_combos.insert(fp);
             tracing::warn!(
                 target: LOG_TARGET,
@@ -548,6 +554,7 @@ fn assemble_and_submit_refund<R: Rpc + HostQueryRpc>(
         }
         DryRunGate::Proceed => {}
     }
+    let mut worker = state.lock().expect("process worker state");
     match submit_execution(rpc, &skeleton, &mut worker.submit, &consumed) {
         Ok(tx_hash) => {
             tracing::info!(

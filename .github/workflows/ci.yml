@@ -18,7 +18,7 @@ env:
   CARGO_INCREMENTAL: "0"
   RUST_BACKTRACE: "1"
   # Must match workspace.dependencies cid-process-executor / cid-protocol rev.
-  CID_DISPATCHER_REV: d9ee77805f7ac930ab149648bed70f484a9886de
+  CID_DISPATCHER_REV: 0e1272b11c6be2e3e08a3fb5f614a5f2751f180a
 
 jobs:
   test:

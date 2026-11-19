@@ -71,6 +71,22 @@ enum ProcessWorkerJob {
     },
 }
 
+struct PendingBatch {
+    reply: Receiver<(BatchOutcome, BatchReportDelta)>,
+    /// Isolate window fingerprint for the outstanding batch (digest loop).
+    window_fp: Vec<u8>,
+    /// Resume key after Continue/Submitted (first of `rest`); Rejected keeps window.
+    resume_on_continue: Option<Vec<u8>>,
+}
+
+/// Completed RunBatch poll result for the digest loop.
+pub struct PolledBatch {
+    pub outcome: BatchOutcome,
+    pub delta: BatchReportDelta,
+    pub window_fp: Vec<u8>,
+    pub resume_on_continue: Option<Vec<u8>>,
+}
+
 /// Handle to a Process worker thread.
 pub struct ProcessWorker {
     state: Arc<Mutex<ProcessWorkerState>>,
@@ -81,6 +97,14 @@ pub struct ProcessWorker {
     epoch: Arc<AtomicU64>,
     /// True while a RunBatch is outstanding (sent, reply not yet consumed).
     batch_outstanding: Arc<AtomicBool>,
+    /// Non-blocking reply slot — digest loop polls next ticks (P1).
+    pending: Mutex<Option<PendingBatch>>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum StartBatchError {
+    AlreadyOutstanding,
+    WorkerDead,
 }
 
 impl ProcessWorker {
@@ -110,28 +134,59 @@ impl ProcessWorker {
         rx.recv_timeout(Duration::from_secs(5)).is_ok()
     }
 
-    pub fn run_batch(
+    /// Non-blocking poll for a completed RunBatch. Never invents outcomes.
+    pub fn try_poll_batch(&self) -> Option<PolledBatch> {
+        let mut slot = self.pending.lock().expect("pending batch");
+        let pending = slot.as_ref()?;
+        match pending.reply.try_recv() {
+            Ok(result) => {
+                let pending = slot.take().expect("pending");
+                self.batch_outstanding.store(false, Ordering::SeqCst);
+                Some(PolledBatch {
+                    outcome: result.0,
+                    delta: result.1,
+                    window_fp: pending.window_fp,
+                    resume_on_continue: pending.resume_on_continue,
+                })
+            }
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                let pending = slot.take().expect("pending");
+                self.batch_outstanding.store(false, Ordering::SeqCst);
+                Some(PolledBatch {
+                    outcome: BatchOutcome::Continue,
+                    delta: BatchReportDelta {
+                        last_error: Some("worker dead: RunBatch reply channel closed".into()),
+                        ..BatchReportDelta::default()
+                    },
+                    window_fp: pending.window_fp,
+                    resume_on_continue: pending.resume_on_continue,
+                })
+            }
+        }
+    }
+
+    /// Dispatch RunBatch without blocking the digest loop (P1).
+    ///
+    /// One in-flight batch per Process (`batch_outstanding`). Outcomes are
+    /// collected via [`try_poll_batch`] on later ticks.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_batch(
         &self,
         process: ResolvedProcess,
         batch: Vec<ScannedIntention>,
         execution_code_key: Vec<u8>,
         tick_cell_deps: Vec<CellDep>,
         max_assembled_tx_bytes: usize,
-    ) -> (BatchOutcome, BatchReportDelta) {
-        let skipped = batch.len();
+        window_fp: Vec<u8>,
+        resume_on_continue: Option<Vec<u8>>,
+    ) -> Result<(), StartBatchError> {
         if self
             .batch_outstanding
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
-            return (
-                BatchOutcome::Continue,
-                BatchReportDelta {
-                    skipped,
-                    last_error: Some("worker: RunBatch already outstanding".into()),
-                    ..BatchReportDelta::default()
-                },
-            );
+            return Err(StartBatchError::AlreadyOutstanding);
         }
         let job_epoch = self.epoch.load(Ordering::SeqCst);
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
@@ -149,44 +204,41 @@ impl ProcessWorker {
             .is_err()
         {
             self.batch_outstanding.store(false, Ordering::SeqCst);
-            return (
-                BatchOutcome::Continue,
-                BatchReportDelta {
-                    skipped,
-                    last_error: Some("worker dead: RunBatch send failed".into()),
-                    ..BatchReportDelta::default()
-                },
-            );
+            return Err(StartBatchError::WorkerDead);
         }
-        // Block for the real reply — never synthesize Continue while the worker
-        // may still be assembling/submitting (P0-1).
-        let result = match reply_rx.recv() {
-            Ok(r) => r,
-            Err(_) => (
-                BatchOutcome::Continue,
-                BatchReportDelta {
-                    skipped,
-                    last_error: Some("worker dead: RunBatch reply channel closed".into()),
-                    ..BatchReportDelta::default()
-                },
-            ),
-        };
-        self.batch_outstanding.store(false, Ordering::SeqCst);
-        result
+        let mut slot = self.pending.lock().expect("pending batch");
+        *slot = Some(PendingBatch {
+            reply: reply_rx,
+            window_fp,
+            resume_on_continue,
+        });
+        Ok(())
     }
 
-    /// Bump epoch so an in-flight job fails closed before submit; late replies
-    /// for the old epoch are ignored by the worker thread.
+    /// Bump epoch so an in-flight job fails closed before submit.
     fn cancel_inflight(&self) {
         self.epoch.fetch_add(1, Ordering::SeqCst);
     }
 
-    fn shutdown(mut self) {
+    fn shutdown_inner(&mut self) {
         self.cancel_inflight();
         let _ = self.job_tx.send(ProcessWorkerJob::Shutdown);
         if let Some(handle) = self.join.take() {
             // Keep JoinHandle until join completes — never detach/abandon (P0-2).
             let _ = handle.join();
+        }
+    }
+
+    fn shutdown(mut self) {
+        self.shutdown_inner();
+    }
+}
+
+impl Drop for ProcessWorker {
+    fn drop(&mut self) {
+        // P3: cancel + join so we never abandon a mid-submit thread on drop.
+        if self.join.is_some() {
+            self.shutdown_inner();
         }
     }
 }
@@ -248,17 +300,9 @@ fn worker_thread_main<R, S>(
                         epoch: epoch.clone(),
                     },
                 );
-                // Ignore late replies after cancel/epoch bump (P0-1).
-                if epoch.load(Ordering::SeqCst) != job_epoch {
-                    let _ = reply.send((
-                        BatchOutcome::Continue,
-                        BatchReportDelta {
-                            last_error: Some("worker: RunBatch cancelled before reply".into()),
-                            ..BatchReportDelta::default()
-                        },
-                    ));
-                    continue;
-                }
+                // Always forward the real outcome — especially Submitted* after
+                // a successful submit. Epoch cancel is checked inside
+                // run_process_batch before submit; do not rewrite results (P3-6).
                 let _ = reply.send(result);
             }
         }
@@ -295,6 +339,7 @@ where
         thread_name,
         epoch,
         batch_outstanding,
+        pending: Mutex::new(None),
     }
 }
 
