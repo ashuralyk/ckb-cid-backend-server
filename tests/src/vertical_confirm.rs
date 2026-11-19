@@ -9,7 +9,7 @@ mod tests {
     use ckb_types::prelude::*;
 
     use crate::fake_rpc::FakeRpc;
-    use crate::helpers::{intention_cell, process_cell, process_type_script, CID_CODE};
+    use crate::helpers::{intention_cell, process_cell, process_type_script, CID_CODE, loop_with_resolver};
     use crate::scripted_ssri::ScriptedSsri;
 
     fn cfg(depth: u64) -> LoopConfig {
@@ -20,9 +20,7 @@ mod tests {
             extra_cell_deps: vec![],
             type_id_code_deps: vec![],
             confirmation_depth: depth,
-            fee_rate: 1000,
-            bounded_refund_locks: vec![],
-            extra_scan_locks: vec![],
+            max_assembled_tx_bytes: 512 * 1024,
         }
     }
 
@@ -37,12 +35,11 @@ mod tests {
         for i in 1..=4 {
             rpc.insert_cell(intention_cell(i, hash, 100_0000_0000));
         }
-        let mut loop_ = DigestLoop::new(
+        let mut loop_ = loop_with_resolver(
             rpc,
-            NopClock,
             ScriptedSsri::mimic((2, 2)),
             cfg(3),
-            ProcessResolver::new(),
+            21,
         );
 
         let first = loop_.tick();
@@ -59,13 +56,13 @@ mod tests {
             assert_eq!(report.submitted, 0, "tick {i}: depth 3 not met");
             assert_eq!(loop_.rpc().submitted().len(), 1);
             assert!(
-                loop_.state().submit.pending_occupies(&proc.out_point),
+                loop_.state().submit.as_ref().unwrap().pending_occupies(&proc.out_point),
                 "Process occupancy must hold until confirmation depth"
             );
             assert!(loop_
                 .state()
-                .submit
-                .in_flight
+                .submit.as_ref().unwrap()
+            .in_flight
                 .contains(&out_point_key(&proc.out_point)));
             loop_.rpc().advance_tip(1);
         }
@@ -78,7 +75,7 @@ mod tests {
         assert_eq!(loop_.rpc().submitted().len(), 2);
         assert!(!loop_
             .state()
-            .submit
+            .submit.as_ref().unwrap()
             .pending
             .contains_key(tx_hash.as_slice()));
         let tx2_process = loop_.rpc().submitted()[1]
@@ -104,12 +101,11 @@ mod tests {
         for i in 1..=4 {
             rpc.insert_cell(intention_cell(i, hash, 100_0000_0000));
         }
-        let mut loop_ = DigestLoop::new(
+        let mut loop_ = loop_with_resolver(
             rpc,
-            NopClock,
             ScriptedSsri::mimic((2, 2)),
             cfg(10),
-            ProcessResolver::new(),
+            22,
         );
 
         let first = loop_.tick();
@@ -132,11 +128,11 @@ mod tests {
             "stale tip 100 vs rewind-to-90 must not release occupancy for another digest"
         );
         assert!(
-            loop_.state().submit.pending.contains_key(&orig_key),
+            loop_.state().submit.as_ref().unwrap().pending.contains_key(&orig_key),
             "Committed(89) with tip 90 and depth 10 must stay pending"
         );
         assert!(
-            loop_.state().submit.pending_occupies(&proc.out_point),
+            loop_.state().submit.as_ref().unwrap().pending_occupies(&proc.out_point),
             "Process occupancy must be held (Unavailable-style) across a tip rewind"
         );
         assert_eq!(
@@ -152,7 +148,7 @@ mod tests {
             settled.submitted, 1,
             "once confirmations reach depth, occupancy releases and leftover work submits"
         );
-        assert!(!loop_.state().submit.pending.contains_key(&orig_key));
+        assert!(!loop_.state().submit.as_ref().unwrap().pending.contains_key(&orig_key));
         assert_eq!(loop_.rpc().submitted().len(), 2);
     }
 }
