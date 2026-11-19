@@ -1,9 +1,11 @@
 pub mod assemble;
 pub mod code_deps;
 pub mod digest_loop;
+pub mod process_batch;
 pub mod fee;
 pub mod host_query;
 pub mod process;
+mod process_busy;
 pub mod registry;
 pub mod rpc;
 pub mod scan;
@@ -55,4 +57,5 @@ pub use submit::{combo_fingerprint, execution_code_key, submit_execution, Pendin
 pub use type_id::{
     type_id_script, type_id_script_hash, TypeIdCodeDep, TypeIdIdentity, TYPE_ID_CODE_HASH,
 };
-pub use workers::{ProcessWorker, WorkerPool, WorkerRemoveError};
+pub use process_busy::ProcessBusyMap;
+pub use workers::{ProcessWorker, ProcessWorkerState, WorkerPool, WorkerRemoveError};

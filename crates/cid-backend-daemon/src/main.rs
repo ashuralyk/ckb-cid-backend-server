@@ -1,6 +1,6 @@
 use cid_backend_core::digest_loop::{DigestLoop, NopClock, WorkerCommand};
 use cid_backend_core::ssri::EmbeddedSsri;
-use cid_backend_core::{ProcessRegistry, WorkerPool};
+use cid_backend_core::{ProcessBusyMap, ProcessRegistry, WorkerPool};
 use cid_backend_daemon::observe::{spawn_health, DaemonStats};
 use cid_backend_daemon::registry_api::{spawn_registry_api, RegistryApiState};
 use cid_backend_daemon::{
@@ -99,28 +99,15 @@ fn main() {
         entries = registry.len(),
     );
 
-    let mut workers = WorkerPool::from_entries(vec![]);
-    for reg in registry.list() {
-        match reg.to_process_entry() {
-            Ok(entry) => {
-                let _ = workers.register(entry);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    target: "cid_backend",
-                    event = "registry.entry_invalid",
-                    error = %e,
-                );
-            }
-        }
-    }
     let worker_cmds: Arc<Mutex<Vec<WorkerCommand>>> = Arc::new(Mutex::new(Vec::new()));
+    let busy = ProcessBusyMap::new();
     let registry = Arc::new(Mutex::new(registry));
 
     if let Some(addr) = config.api_bind {
         let state = RegistryApiState {
             registry: registry.clone(),
             worker_cmds: worker_cmds.clone(),
+            busy: busy.clone(),
         };
         match spawn_registry_api(addr, state) {
             Ok(h) => tracing::info!(
@@ -140,12 +127,12 @@ fn main() {
         }
     }
 
-    let rpc = CkbRpc::from_config(&config);
+    let rpc = Arc::new(CkbRpc::from_config(&config));
     if config.validate_genesis {
         let expected = config
             .genesis_hash
             .expect("validate_genesis requires genesis_hash");
-        if let Err(e) = rpc.verify_declared_genesis(&expected) {
+        if let Err(e) = rpc.as_ref().verify_declared_genesis(&expected) {
             tracing::error!(
                 target: "cid_backend",
                 event = "genesis.mismatch",
@@ -160,16 +147,34 @@ fn main() {
             genesis_hash = genesis_hex.as_deref(),
         );
     }
+    let ssri = Arc::new(EmbeddedSsri);
+    let mut workers = WorkerPool::new(rpc.clone(), ssri.clone());
+    for reg in registry.list() {
+        match reg.to_process_entry() {
+            Ok(entry) => {
+                let _ = workers.register(entry);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "cid_backend",
+                    event = "registry.entry_invalid",
+                    error = %e,
+                );
+            }
+        }
+    }
+
     let loop_config = config.to_loop_config();
     let poll = config.poll_interval;
     let mut digest = DigestLoop::with_workers(
         rpc,
         NopClock,
-        EmbeddedSsri,
+        ssri,
         loop_config,
         workers,
         Some(worker_cmds),
-    );
+    )
+    .with_busy_map(busy);
     loop {
         let report = digest.tick();
         let pending = digest
@@ -177,7 +182,7 @@ fn main() {
             .hashes()
             .iter()
             .filter_map(|h| digest.workers().get(h))
-            .map(|w| w.submit.pending.len())
+            .map(|w| w.with_state(|s| s.submit.pending.len()))
             .sum();
         stats.observe(&report, pending);
         std::thread::sleep(poll);

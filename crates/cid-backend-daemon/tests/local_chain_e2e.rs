@@ -459,6 +459,7 @@ fn scan_resolve_ssri_submit_confirms_on_local_dev_chain() {
         process_type_code_hashes: vec![process_code_hash],
         health_bind: None,
         api_bind: None,
+        allow_non_loopback_api: false,
         registry_path: std::env::temp_dir().join("cid-local-e2e-registry.json"),
         registry_max_entries: 64,
         confirmation_depth: 1,

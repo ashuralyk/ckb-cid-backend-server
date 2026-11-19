@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::sync::Mutex;
 
 use cid_backend_core::ssri::{SsriError, SsriHost};
 use cid_backend_core::type_id::TYPE_ID_CODE_HASH;
@@ -12,7 +12,7 @@ pub struct ScriptedSsri {
     pub bounds: (u32, u32),
     pub mode: Mode,
     /// Binaries observed by `get_batch_bounds` / `assemble` (SSRI source tests).
-    pub seen_binaries: RefCell<Vec<Vec<u8>>>,
+    pub seen_binaries: Mutex<Vec<Vec<u8>>>,
 }
 
 pub enum Mode {
@@ -20,7 +20,7 @@ pub enum Mode {
     AlwaysIncompatible(i8),
     Unusable,
     OkThenIncompatible {
-        remaining_ok: RefCell<u32>,
+        remaining_ok: Mutex<u32>,
         code: i8,
     },
     /// Digest_ok beneficiary output capacity (independent of Intention capacity).
@@ -32,7 +32,7 @@ impl ScriptedSsri {
         Self {
             bounds,
             mode,
-            seen_binaries: RefCell::new(Vec::new()),
+            seen_binaries: Mutex::new(Vec::new()),
         }
     }
 
@@ -52,7 +52,7 @@ impl ScriptedSsri {
         Self::base(
             bounds,
             Mode::OkThenIncompatible {
-                remaining_ok: RefCell::new(ok_calls),
+                remaining_ok: Mutex::new(ok_calls),
                 code,
             },
         )
@@ -63,7 +63,7 @@ impl ScriptedSsri {
     }
 
     fn note_binary(&self, binary: &[u8]) {
-        self.seen_binaries.borrow_mut().push(binary.to_vec());
+        self.seen_binaries.lock().unwrap().push(binary.to_vec());
     }
 }
 
@@ -89,7 +89,7 @@ impl SsriHost for ScriptedSsri {
             Mode::MimicExample => mimic_assemble(draft_tx, host, None),
             Mode::FixedBeneficiary(cap) => mimic_assemble(draft_tx, host, Some(*cap)),
             Mode::OkThenIncompatible { remaining_ok, code } => {
-                let mut n = remaining_ok.borrow_mut();
+                let mut n = remaining_ok.lock().unwrap();
                 if *n > 0 {
                     *n -= 1;
                     mimic_assemble(draft_tx, host, None)

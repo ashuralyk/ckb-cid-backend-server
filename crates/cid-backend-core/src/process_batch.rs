@@ -1,0 +1,558 @@
+//! Process batch assembly / dry-run / submit (runs on per-Process worker threads).
+
+use crate::assemble::{
+    assemble_digest_incompatible, execution_from_assembled, validate_assembled_tx, AssembleError,
+};
+const DEFAULT_MAX_ASSEMBLED_TX_BYTES: usize = 512 * 1024;
+use crate::fee::CidLockIdentity;
+use crate::host_query::{seed_host_for_batch, HostQueryError, HostQueryRpc};
+use crate::process::ResolvedProcess;
+use crate::rpc::{Rpc, RpcError};
+use crate::scan::ScannedIntention;
+use crate::ssri::{build_batch_draft, draft_cells_for_batch, SsriError, SsriHost};
+use crate::submit::{combo_fingerprint, dry_run_gate, submit_execution, DryRunGate};
+use crate::workers::ProcessWorkerState;
+use ckb_types::packed::CellDep;
+use ckb_types::prelude::{Entity, Unpack};
+use std::fmt::Write as _;
+
+const LOG_TARGET: &str = "cid_backend";
+
+fn hex_pref(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(2 + bytes.len() * 2);
+    s.push_str("0x");
+    for b in bytes {
+        let _ = write!(&mut s, "{b:02x}");
+    }
+    s
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchOutcome {
+    SubmittedProcess,
+    Submitted,
+    Rejected,
+    CachedRejected,
+    Continue,
+    ProcessOccupied,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct BatchReportDelta {
+    pub submitted: usize,
+    pub skipped: usize,
+    pub conflicts: usize,
+    pub last_error: Option<String>,
+}
+
+pub struct ProcessBatchParams<'a> {
+    pub hash: [u8; 32],
+    pub worker: &'a mut ProcessWorkerState,
+    pub process: &'a ResolvedProcess,
+    pub batch: Vec<ScannedIntention>,
+    pub execution_code_key: &'a [u8],
+    pub tick_cell_deps: &'a [CellDep],
+    pub max_assembled_tx_bytes: usize,
+}
+
+pub fn window_combo_cached(
+    worker: &ProcessWorkerState,
+    batch: &[ScannedIntention],
+    process: &ResolvedProcess,
+    execution_code_key: &[u8],
+) -> bool {
+    let ops: Vec<_> = batch.iter().map(|i| i.out_point.clone()).collect();
+    let fp = combo_fingerprint(
+        &ops,
+        Some(&process.live_cell.out_point),
+        execution_code_key,
+    );
+    worker.submit.rejected_combos.contains(&fp)
+}
+
+pub fn run_process_batch<R, S>(
+    rpc: &R,
+    ssri: &S,
+    params: ProcessBatchParams<'_>,
+) -> (BatchOutcome, BatchReportDelta)
+where
+    R: Rpc + HostQueryRpc,
+    S: SsriHost,
+{
+    let ProcessBatchParams {
+        hash,
+        worker,
+        process,
+        batch,
+        execution_code_key,
+        tick_cell_deps,
+        max_assembled_tx_bytes,
+    } = params;
+    let mut report = BatchReportDelta::default();
+
+    if window_combo_cached(worker, &batch, process, execution_code_key) {
+        tracing::debug!(
+            target: LOG_TARGET,
+            event = "submit.rejected_combo",
+            n = batch.len(),
+        );
+        return (BatchOutcome::CachedRejected, report);
+    }
+
+    if worker.submit.pending_occupies(&process.live_cell.out_point) {
+        tracing::warn!(
+            target: LOG_TARGET,
+            event = "tick.skip",
+            reason = "process_occupied",
+        );
+        report.skipped += batch.len();
+        return (BatchOutcome::ProcessOccupied, report);
+    }
+
+    let draft = build_batch_draft(&batch, process);
+    let cells = draft_cells_for_batch(&batch, process);
+    let tip = match rpc.tip_block_number() {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(
+                target: LOG_TARGET,
+                event = "tick.skip",
+                reason = "tip_block_number",
+                error = %e,
+            );
+            report.last_error = Some(format!("tip block: {e}"));
+            report.skipped += batch.len();
+            return (BatchOutcome::Continue, report);
+        }
+    };
+    let host = match seed_host_for_batch(rpc, &cells, tip) {
+        Ok(h) => h,
+        Err(e) => {
+            let reason = match &e {
+                HostQueryError::Rpc(_) => "host_query_rpc",
+                HostQueryError::MissingLiveCell(_) => "host_query_missing_cell",
+                HostQueryError::MissingBlockHash { .. } => "host_query_missing_tip_hash",
+            };
+            tracing::warn!(
+                target: LOG_TARGET,
+                event = "tick.skip",
+                reason,
+                error = %e,
+            );
+            report.last_error = Some(format!("host seed: {e}"));
+            report.skipped += batch.len();
+            return (BatchOutcome::Continue, report);
+        }
+    };
+
+    let max_size = if max_assembled_tx_bytes == 0 {
+        DEFAULT_MAX_ASSEMBLED_TX_BYTES
+    } else {
+        max_assembled_tx_bytes
+    };
+
+    let assemble_outcome = ssri.assemble(&process.binary, &draft, host);
+    let skeleton = match assemble_outcome {
+        Ok(assembled) => {
+            match validate_assembled_tx(&assembled, &batch, process, max_size) {
+                Ok(()) => {}
+                Err(AssembleError::SizeLimit { size, max }) => {
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        event = "assemble.invalid",
+                        reason = "size_limit",
+                        size,
+                        max,
+                    );
+                    return record_invalid_assembled_reject(
+                        worker,
+                        &batch,
+                        process,
+                        execution_code_key,
+                        &mut report,
+                    );
+                }
+                Err(AssembleError::InvalidAssembled(m)) => {
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        event = "assemble.invalid",
+                        reason = "guest_tx",
+                        error = %m,
+                    );
+                    return record_invalid_assembled_reject(
+                        worker,
+                        &batch,
+                        process,
+                        execution_code_key,
+                        &mut report,
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        event = "tick.skip",
+                        reason = "validate_assembled",
+                        error = %e,
+                    );
+                    report.skipped += batch.len();
+                    return (BatchOutcome::Continue, report);
+                }
+            }
+            match execution_from_assembled(&assembled) {
+                Ok(s) => s,
+                Err(AssembleError::InvalidAssembled(m)) => {
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        event = "assemble.invalid",
+                        reason = "execution_skeleton",
+                        error = %m,
+                    );
+                    return record_invalid_assembled_reject(
+                        worker,
+                        &batch,
+                        process,
+                        execution_code_key,
+                        &mut report,
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        event = "tick.skip",
+                        reason = "execution_from_assembled",
+                        error = %e,
+                    );
+                    report.skipped += batch.len();
+                    return (BatchOutcome::Continue, report);
+                }
+            }
+        }
+        Err(SsriError::Incompatible(code)) => {
+            tracing::info!(
+                target: LOG_TARGET,
+                event = "ssri.incompatible",
+                code,
+            );
+            return handle_incompatible_refunds(
+                rpc,
+                hash,
+                worker,
+                &batch,
+                code,
+                execution_code_key,
+                tick_cell_deps,
+                &mut report,
+            );
+        }
+        Err(SsriError::Unusable(m)) => {
+            tracing::warn!(
+                target: LOG_TARGET,
+                event = "tick.skip",
+                reason = "ssri_unusable",
+                error = %m,
+            );
+            report.skipped += batch.len();
+            return (BatchOutcome::Continue, report);
+        }
+    };
+
+    let consumed_process = skeleton
+        .tx
+        .inputs()
+        .into_iter()
+        .any(|i| i.previous_output() == process.live_cell.out_point);
+    let intent_ops: Vec<_> = batch.iter().map(|i| i.out_point.clone()).collect();
+    let process_op = consumed_process.then(|| process.live_cell.out_point.clone());
+    let fp = combo_fingerprint(&intent_ops, process_op.as_ref(), execution_code_key);
+    if worker.submit.rejected_combos.contains(&fp) {
+        tracing::debug!(
+            target: LOG_TARGET,
+            event = "submit.rejected_combo",
+            n = batch.len(),
+        );
+        return (BatchOutcome::CachedRejected, report);
+    }
+    let consumed: Vec<_> = skeleton
+        .tx
+        .inputs()
+        .into_iter()
+        .map(|i| i.previous_output())
+        .collect();
+    match dry_run_gate(rpc, &skeleton.tx) {
+        DryRunGate::Rejected(m) => {
+            worker.submit.rejected_combos.insert(fp);
+            tracing::warn!(
+                target: LOG_TARGET,
+                event = "dry_run.rejected",
+                error = %m,
+                n = batch.len(),
+            );
+            report.last_error = Some(format!("dry-run rejected: {m}"));
+            return (BatchOutcome::Rejected, report);
+        }
+        DryRunGate::Skip(m) => {
+            tracing::warn!(
+                target: LOG_TARGET,
+                event = "tick.skip",
+                reason = "dry_run_unavailable",
+                error = %m,
+            );
+            report.last_error = Some(format!("dry-run: {m}"));
+            report.skipped += batch.len();
+            return (BatchOutcome::Continue, report);
+        }
+        DryRunGate::Proceed => {}
+    }
+    match submit_execution(rpc, &skeleton, &mut worker.submit, &consumed) {
+        Ok(tx_hash) => {
+            tracing::info!(
+                target: LOG_TARGET,
+                event = "submit.ok",
+                tx_hash = %hex_pref(tx_hash.as_slice()),
+            );
+            report.submitted += 1;
+            if consumed_process {
+                (BatchOutcome::SubmittedProcess, report)
+            } else {
+                (BatchOutcome::Submitted, report)
+            }
+        }
+        Err(RpcError::Conflict(m)) => {
+            tracing::warn!(
+                target: LOG_TARGET,
+                event = "submit.conflict",
+                error = %m,
+            );
+            report.conflicts += 1;
+            report.last_error = Some(format!("submit conflict: {m}"));
+            (BatchOutcome::Continue, report)
+        }
+        Err(RpcError::SubmitRejected(m)) => {
+            worker.submit.rejected_combos.insert(fp);
+            tracing::warn!(
+                target: LOG_TARGET,
+                event = "submit.rejected",
+                error = %m,
+                n = batch.len(),
+            );
+            report.last_error = Some(format!("submit rejected: {m}"));
+            (BatchOutcome::Rejected, report)
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: LOG_TARGET,
+                event = "tick.skip",
+                reason = "submit_failed",
+                error = %e,
+            );
+            report.last_error = Some(format!("submit failed: {e}"));
+            report.skipped += batch.len();
+            (BatchOutcome::Continue, report)
+        }
+    }
+}
+
+fn handle_incompatible_refunds<R: Rpc + HostQueryRpc>(
+    rpc: &R,
+    hash: [u8; 32],
+    worker: &mut ProcessWorkerState,
+    batch: &[ScannedIntention],
+    code: i8,
+    execution_code_key: &[u8],
+    tick_cell_deps: &[CellDep],
+    report: &mut BatchReportDelta,
+) -> (BatchOutcome, BatchReportDelta) {
+    let mut by_identity: Vec<(CidLockIdentity, Vec<ScannedIntention>)> = Vec::new();
+    for item in batch {
+        let id = item.lock_identity();
+        if let Some((_, group)) = by_identity.iter_mut().find(|(existing, _)| *existing == id) {
+            group.push(item.clone());
+        } else {
+            by_identity.push((id, vec![item.clone()]));
+        }
+    }
+
+    if by_identity.len() > 1 {
+        tracing::info!(
+            target: LOG_TARGET,
+            event = "refund.partition",
+            code,
+            groups = by_identity.len(),
+        );
+    }
+
+    let mut submitted = false;
+    for (_id, group) in by_identity {
+        if group.is_empty() {
+            continue;
+        }
+        let outcome = assemble_and_submit_refund(
+            rpc,
+            hash,
+            worker,
+            &group,
+            code,
+            execution_code_key,
+            tick_cell_deps,
+            report,
+        );
+        match outcome {
+            BatchOutcome::Submitted => submitted = true,
+            BatchOutcome::Rejected | BatchOutcome::CachedRejected => {
+                return (outcome, report.clone());
+            }
+            _ => {}
+        }
+    }
+
+    if submitted {
+        (BatchOutcome::Submitted, report.clone())
+    } else {
+        (BatchOutcome::Continue, report.clone())
+    }
+}
+
+fn assemble_and_submit_refund<R: Rpc + HostQueryRpc>(
+    rpc: &R,
+    _hash: [u8; 32],
+    worker: &mut ProcessWorkerState,
+    group: &[ScannedIntention],
+    code: i8,
+    execution_code_key: &[u8],
+    tick_cell_deps: &[CellDep],
+    report: &mut BatchReportDelta,
+) -> BatchOutcome {
+    let skeleton = match assemble_digest_incompatible(group, tick_cell_deps) {
+        Ok(s) => {
+            let out_sum: u64 = s
+                .tx
+                .outputs()
+                .into_iter()
+                .map(|o| {
+                    let c: u64 = o.capacity().unpack();
+                    c
+                })
+                .sum();
+            let in_sum: u64 = group.iter().map(|i| i.capacity).sum();
+            let fee = in_sum.saturating_sub(out_sum);
+            tracing::info!(
+                target: LOG_TARGET,
+                event = "refund.path",
+                code,
+                path = "user_lock",
+                fee,
+                n = group.len(),
+            );
+            s
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: LOG_TARGET,
+                event = "refund.path",
+                code,
+                path = "unbuildable",
+                error = %e,
+            );
+            report.skipped += group.len();
+            return BatchOutcome::Continue;
+        }
+    };
+
+    let intent_ops: Vec<_> = group.iter().map(|i| i.out_point.clone()).collect();
+    let fp = combo_fingerprint(&intent_ops, None, execution_code_key);
+    if worker.submit.rejected_combos.contains(&fp) {
+        return BatchOutcome::CachedRejected;
+    }
+    let consumed: Vec<_> = skeleton
+        .tx
+        .inputs()
+        .into_iter()
+        .map(|i| i.previous_output())
+        .collect();
+    match dry_run_gate(rpc, &skeleton.tx) {
+        DryRunGate::Rejected(m) => {
+            worker.submit.rejected_combos.insert(fp);
+            tracing::warn!(
+                target: LOG_TARGET,
+                event = "dry_run.rejected",
+                error = %m,
+                n = group.len(),
+            );
+            report.last_error = Some(format!("dry-run rejected: {m}"));
+            return BatchOutcome::Rejected;
+        }
+        DryRunGate::Skip(m) => {
+            tracing::warn!(
+                target: LOG_TARGET,
+                event = "tick.skip",
+                reason = "dry_run_unavailable",
+                error = %m,
+            );
+            report.last_error = Some(format!("dry-run: {m}"));
+            report.skipped += group.len();
+            return BatchOutcome::Continue;
+        }
+        DryRunGate::Proceed => {}
+    }
+    match submit_execution(rpc, &skeleton, &mut worker.submit, &consumed) {
+        Ok(tx_hash) => {
+            tracing::info!(
+                target: LOG_TARGET,
+                event = "submit.ok",
+                tx_hash = %hex_pref(tx_hash.as_slice()),
+            );
+            report.submitted += 1;
+            BatchOutcome::Submitted
+        }
+        Err(RpcError::Conflict(m)) => {
+            tracing::warn!(
+                target: LOG_TARGET,
+                event = "submit.conflict",
+                error = %m,
+            );
+            report.conflicts += 1;
+            report.last_error = Some(format!("submit conflict: {m}"));
+            BatchOutcome::Continue
+        }
+        Err(RpcError::SubmitRejected(m)) => {
+            worker.submit.rejected_combos.insert(fp);
+            tracing::warn!(
+                target: LOG_TARGET,
+                event = "submit.rejected",
+                error = %m,
+                n = group.len(),
+            );
+            report.last_error = Some(format!("submit rejected: {m}"));
+            BatchOutcome::Rejected
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: LOG_TARGET,
+                event = "tick.skip",
+                reason = "submit_failed",
+                error = %e,
+            );
+            report.last_error = Some(format!("submit failed: {e}"));
+            report.skipped += group.len();
+            BatchOutcome::Continue
+        }
+    }
+}
+
+fn record_invalid_assembled_reject(
+    worker: &mut ProcessWorkerState,
+    batch: &[ScannedIntention],
+    process: &ResolvedProcess,
+    execution_code_key: &[u8],
+    report: &mut BatchReportDelta,
+) -> (BatchOutcome, BatchReportDelta) {
+    let intent_ops: Vec<_> = batch.iter().map(|i| i.out_point.clone()).collect();
+    let fp = combo_fingerprint(
+        &intent_ops,
+        Some(&process.live_cell.out_point),
+        execution_code_key,
+    );
+    worker.submit.rejected_combos.insert(fp);
+    report.skipped += batch.len();
+    (BatchOutcome::Rejected, report.clone())
+}

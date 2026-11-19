@@ -100,39 +100,41 @@ pub fn default_loop_config() -> LoopConfig {
     }
 }
 
-pub fn digest_loop_empty<R: Rpc + HostQueryRpc, S: SsriHost>(
-    rpc: R,
-    ssri: S,
-    config: LoopConfig,
-) -> DigestLoop<R, NopClock, S> {
+pub fn digest_loop_empty<R, S>(rpc: R, ssri: S, config: LoopConfig) -> DigestLoop<R, NopClock, S>
+where
+    R: Rpc + HostQueryRpc + Send + Sync + 'static,
+    S: SsriHost + Send + Sync + 'static,
+{
     DigestLoop::new(rpc, NopClock, ssri, config)
 }
 
-pub fn register_fixture(
-    loop_: &mut DigestLoop<
-        impl Rpc + HostQueryRpc,
-        impl cid_backend_core::digest_loop::Clock,
-        impl SsriHost,
-    >,
-    unique: u8,
-) {
+pub fn register_fixture<R, C, S>(loop_: &mut DigestLoop<R, C, S>, unique: u8)
+where
+    R: Rpc + HostQueryRpc + Send + Sync + 'static,
+    C: cid_backend_core::digest_loop::Clock,
+    S: SsriHost + Send + Sync + 'static,
+{
     let entry = fixture_process_entry(unique);
     loop_.register_process(entry);
-    if let Some(w) = loop_
-        .workers_mut()
-        .get_mut(&fixture_process_entry(unique).identity_type_hash)
-    {
-        w.resolver = ProcessResolver::for_entry(fixture_process_entry(unique))
-            .with_fallback_binary(FIXTURE_ELF.to_vec());
+    let hash = fixture_process_entry(unique).identity_type_hash;
+    if let Some(w) = loop_.workers().get(&hash) {
+        w.with_state_mut(|state| {
+            state.resolver = ProcessResolver::for_entry(fixture_process_entry(unique))
+                .with_fallback_binary(FIXTURE_ELF.to_vec());
+        });
     }
 }
 
-pub fn loop_with_resolver<R: Rpc + HostQueryRpc, S: SsriHost>(
+pub fn loop_with_resolver<R, S>(
     rpc: R,
     ssri: S,
     config: LoopConfig,
     unique: u8,
-) -> DigestLoop<R, NopClock, S> {
+) -> DigestLoop<R, NopClock, S>
+where
+    R: Rpc + HostQueryRpc + Send + Sync + 'static,
+    S: SsriHost + Send + Sync + 'static,
+{
     let entry = fixture_process_entry(unique);
     DigestLoop::new_with_resolver(
         rpc,
@@ -143,13 +145,17 @@ pub fn loop_with_resolver<R: Rpc + HostQueryRpc, S: SsriHost>(
     )
 }
 
-pub fn loop_with_resolver_and_code<R: Rpc + HostQueryRpc, S: SsriHost>(
+pub fn loop_with_resolver_and_code<R, S>(
     rpc: R,
     ssri: S,
     config: LoopConfig,
     unique: u8,
     code_args: [u8; 32],
-) -> DigestLoop<R, NopClock, S> {
+) -> DigestLoop<R, NopClock, S>
+where
+    R: Rpc + HostQueryRpc + Send + Sync + 'static,
+    S: SsriHost + Send + Sync + 'static,
+{
     let entry = fixture_process_entry_with_code(unique, code_args);
     DigestLoop::new_with_resolver(
         rpc,
