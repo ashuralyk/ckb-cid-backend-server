@@ -49,8 +49,13 @@ impl CkbRpc {
         }
     }
 
-    /// Host-query indexer round-trips use a dedicated 10s bound (P2-6).
-    fn host_query_rpc_call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
+    /// All [`HostQueryRpc`] round-trips use a dedicated 10s bound (node or indexer).
+    fn host_query_rpc_call(
+        &self,
+        url: &str,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, RpcError> {
         let body = json!({
             "id": 1,
             "jsonrpc": "2.0",
@@ -59,7 +64,7 @@ impl CkbRpc {
         });
         let resp = self
             .agent
-            .post(&self.indexer_url)
+            .post(url)
             .set("Content-Type", "application/json")
             .timeout(Duration::from_secs(DEFAULT_HOST_QUERY_TIMEOUT_SECS))
             .send_json(body)
@@ -401,7 +406,7 @@ impl Rpc for CkbRpc {
 
 impl HostQueryRpc for CkbRpc {
     fn get_live_cell(&self, out_point: &OutPoint) -> Result<Option<LiveCell>, RpcError> {
-        let result = self.rpc_call(
+        let result = self.host_query_rpc_call(
             &self.node_url,
             "get_live_cell",
             json!([out_point_json(out_point), true]),
@@ -428,7 +433,8 @@ impl HostQueryRpc for CkbRpc {
     }
 
     fn get_block_hash(&self, number: u64) -> Result<Option<[u8; 32]>, RpcError> {
-        let result = self.rpc_call(&self.node_url, "get_block_hash", json!([hex_u64(number)]))?;
+        let result =
+            self.host_query_rpc_call(&self.node_url, "get_block_hash", json!([hex_u64(number)]))?;
         if result.is_null() {
             return Ok(None);
         }
@@ -442,7 +448,7 @@ impl HostQueryRpc for CkbRpc {
     }
 
     fn get_header_by_number(&self, number: u64) -> Result<Option<Vec<u8>>, RpcError> {
-        let result = self.rpc_call(
+        let result = self.host_query_rpc_call(
             &self.node_url,
             "get_header_by_number",
             json!([hex_u64(number)]),
@@ -454,7 +460,8 @@ impl HostQueryRpc for CkbRpc {
     }
 
     fn get_header(&self, hash: &[u8; 32]) -> Result<Option<Vec<u8>>, RpcError> {
-        let result = self.rpc_call(&self.node_url, "get_header", json!([hex_bytes(hash)]))?;
+        let result =
+            self.host_query_rpc_call(&self.node_url, "get_header", json!([hex_bytes(hash)]))?;
         if result.is_null() {
             return Ok(None);
         }
@@ -472,8 +479,9 @@ impl HostQueryRpc for CkbRpc {
         let page_limit = u64::from(limit.clamp(1, DEFAULT_HOST_QUERY_PAGE_LIMIT));
         let after_val = json_after_cursor(after);
         let order_str = if order == 0 { "asc" } else { "desc" };
-        // Per-request 10s host-query timeout (P2-6); honor asc/desc (P2-7).
+        // 10s host-query timeout; honor asc/desc; opaque indexer cursor (P2).
         let result = self.host_query_rpc_call(
+            &self.indexer_url,
             "get_cells",
             json!([search_key, order_str, hex_u64(page_limit), after_val]),
         )?;
@@ -489,7 +497,6 @@ impl HostQueryRpc for CkbRpc {
             .get("last_cursor")
             .and_then(|c| c.as_str())
             .unwrap_or("");
-        // Indexer cursors are opaque hex strings (variable length).
         Ok((cells, next.as_bytes().to_vec()))
     }
 }

@@ -73,11 +73,12 @@ register/delete persist immediately and enqueue live worker spawn/stop.
 
 During `Process.assemble`, the live digest path passes an RPC-backed
 `RpcHostQuery` into `ProcessExecutor::assemble` (generic over `HostQuery`).
-ckb-ssri-std syscalls (`find_cell_by_out_point` 2287, …, `get_cells` 2367) hit
-CKB node/indexer JSON-RPC directly — including opaque variable-length indexer
-cursors and `asc`/`desc` order — with a 10s per-request host-query timeout.
-Offline/`MockHost` seeding remains for unit tests only. See contract
-`docs/ssri-backend-interface.md`.
+Every host-query syscall (`find_cell_by_out_point` 2287, `find_cell_data`
+2297, `get_live_cell` 2317, `get_header` 2327, `get_header_by_number` 2337,
+`get_block_hash` 2347, `get_cells` 2367) uses a **10s per-request** timeout
+against node or indexer JSON-RPC. `get_cells` uses opaque variable-length
+indexer cursors and honors `asc`/`desc` order. Offline/`MockHost` seeding
+remains for unit tests only. See contract `docs/ssri-backend-interface.md`.
 
 ## Ops checklist
 

@@ -16,6 +16,7 @@ use ckb_types::prelude::*;
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 
 const LOG_TARGET: &str = "cid_backend";
@@ -524,14 +525,116 @@ where
             eligible.push(i);
         }
 
-        for (hash, bucket) in bucket_by_process_type_hash(&eligible) {
-            self.process_bucket(hash, bucket, &mut report);
+        let buckets = bucket_by_process_type_hash(&eligible);
+        // Multi-round only for reject-isolate expansions. Transient Continue /
+        // Conflict wait for the next tick (same as pre-async semantics).
+        for _round in 0..64 {
+            let mut started = false;
+            for (hash, bucket) in &buckets {
+                let was_out = self
+                    .workers
+                    .get(hash)
+                    .is_some_and(|w| w.batch_outstanding());
+                if was_out {
+                    continue;
+                }
+                self.process_bucket(*hash, bucket.clone(), &mut report);
+                if self
+                    .workers
+                    .get(hash)
+                    .is_some_and(|w| w.batch_outstanding())
+                {
+                    started = true;
+                }
+            }
+            let more = self.wait_all_batches(&mut report);
+            if !started || !more {
+                break;
+            }
         }
 
         self.tick_cell_deps.clear();
         self.clear_worker_tick_code();
         self.sync_busy_map();
         report
+    }
+
+    fn apply_polled_batch(
+        worker: &crate::workers::ProcessWorker,
+        report: &mut TickReport,
+        polled: crate::workers::PolledBatch,
+    ) -> bool {
+        Self::apply_batch_report(report, &polled.delta);
+        let mut continue_round = false;
+        match polled.outcome {
+            BatchOutcome::Submitted | BatchOutcome::SubmittedProcess => {
+                worker.with_state_mut(|state| {
+                    if let Some(r) = polled.resume_on_continue {
+                        state.isolate_resume = Some(r);
+                    } else {
+                        state.isolate_resume = None;
+                        state.isolate_expanded.clear();
+                    }
+                });
+            }
+            BatchOutcome::Rejected | BatchOutcome::CachedRejected => {
+                continue_round = true;
+                worker.with_state_mut(|state| {
+                    state.isolate_expanded.insert(polled.window_fp);
+                });
+            }
+            BatchOutcome::Continue => {
+                // Unbuildable / soft skip: advance past window and keep isolating.
+                // Conflict / submit failure set last_error or conflicts — next tick.
+                if polled.delta.conflicts == 0
+                    && polled.delta.last_error.is_none()
+                    && polled.delta.skipped > 0
+                {
+                    continue_round = true;
+                    worker.with_state_mut(|state| {
+                        if let Some(r) = polled.resume_on_continue {
+                            state.isolate_resume = Some(r);
+                        } else {
+                            state.isolate_resume = None;
+                            state.isolate_expanded.clear();
+                        }
+                    });
+                }
+            }
+            BatchOutcome::ProcessOccupied => {}
+        }
+        continue_round
+    }
+
+    /// Block until every outstanding RunBatch has an ack — never invent outcomes.
+    /// Returns true when isolate should run another round this tick.
+    fn wait_all_batches(&mut self, report: &mut TickReport) -> bool {
+        let mut more = false;
+        loop {
+            let mut any_outstanding = false;
+            for hash in self.workers.hashes() {
+                let Some(worker) = self.workers.get(&hash) else {
+                    continue;
+                };
+                if let Some(polled) = worker.try_poll_batch() {
+                    if matches!(
+                        polled.outcome,
+                        BatchOutcome::Submitted | BatchOutcome::SubmittedProcess
+                    ) {
+                        self.sync_busy_map();
+                    }
+                    if Self::apply_polled_batch(worker, report, polled) {
+                        more = true;
+                    }
+                } else if worker.batch_outstanding() {
+                    any_outstanding = true;
+                }
+            }
+            if !any_outstanding {
+                return more;
+            }
+            thread::sleep(Duration::from_micros(100));
+        }
     }
 
     fn refresh_worker_process_code(&mut self) {
@@ -774,6 +877,26 @@ where
             return;
         }
 
+        // Collect async RunBatch outcomes without blocking other Processes (P1).
+        if let Some(worker) = self.workers.get(&hash) {
+            if let Some(polled) = worker.try_poll_batch() {
+                if matches!(
+                    polled.outcome,
+                    BatchOutcome::Submitted | BatchOutcome::SubmittedProcess
+                ) {
+                    self.sync_busy_map();
+                }
+                let outcome = polled.outcome;
+                Self::apply_polled_batch(worker, report, polled);
+                if matches!(outcome, BatchOutcome::SubmittedProcess) {
+                    return;
+                }
+            }
+            if worker.batch_outstanding() {
+                return;
+            }
+        }
+
         let process = {
             let worker = self.workers.get(&hash).expect("exists");
             match worker.with_state_mut(|state| state.resolver.resolve(self.rpc.as_ref(), &hash)) {
@@ -934,7 +1057,14 @@ where
                     }
                     return items.first().map(|i| out_point_key(&i.out_point));
                 }
-                let outcome = self.dispatch_process_batch(hash, process, window.clone(), report);
+                let resume_on_continue = rest.first().map(|i| out_point_key(&i.out_point));
+                let outcome = self.dispatch_process_batch(
+                    hash,
+                    process,
+                    window.clone(),
+                    resume_on_continue,
+                    report,
+                );
                 if !matches!(outcome, BatchOutcome::CachedRejected) {
                     *attempts += 1;
                 }
@@ -957,7 +1087,7 @@ where
                 cached_splits += 1;
             }
             match outcome {
-                BatchOutcome::SubmittedProcess | BatchOutcome::ProcessOccupied => {
+                BatchOutcome::SubmittedProcess => {
                     let resume = rest
                         .first()
                         .or_else(|| stack.iter().find_map(|s| s.first()))
@@ -967,6 +1097,11 @@ where
                         report.skipped += leftover.len();
                     }
                     return resume;
+                }
+                BatchOutcome::ProcessOccupied => {
+                    // Async RunBatch in flight for this window — resume here after
+                    // poll (do not skip to `rest` or we lose reject-isolate) (P1).
+                    return items.first().map(|i| out_point_key(&i.out_point));
                 }
                 BatchOutcome::Submitted | BatchOutcome::Continue => {
                     if !rest.is_empty() {
@@ -1052,6 +1187,7 @@ where
         hash: [u8; 32],
         process: &ResolvedProcess,
         batch: Vec<ScannedIntention>,
+        resume_on_continue: Option<Vec<u8>>,
         report: &mut TickReport,
     ) -> BatchOutcome {
         let worker = match self.workers.get(&hash) {
@@ -1063,23 +1199,25 @@ where
         } else {
             self.config.max_assembled_tx_bytes
         };
-        let (outcome, delta) = worker.run_batch(
+        let window_fp = self.window_fingerprint(&batch, process);
+        match worker.start_batch(
             process.clone(),
             batch,
             self.execution_code_key.clone(),
             self.tick_cell_deps.clone(),
             max_size,
-        );
-        Self::apply_batch_report(report, &delta);
-        // Sync busy map immediately after submit so registry code-rebind sees
-        // pending occupancy without waiting for tick end (P1-5).
-        if matches!(
-            outcome,
-            BatchOutcome::Submitted | BatchOutcome::SubmittedProcess
+            window_fp,
+            resume_on_continue,
         ) {
-            self.sync_busy_map();
+            Ok(()) => BatchOutcome::ProcessOccupied,
+            Err(crate::workers::StartBatchError::AlreadyOutstanding) => {
+                BatchOutcome::ProcessOccupied
+            }
+            Err(crate::workers::StartBatchError::WorkerDead) => {
+                report.last_error = Some("worker dead: RunBatch send failed".into());
+                BatchOutcome::Continue
+            }
         }
-        outcome
     }
 }
 
