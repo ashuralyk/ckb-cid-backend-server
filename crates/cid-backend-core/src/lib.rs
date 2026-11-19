@@ -1,4 +1,5 @@
 pub mod assemble;
+pub mod host_query;
 pub mod code_deps;
 pub mod digest_loop;
 pub mod fee;
@@ -10,7 +11,14 @@ pub mod submit;
 pub mod type_id;
 
 pub use assemble::{
-    assemble_digest_incompatible, assemble_digest_ok, AssembleError, ExecutionSkeleton,
+    assemble_digest_incompatible, execution_from_assembled, validate_assembled_tx, AssembleError,
+    ExecutionSkeleton,
+};
+pub use host_query::{
+    encode_block_hash, encode_cell_data, encode_cell_output, seed_mock_host_for_draft,
+    seed_mock_host_from_live_cells, HostQueryError, HostQueryRpc, DEFAULT_HOST_QUERY_PAGE_LIMIT,
+    DEFAULT_HOST_QUERY_TIMEOUT_SECS, FIND_CELL_BY_OUT_POINT, FIND_CELL_DATA_BY_OUT_POINT,
+    GET_BLOCK_HASH, GET_CELLS, GET_HEADER, GET_HEADER_BY_NUMBER, GET_LIVE_CELL,
 };
 pub use code_deps::{
     merge_cell_deps, resolve_execution_cell_deps, resolve_type_id_code_cell,
