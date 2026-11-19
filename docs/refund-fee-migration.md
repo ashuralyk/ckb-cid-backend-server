@@ -81,8 +81,9 @@ allowlist entry is not a scanned identity.
   `min(MAX_REFUND_FEE, capacity - occupied)`.
 - `sum(cuts) == fee` exactly — **no siphon outputs** (implies contract
   `F >= S` when there are no extra outputs).
-- Fail closed / isolate-shrink (`FeeUnaffordable`) if the budget is
-  insufficient (non-permanent, no `rejected_combos`).
+- Fail closed with soft `RetryLater` (`FeeUnaffordable`) if the budget is
+  insufficient (non-permanent, no `rejected_combos`, no isolate-shrink;
+  below-min leftovers retry refund once marked pending).
 - Intentions whose lock is **not** on the allowlist always use exact refunds.
 - **Never** mix allowlisted and legacy locks in one bounded refund tx.
 - **Never** co-bundle two different bounded-capable lock identities in one

@@ -516,6 +516,9 @@ where
                     (live_keys.contains(k) || pending_occupied.contains(k))
                         && !state.submit.rejected.contains(k)
                 });
+                state
+                    .pending_incompatible_refund
+                    .retain(|k| live_keys.contains(k));
             });
         });
 
@@ -643,6 +646,15 @@ where
                     state.isolate_expanded.insert(polled.window_fp);
                     state.isolate_pending.extend(frames);
                 });
+            }
+            BatchOutcome::RetryLater => {
+                // Fee-unaffordable (etc.): no isolate split; next tick may refund
+                // below-min via pending_incompatible_refund.
+                if let Some(r) = polled.resume_on_continue {
+                    worker.with_state_mut(|state| {
+                        state.isolate_resume = Some(r);
+                    });
+                }
             }
             BatchOutcome::Continue => {
                 // Unbuildable / soft skip: advance past window and keep isolating.
@@ -1091,27 +1103,46 @@ where
                         .unwrap_or(true)
                 })
                 .collect();
-            if items.len() < min as usize {
-                report.skipped += items.len();
-                continue;
-            }
+            let refund_only = if items.len() < min as usize {
+                let all_pending = self
+                    .workers
+                    .get(&hash)
+                    .map(|w| {
+                        w.with_state(|s| {
+                            !items.is_empty()
+                                && items.iter().all(|i| {
+                                    s.pending_incompatible_refund
+                                        .contains(&out_point_key(&i.out_point))
+                                })
+                        })
+                    })
+                    .unwrap_or(false);
+                if !all_pending {
+                    report.skipped += items.len();
+                    continue;
+                }
+                true
+            } else {
+                false
+            };
             report.isolate_windows += 1;
             let n = items.len().min(max as usize);
             let window = items[..n].to_vec();
             let rest = items[n..].to_vec();
             let fp = self.window_fingerprint(&window, process);
-            let already = self
-                .workers
-                .get(&hash)
-                .map(|w| w.with_state(|s| s.isolate_expanded.contains(&fp)))
-                .unwrap_or(false);
+            let already = !refund_only
+                && self
+                    .workers
+                    .get(&hash)
+                    .map(|w| w.with_state(|s| s.isolate_expanded.contains(&fp)))
+                    .unwrap_or(false);
             if already {
                 // Already expanded once this sweep — do not re-push drop_first/
                 // shrink (diamond explosion). Async Rejected queues frames via
                 // isolate_pending at poll time instead of relying on this arm.
                 continue;
             }
-            let cached = self.window_combo_cached(&hash, &window, process);
+            let cached = !refund_only && self.window_combo_cached(&hash, &window, process);
             let outcome = if cached {
                 tracing::debug!(
                     target: LOG_TARGET,
@@ -1142,6 +1173,7 @@ where
                     min,
                     resume_on_continue,
                     report,
+                    refund_only,
                 );
                 if !matches!(outcome, BatchOutcome::CachedRejected) {
                     *attempts += 1;
@@ -1188,7 +1220,7 @@ where
                     // Resume at this window after poll (do not skip to `rest`).
                     return items.first().map(|i| out_point_key(&i.out_point));
                 }
-                BatchOutcome::Submitted | BatchOutcome::Continue => {
+                BatchOutcome::Submitted | BatchOutcome::Continue | BatchOutcome::RetryLater => {
                     if !rest.is_empty() {
                         stack.push(rest);
                     }
@@ -1280,6 +1312,7 @@ where
         min: u32,
         resume_on_continue: Option<Vec<u8>>,
         report: &mut TickReport,
+        refund_only: bool,
     ) -> BatchOutcome {
         let worker = match self.workers.get(&hash) {
             Some(w) => w,
@@ -1312,6 +1345,7 @@ where
             resume_on_continue,
             rest,
             min,
+            refund_only,
         ) {
             Ok(()) => BatchOutcome::ProcessOccupied,
             Err(crate::workers::StartBatchError::AlreadyOutstanding) => {

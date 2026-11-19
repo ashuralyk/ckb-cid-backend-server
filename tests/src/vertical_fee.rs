@@ -119,7 +119,7 @@ mod tests {
     #[test]
     fn unaffordable_bounded_group_does_not_suppress_exact_refund() {
         use crate::helpers::intention_cell_with_lock;
-        use cid_backend_core::{CidLockIdentity, MAX_FEE_RATE};
+        use cid_backend_core::{out_point_key, CidLockIdentity, DEFAULT_FEE_RATE, MAX_FEE_RATE};
         use ckb_types::core::ScriptHashType;
 
         let rpc = FakeRpc::new();
@@ -146,5 +146,70 @@ mod tests {
             exact.out_point
         );
         assert!(loop_.rpc().has_cell(&bounded.out_point));
+        let pending = loop_.workers().get(&hash).unwrap().with_state(|s| {
+            s.pending_incompatible_refund
+                .contains(&out_point_key(&bounded.out_point))
+        });
+        assert!(
+            pending,
+            "unaffordable identity must be marked for below-min refund retry"
+        );
+        let expanded = loop_
+            .workers()
+            .get(&hash)
+            .unwrap()
+            .with_state(|s| s.isolate_expanded.len());
+        assert_eq!(
+            expanded, 0,
+            "RefundFeeUnaffordable must not trigger isolate splits"
+        );
+
+        // P2: singleton leftover (len < min=2) must still refund once fee is affordable.
+        loop_.config_mut().refund_policy.fee_rate = DEFAULT_FEE_RATE;
+        let report2 = loop_.tick();
+        assert_eq!(
+            report2.submitted, 1,
+            "below-min incompatible leftover must refund after fee becomes affordable; {:?}",
+            report2.last_error
+        );
+        assert!(!loop_.rpc().has_cell(&bounded.out_point));
+    }
+
+    #[test]
+    fn refund_fee_unaffordable_does_not_isolate_or_cache_reject() {
+        use cid_backend_core::{out_point_key, DEFAULT_FEE_RATE, MAX_FEE_RATE};
+
+        let rpc = FakeRpc::new();
+        let hash = script_hash32(&process_type_script(3));
+        let capacity = 100_0000_0000;
+        let bounded = intention_cell(1, hash, capacity);
+        rpc.insert_cell(bounded.clone());
+        rpc.insert_cell(process_cell(3, 200_0000_0000, vec![]));
+        let mut config = default_loop_config();
+        config.refund_policy.bounded_locks = vec![config.scan_lock_identities()[0]];
+        config.refund_policy.fee_rate = MAX_FEE_RATE;
+        let mut loop_ = loop_with_resolver(rpc, ScriptedSsri::incompatible(21), config, 3);
+
+        let report = loop_.tick();
+        assert_eq!(report.submitted, 0, "{:?}", report.last_error);
+        assert!(loop_.rpc().has_cell(&bounded.out_point));
+        loop_.workers().get(&hash).unwrap().with_state(|s| {
+            assert!(s
+                .pending_incompatible_refund
+                .contains(&out_point_key(&bounded.out_point)));
+            assert!(
+                s.isolate_expanded.is_empty(),
+                "FeeUnaffordable must not isolate-split"
+            );
+            assert!(
+                s.submit.rejected_combos.is_empty(),
+                "FeeUnaffordable must not cache rejected_combos"
+            );
+        });
+
+        loop_.config_mut().refund_policy.fee_rate = DEFAULT_FEE_RATE;
+        let report2 = loop_.tick();
+        assert_eq!(report2.submitted, 1, "{:?}", report2.last_error);
+        assert!(!loop_.rpc().has_cell(&bounded.out_point));
     }
 }
