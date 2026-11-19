@@ -69,7 +69,7 @@ pub fn execution_from_assembled(assembled: &AssembledTx) -> Result<ExecutionSkel
     let bytes = assembled.as_molecule_bytes();
     let packed = ckb_types::packed::Transaction::from_slice(bytes)
         .map_err(|e| AssembleError::InvalidAssembled(format!("{e:?}")))?;
-    let tx: TransactionView = packed.into();
+    let tx: TransactionView = packed.into_view();
     if tx.data().as_slice() != bytes {
         return Err(AssembleError::InvalidAssembled(
             "transaction view bytes diverge from assembled molecule".into(),
