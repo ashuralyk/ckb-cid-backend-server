@@ -4,8 +4,7 @@ mod tests {
 
     use crate::fake_rpc::FakeRpc;
     use crate::helpers::{
-        default_loop_config, intention_cell, loop_with_resolver, process_cell, process_type_hash,
-        process_type_script,
+        default_loop_config, intention_cell, loop_with_resolver, process_cell, process_type_script,
     };
     use crate::scripted_ssri::ScriptedSsri;
 
@@ -19,12 +18,8 @@ mod tests {
         rpc.insert_cell(intent.clone());
         rpc.insert_cell(proc.clone());
 
-        let mut loop_ = loop_with_resolver(
-            rpc,
-            ScriptedSsri::mimic((1, 4)),
-            default_loop_config(),
-            1,
-        );
+        let mut loop_ =
+            loop_with_resolver(rpc, ScriptedSsri::mimic((1, 4)), default_loop_config(), 1);
         let report = loop_.tick();
         assert_eq!(report.submitted, 1);
         assert_eq!(report.conflicts, 0);
@@ -54,7 +49,9 @@ mod tests {
         );
         assert!(loop_
             .state()
-            .submit.as_ref().unwrap()
+            .submit
+            .as_ref()
+            .unwrap()
             .in_flight
             .contains(&out_point_key(&intent.out_point)));
         assert!(loop_
@@ -77,12 +74,7 @@ mod tests {
             vec![0x7f, b'E', b'L', b'F', 1],
         ));
 
-        let mut loop_ = loop_with_resolver(
-            rpc,
-            ScriptedSsri::unusable(),
-            default_loop_config(),
-            1,
-        );
+        let mut loop_ = loop_with_resolver(rpc, ScriptedSsri::unusable(), default_loop_config(), 1);
         let report = loop_.tick();
         assert_eq!(report.submitted, 0);
         assert!(loop_.rpc().submitted().is_empty());

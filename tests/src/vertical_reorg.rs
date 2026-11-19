@@ -1,15 +1,15 @@
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
-    use cid_backend_core::digest_loop::{DigestLoop, LoopConfig, NopClock};
-    use cid_backend_core::process::ProcessResolver;
+    use cid_backend_core::digest_loop::LoopConfig;
     use cid_backend_core::rpc::{out_point_key, script_hash32, Rpc, TxStatus};
     use ckb_types::core::ScriptHashType;
     use ckb_types::prelude::*;
+    use std::time::Duration;
 
     use crate::fake_rpc::FakeRpc;
-    use crate::helpers::{intention_cell, process_cell, process_type_script, CID_CODE, loop_with_resolver};
+    use crate::helpers::{
+        intention_cell, loop_with_resolver, process_cell, process_type_script, CID_CODE,
+    };
     use crate::scripted_ssri::ScriptedSsri;
 
     fn cfg(depth: u64) -> LoopConfig {
@@ -34,12 +34,7 @@ mod tests {
         let proc = process_cell(22, 200_0000_0000, vec![0x7f, b'E', b'L', b'F', 22]);
         rpc.insert_cell(intent.clone());
         rpc.insert_cell(proc.clone());
-        let mut loop_ = loop_with_resolver(
-            rpc,
-            ScriptedSsri::mimic((1, 4)),
-            cfg(3),
-            22,
-        );
+        let mut loop_ = loop_with_resolver(rpc, ScriptedSsri::mimic((1, 4)), cfg(3), 22);
 
         assert_eq!(loop_.tick().submitted, 1);
         let tx_hash = loop_.rpc().submitted()[0].hash();
@@ -47,7 +42,12 @@ mod tests {
         loop_.rpc().advance_tip(1);
         let confirming = loop_.tick();
         assert_eq!(confirming.submitted, 0);
-        assert!(loop_.state().submit.as_ref().unwrap().pending_occupies(&proc.out_point));
+        assert!(loop_
+            .state()
+            .submit
+            .as_ref()
+            .unwrap()
+            .pending_occupies(&proc.out_point));
         assert_eq!(loop_.rpc().submitted().len(), 1);
 
         loop_.rpc().simulate_drop(&tx_hash);
@@ -71,7 +71,9 @@ mod tests {
         assert_eq!(loop_.rpc().submitted().len(), 2);
         assert!(loop_
             .state()
-            .submit.as_ref().unwrap()
+            .submit
+            .as_ref()
+            .unwrap()
             .in_flight
             .contains(&out_point_key(&proc.out_point)));
     }
@@ -85,12 +87,7 @@ mod tests {
         let proc = process_cell(23, 200_0000_0000, vec![0x7f, b'E', b'L', b'F', 23]);
         rpc.insert_cell(intent.clone());
         rpc.insert_cell(proc.clone());
-        let mut loop_ = loop_with_resolver(
-            rpc,
-            ScriptedSsri::mimic((1, 4)),
-            cfg(1),
-            23,
-        );
+        let mut loop_ = loop_with_resolver(rpc, ScriptedSsri::mimic((1, 4)), cfg(1), 23);
 
         assert_eq!(loop_.tick().submitted, 1);
         let tx_hash = loop_.rpc().submitted()[0].hash();
@@ -99,8 +96,10 @@ mod tests {
         assert!(
             !loop_
                 .state()
-                .submit.as_ref().unwrap()
-            .pending
+                .submit
+                .as_ref()
+                .unwrap()
+                .pending
                 .contains_key(tx_hash.as_slice()),
             "depth 1 settles on first committed sight at tip"
         );
@@ -132,12 +131,7 @@ mod tests {
         for i in 1..=4 {
             rpc.insert_cell(intention_cell(i, hash, 100_0000_0000));
         }
-        let mut loop_ = loop_with_resolver(
-            rpc,
-            ScriptedSsri::mimic((2, 2)),
-            cfg(4),
-            24,
-        );
+        let mut loop_ = loop_with_resolver(rpc, ScriptedSsri::mimic((2, 2)), cfg(4), 24);
 
         assert_eq!(loop_.tick().submitted, 1);
         let tx_hash = loop_.rpc().submitted()[0].hash();
@@ -145,13 +139,23 @@ mod tests {
         loop_.rpc().advance_tip(2);
         assert_eq!(loop_.rpc().tip(), 12);
         assert_eq!(loop_.tick().submitted, 0);
-        assert!(loop_.state().submit.as_ref().unwrap().pending_occupies(&proc.out_point));
+        assert!(loop_
+            .state()
+            .submit
+            .as_ref()
+            .unwrap()
+            .pending_occupies(&proc.out_point));
 
         loop_.rpc().set_tip(10);
         let rewound = loop_.tick();
         assert_eq!(rewound.submitted, 0, "tip rewind must not settle");
         assert_eq!(loop_.rpc().submitted().len(), 1);
-        assert!(loop_.state().submit.as_ref().unwrap().pending_occupies(&proc.out_point));
+        assert!(loop_
+            .state()
+            .submit
+            .as_ref()
+            .unwrap()
+            .pending_occupies(&proc.out_point));
         assert_eq!(loop_.state().last_tip, Some(10));
 
         loop_.rpc().advance_tip(3);
@@ -171,12 +175,7 @@ mod tests {
         let proc = process_cell(25, 200_0000_0000, vec![0x7f, b'E', b'L', b'F', 25]);
         rpc.insert_cell(intent.clone());
         rpc.insert_cell(proc.clone());
-        let mut loop_ = loop_with_resolver(
-            rpc,
-            ScriptedSsri::mimic((1, 4)),
-            cfg(4),
-            25,
-        );
+        let mut loop_ = loop_with_resolver(rpc, ScriptedSsri::mimic((1, 4)), cfg(4), 25);
 
         assert_eq!(loop_.tick().submitted, 1);
         let tx_hash = loop_.rpc().submitted()[0].hash();

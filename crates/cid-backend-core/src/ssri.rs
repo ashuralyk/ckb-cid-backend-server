@@ -364,7 +364,10 @@ mod tests {
         };
         let mut resolver = ProcessResolver::for_entry(entry);
         resolver.set_tick_process_code(Some(&code));
-        let resolved = resolver.resolve(&rpc, &type_hash).unwrap().expect("resolved");
+        let resolved = resolver
+            .resolve(&rpc, &type_hash)
+            .unwrap()
+            .expect("resolved");
         assert_eq!(resolved.binary, bin, "SSRI binary must be code cell ELF");
         let (min, max) = EmbeddedSsri
             .get_batch_bounds(&resolved.binary)

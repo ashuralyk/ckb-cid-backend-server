@@ -1,15 +1,15 @@
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
-    use cid_backend_core::digest_loop::{DigestLoop, LoopConfig, NopClock};
-    use cid_backend_core::process::ProcessResolver;
+    use cid_backend_core::digest_loop::LoopConfig;
     use cid_backend_core::rpc::script_hash32;
     use ckb_types::core::ScriptHashType;
     use ckb_types::prelude::*;
+    use std::time::Duration;
 
     use crate::fake_rpc::FakeRpc;
-    use crate::helpers::{intention_cell, process_cell, process_type_script, CID_CODE, loop_with_resolver};
+    use crate::helpers::{
+        intention_cell, loop_with_resolver, process_cell, process_type_script, CID_CODE,
+    };
     use crate::scripted_ssri::ScriptedSsri;
 
     fn setup(n_intentions: u8) -> (FakeRpc, [u8; 32]) {
@@ -42,12 +42,7 @@ mod tests {
     #[test]
     fn below_min_does_not_submit() {
         let (rpc, _) = setup(1);
-        let mut loop_ = loop_with_resolver(
-            rpc,
-            ScriptedSsri::mimic((2, 2)),
-            cfg(),
-            2,
-        );
+        let mut loop_ = loop_with_resolver(rpc, ScriptedSsri::mimic((2, 2)), cfg(), 2);
         let report = loop_.tick();
         assert_eq!(report.submitted, 0);
         assert_eq!(loop_.rpc().submitted().len(), 0);
@@ -65,12 +60,7 @@ mod tests {
     #[test]
     fn at_max_submits_exactly_max() {
         let (rpc, _) = setup(2);
-        let mut loop_ = loop_with_resolver(
-            rpc,
-            ScriptedSsri::mimic((2, 2)),
-            cfg(),
-            2,
-        );
+        let mut loop_ = loop_with_resolver(rpc, ScriptedSsri::mimic((2, 2)), cfg(), 2);
         let report = loop_.tick();
         assert_eq!(report.submitted, 1);
         let tx = &loop_.rpc().submitted()[0];
@@ -80,12 +70,7 @@ mod tests {
     #[test]
     fn above_max_takes_first_max_asc_leaves_remainder_below_min() {
         let (rpc, _) = setup(3);
-        let mut loop_ = loop_with_resolver(
-            rpc,
-            ScriptedSsri::mimic((2, 2)),
-            cfg(),
-            2,
-        );
+        let mut loop_ = loop_with_resolver(rpc, ScriptedSsri::mimic((2, 2)), cfg(), 2);
         let report = loop_.tick();
         assert_eq!(report.submitted, 1);
         let tx = &loop_.rpc().submitted()[0];
@@ -115,12 +100,7 @@ mod tests {
         for i in 1..=4 {
             rpc.insert_cell(intention_cell(i, hash, 100_0000_0000));
         }
-        let mut loop_ = loop_with_resolver(
-            rpc,
-            ScriptedSsri::mimic((2, 2)),
-            cfg(),
-            2,
-        );
+        let mut loop_ = loop_with_resolver(rpc, ScriptedSsri::mimic((2, 2)), cfg(), 2);
 
         let first = loop_.tick();
         assert_eq!(first.submitted, 1, "one digest_ok per tick");

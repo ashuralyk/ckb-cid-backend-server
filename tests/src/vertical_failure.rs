@@ -1,16 +1,15 @@
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
-    use cid_backend_core::digest_loop::{DigestLoop, LoopConfig, NopClock};
-    use cid_backend_core::process::ProcessResolver;
+    use cid_backend_core::digest_loop::LoopConfig;
     use cid_backend_core::rpc::{out_point_key, script_hash32, LiveCell};
     use ckb_types::core::ScriptHashType;
+    use std::time::Duration;
 
     use crate::fake_rpc::FakeRpc;
     use crate::helpers::{
-        cid_lock_args, intention_cell, live_cell, lock_script, out_point, process_cell,
-        process_type_script, CID_CODE, loop_with_resolver};
+        cid_lock_args, intention_cell, live_cell, lock_script, loop_with_resolver, out_point,
+        process_cell, process_type_script, CID_CODE,
+    };
     use crate::scripted_ssri::{Mode, ScriptedSsri};
 
     fn cfg() -> LoopConfig {
@@ -35,24 +34,23 @@ mod tests {
         rpc.insert_cell(intent.clone());
         rpc.insert_cell(proc.clone());
         rpc.inject_unavailable_submit_once();
-        let mut loop_ = loop_with_resolver(
-            rpc,
-            ScriptedSsri::mimic((1, 4)),
-            cfg(),
-            26,
-        );
+        let mut loop_ = loop_with_resolver(rpc, ScriptedSsri::mimic((1, 4)), cfg(), 26);
 
         let first = loop_.tick();
         assert_eq!(first.submitted, 0);
         assert_eq!(first.conflicts, 0);
         assert!(!loop_
             .state()
-            .submit.as_ref().unwrap()
+            .submit
+            .as_ref()
+            .unwrap()
             .in_flight
             .contains(&out_point_key(&intent.out_point)));
         assert!(!loop_
             .state()
-            .submit.as_ref().unwrap()
+            .submit
+            .as_ref()
+            .unwrap()
             .rejected
             .contains(&out_point_key(&intent.out_point)));
         assert!(loop_
@@ -78,12 +76,7 @@ mod tests {
         rpc.insert_cell(good.clone());
         rpc.insert_cell(proc.clone());
         rpc.inject_reject_once();
-        let mut loop_ = loop_with_resolver(
-            rpc,
-            ScriptedSsri::mimic((1, 1)),
-            cfg(),
-            27,
-        );
+        let mut loop_ = loop_with_resolver(rpc, ScriptedSsri::mimic((1, 1)), cfg(), 27);
 
         let first = loop_.tick();
         assert_eq!(
@@ -94,25 +87,36 @@ mod tests {
         assert!(
             !loop_
                 .state()
-                .submit.as_ref().unwrap()
-            .rejected
+                .submit
+                .as_ref()
+                .unwrap()
+                .rejected
                 .contains(&out_point_key(&bad.out_point)),
             "transaction reject must not blacklist an Intention outpoint"
         );
         assert!(
             !loop_
                 .state()
-                .submit.as_ref().unwrap()
-            .rejected
+                .submit
+                .as_ref()
+                .unwrap()
+                .rejected
                 .contains(&out_point_key(&proc.out_point)),
             "Process outpoint must not enter rejected"
         );
         assert!(!loop_
             .state()
-            .submit.as_ref().unwrap()
+            .submit
+            .as_ref()
+            .unwrap()
             .in_flight
             .contains(&out_point_key(&bad.out_point)));
-        assert!(!loop_.state().submit.as_ref().unwrap().pending_occupies(&bad.out_point));
+        assert!(!loop_
+            .state()
+            .submit
+            .as_ref()
+            .unwrap()
+            .pending_occupies(&bad.out_point));
         assert!(loop_
             .rpc()
             .live_cells()
@@ -154,12 +158,7 @@ mod tests {
         rpc.insert_cell(good.clone());
         rpc.insert_cell(proc.clone());
         rpc.reject_when_consuming(&bad.out_point);
-        let mut loop_ = loop_with_resolver(
-            rpc,
-            ScriptedSsri::mimic((1, 4)),
-            cfg(),
-            28,
-        );
+        let mut loop_ = loop_with_resolver(rpc, ScriptedSsri::mimic((1, 4)), cfg(), 28);
 
         let first = loop_.tick();
         assert_eq!(
@@ -183,23 +182,39 @@ mod tests {
         assert!(
             !loop_
                 .state()
-                .submit.as_ref().unwrap()
-            .rejected
+                .submit
+                .as_ref()
+                .unwrap()
+                .rejected
                 .contains(&out_point_key(&good.out_point)),
             "valid B must not be blacklisted"
         );
         assert!(!loop_
             .state()
-            .submit.as_ref().unwrap()
+            .submit
+            .as_ref()
+            .unwrap()
             .rejected
             .contains(&out_point_key(&bad.out_point)));
         assert!(!loop_
             .state()
-            .submit.as_ref().unwrap()
+            .submit
+            .as_ref()
+            .unwrap()
             .rejected
             .contains(&out_point_key(&proc.out_point)));
-        assert!(!loop_.state().submit.as_ref().unwrap().pending_occupies(&bad.out_point));
-        assert!(loop_.state().submit.as_ref().unwrap().pending_occupies(&good.out_point));
+        assert!(!loop_
+            .state()
+            .submit
+            .as_ref()
+            .unwrap()
+            .pending_occupies(&bad.out_point));
+        assert!(loop_
+            .state()
+            .submit
+            .as_ref()
+            .unwrap()
+            .pending_occupies(&good.out_point));
     }
 
     #[test]
@@ -214,12 +229,7 @@ mod tests {
         rpc.insert_cell(good.clone());
         rpc.insert_cell(proc.clone());
         rpc.reject_when_consuming(&bad.out_point);
-        let mut loop_ = loop_with_resolver(
-            rpc,
-            ScriptedSsri::mimic((2, 2)),
-            cfg(),
-            29,
-        );
+        let mut loop_ = loop_with_resolver(rpc, ScriptedSsri::mimic((2, 2)), cfg(), 29);
 
         let first = loop_.tick();
         assert_eq!(first.submitted, 0, "min=2 cannot isolate B from A");
@@ -229,8 +239,18 @@ mod tests {
             "min>1 reject must not write the window into rejected, got {:?}",
             loop_.state().submit.as_ref().unwrap().rejected
         );
-        assert!(!loop_.state().submit.as_ref().unwrap().pending_occupies(&bad.out_point));
-        assert!(!loop_.state().submit.as_ref().unwrap().pending_occupies(&good.out_point));
+        assert!(!loop_
+            .state()
+            .submit
+            .as_ref()
+            .unwrap()
+            .pending_occupies(&bad.out_point));
+        assert!(!loop_
+            .state()
+            .submit
+            .as_ref()
+            .unwrap()
+            .pending_occupies(&good.out_point));
         assert!(loop_
             .rpc()
             .live_cells()
@@ -257,18 +277,18 @@ mod tests {
         rpc.insert_cell(bad.clone());
         rpc.insert_cell(proc.clone());
         rpc.reject_when_consuming(&bad.out_point);
-        let mut loop_ = loop_with_resolver(
-            rpc,
-            ScriptedSsri::mimic((1, 1)),
-            cfg(),
-            30,
-        );
+        let mut loop_ = loop_with_resolver(rpc, ScriptedSsri::mimic((1, 1)), cfg(), 30);
 
         let first = loop_.tick();
         assert_eq!(first.submitted, 0);
         assert_eq!(loop_.rpc().submit_attempts(), 1);
         assert!(loop_.state().submit.as_ref().unwrap().rejected.is_empty());
-        assert!(!loop_.state().submit.as_ref().unwrap().pending_occupies(&bad.out_point));
+        assert!(!loop_
+            .state()
+            .submit
+            .as_ref()
+            .unwrap()
+            .pending_occupies(&bad.out_point));
 
         let second = loop_.tick();
         let third = loop_.tick();
@@ -306,12 +326,7 @@ mod tests {
         // Hold occupancy on the same Process so a recreate cannot mint a new
         // combo and retry the poison prefix (that path is covered elsewhere).
         rpc.defer_commit();
-        let mut loop_ = loop_with_resolver(
-            rpc,
-            ScriptedSsri::mimic((1, 1)),
-            cfg(),
-            32,
-        );
+        let mut loop_ = loop_with_resolver(rpc, ScriptedSsri::mimic((1, 1)), cfg(), 32);
 
         let first = loop_.tick();
         assert_eq!(first.submitted, 0, "budget stops at 64 poison combos");
@@ -334,18 +349,32 @@ mod tests {
         );
         assert!(!loop_
             .state()
-            .submit.as_ref().unwrap()
+            .submit
+            .as_ref()
+            .unwrap()
             .rejected
             .contains(&out_point_key(&good.out_point)));
         for cell in &poison {
-            assert!(!loop_.state().submit.as_ref().unwrap().pending_occupies(&cell.out_point));
             assert!(!loop_
                 .state()
-                .submit.as_ref().unwrap()
-            .rejected
+                .submit
+                .as_ref()
+                .unwrap()
+                .pending_occupies(&cell.out_point));
+            assert!(!loop_
+                .state()
+                .submit
+                .as_ref()
+                .unwrap()
+                .rejected
                 .contains(&out_point_key(&cell.out_point)));
         }
-        assert!(loop_.state().submit.as_ref().unwrap().pending_occupies(&good.out_point));
+        assert!(loop_
+            .state()
+            .submit
+            .as_ref()
+            .unwrap()
+            .pending_occupies(&good.out_point));
 
         let attempts = loop_.rpc().submit_attempts();
         let third = loop_.tick();
@@ -373,12 +402,7 @@ mod tests {
         rpc.insert_cell(good.clone());
         rpc.insert_cell(proc);
         rpc.defer_commit();
-        let mut loop_ = loop_with_resolver(
-            rpc,
-            ScriptedSsri::mimic((1, 4)),
-            cfg(),
-            33,
-        );
+        let mut loop_ = loop_with_resolver(rpc, ScriptedSsri::mimic((1, 4)), cfg(), 33);
 
         let mut saw_good = false;
         for _ in 0..16 {
@@ -411,10 +435,17 @@ mod tests {
         );
         assert!(!loop_
             .state()
-            .submit.as_ref().unwrap()
+            .submit
+            .as_ref()
+            .unwrap()
             .rejected
             .contains(&out_point_key(&good.out_point)));
-        assert!(loop_.state().submit.as_ref().unwrap().pending_occupies(&good.out_point));
+        assert!(loop_
+            .state()
+            .submit
+            .as_ref()
+            .unwrap()
+            .pending_occupies(&good.out_point));
     }
 
     fn unbuildable_intention(fill: u8, process_type_hash: [u8; 32]) -> LiveCell {
@@ -482,19 +513,36 @@ mod tests {
             good.out_point
         );
         assert!(
-            loop_.state().submit.as_ref().unwrap().pending_occupies(&good.out_point),
+            loop_
+                .state()
+                .submit
+                .as_ref()
+                .unwrap()
+                .pending_occupies(&good.out_point),
             "refund occupies B until the next tick settles"
         );
         assert!(
-            !loop_.state().submit.as_ref().unwrap().pending_occupies(&proc.out_point),
+            !loop_
+                .state()
+                .submit
+                .as_ref()
+                .unwrap()
+                .pending_occupies(&proc.out_point),
             "User Lock refund must not occupy Process"
         );
         for cell in &poison {
-            assert!(!loop_.state().submit.as_ref().unwrap().pending_occupies(&cell.out_point));
             assert!(!loop_
                 .state()
-                .submit.as_ref().unwrap()
-            .rejected
+                .submit
+                .as_ref()
+                .unwrap()
+                .pending_occupies(&cell.out_point));
+            assert!(!loop_
+                .state()
+                .submit
+                .as_ref()
+                .unwrap()
+                .rejected
                 .contains(&out_point_key(&cell.out_point)));
         }
 
@@ -503,7 +551,12 @@ mod tests {
         let fourth = loop_.tick();
         assert_eq!(third.submitted, 0);
         assert_eq!(fourth.submitted, 0);
-        assert!(!loop_.state().submit.as_ref().unwrap().pending_occupies(&good.out_point));
+        assert!(!loop_
+            .state()
+            .submit
+            .as_ref()
+            .unwrap()
+            .pending_occupies(&good.out_point));
         assert_eq!(
             loop_.rpc().submit_attempts(),
             attempts,
@@ -546,7 +599,8 @@ mod tests {
         rpc.insert_cell(good_proc.clone());
         rpc.defer_commit();
 
-        let mut loop_ = crate::helpers::digest_loop_empty(rpc, ScriptedSsri::mimic((1, n as u32)), cfg());
+        let mut loop_ =
+            crate::helpers::digest_loop_empty(rpc, ScriptedSsri::mimic((1, n as u32)), cfg());
         crate::helpers::register_fixture(&mut loop_, poison_unique);
         crate::helpers::register_fixture(&mut loop_, good_unique);
 
@@ -651,7 +705,12 @@ mod tests {
                 .previous_output(),
             good.out_point
         );
-        assert!(loop_.state().submit.as_ref().unwrap().pending_occupies(&good.out_point));
+        assert!(loop_
+            .state()
+            .submit
+            .as_ref()
+            .unwrap()
+            .pending_occupies(&good.out_point));
         let attempts = loop_.rpc().submit_attempts();
         let _ = loop_.tick();
         let _ = loop_.tick();

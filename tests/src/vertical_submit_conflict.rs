@@ -1,14 +1,14 @@
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
-    use cid_backend_core::digest_loop::{DigestLoop, LoopConfig, NopClock};
-    use cid_backend_core::process::ProcessResolver;
+    use cid_backend_core::digest_loop::LoopConfig;
     use cid_backend_core::rpc::{out_point_key, script_hash32};
     use ckb_types::core::ScriptHashType;
+    use std::time::Duration;
 
     use crate::fake_rpc::FakeRpc;
-    use crate::helpers::{intention_cell, process_cell, process_type_script, CID_CODE, loop_with_resolver};
+    use crate::helpers::{
+        intention_cell, loop_with_resolver, process_cell, process_type_script, CID_CODE,
+    };
     use crate::scripted_ssri::ScriptedSsri;
 
     #[test]
@@ -45,12 +45,16 @@ mod tests {
         assert_eq!(first.conflicts, 1);
         assert!(loop_
             .state()
-            .submit.as_ref().unwrap()
+            .submit
+            .as_ref()
+            .unwrap()
             .failed
             .contains(&out_point_key(&intent.out_point)));
         assert!(!loop_
             .state()
-            .submit.as_ref().unwrap()
+            .submit
+            .as_ref()
+            .unwrap()
             .in_flight
             .contains(&out_point_key(&intent.out_point)));
         assert!(loop_
@@ -69,7 +73,9 @@ mod tests {
             .all(|c| c.out_point != intent.out_point));
         assert!(loop_
             .state()
-            .submit.as_ref().unwrap()
+            .submit
+            .as_ref()
+            .unwrap()
             .in_flight
             .contains(&out_point_key(&intent.out_point)));
     }

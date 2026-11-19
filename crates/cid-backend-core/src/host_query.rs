@@ -64,7 +64,7 @@ pub trait HostQueryRpc {
 
     fn get_header(&self, hash: &[u8; 32]) -> Result<Option<Vec<u8>>, RpcError>;
 
-  /// Bounded `get_cells` page: molecule-encoded `search_key`, cursor `after`.
+    /// Bounded `get_cells` page: molecule-encoded `search_key`, cursor `after`.
     fn get_cells_page(
         &self,
         search_key_molecule: &[u8],
@@ -131,8 +131,8 @@ pub fn encode_block_hash(hash: &[u8; 32]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ckb_types::packed::{Byte32, Script};
     use ckb_types::core::ScriptHashType;
+    use ckb_types::packed::{Byte32, Script};
     use std::collections::HashMap;
 
     struct StubHostRpc {
@@ -149,8 +149,7 @@ mod tests {
         }
 
         fn insert(&mut self, cell: LiveCell) {
-            self.cells
-                .insert(cell.out_point.as_slice().to_vec(), cell);
+            self.cells.insert(cell.out_point.as_slice().to_vec(), cell);
         }
 
         fn insert_hash(&mut self, number: u64, hash: [u8; 32]) {
@@ -274,7 +273,10 @@ mod tests {
             Err(e) => e,
             Ok(_) => panic!("expected missing block hash"),
         };
-        assert!(matches!(err, HostQueryError::MissingBlockHash { number: 5 }));
+        assert!(matches!(
+            err,
+            HostQueryError::MissingBlockHash { number: 5 }
+        ));
     }
 
     #[test]
