@@ -131,29 +131,15 @@ pub fn validate_assembled_tx(
         ));
     }
 
-    // Every draft input (intentions + process state) must appear; reject extras
-    // that were not part of the pre-formed draft (P1-8).
+    // Every draft input (intentions + process state) must appear. Extra inputs
+    // (Process-added funding / counterparty cells) are allowed (P1-4).
     let mut expected: Vec<ckb_types::packed::OutPoint> =
         intentions.iter().map(|i| i.out_point.clone()).collect();
     expected.push(process.live_cell.out_point.clone());
-    if inputs.len() != expected.len() {
-        return Err(AssembleError::InvalidAssembled(format!(
-            "assembled input count {} != draft input count {}",
-            inputs.len(),
-            expected.len()
-        )));
-    }
     for op in &expected {
         if !inputs.iter().any(|i| i.as_slice() == op.as_slice()) {
             return Err(AssembleError::InvalidAssembled(
                 "assembled inputs missing a draft out_point".into(),
-            ));
-        }
-    }
-    for op in &inputs {
-        if !expected.iter().any(|e| e.as_slice() == op.as_slice()) {
-            return Err(AssembleError::InvalidAssembled(
-                "assembled inputs include out_point not in draft".into(),
             ));
         }
     }
@@ -276,13 +262,16 @@ mod tests {
     use crate::scan::ScannedIntention;
     use cid_protocol::{CidArgs, Payload, Script as CidScript};
     use ckb_types::core::ScriptHashType;
-    use ckb_types::packed::{Byte32, OutPoint, RawTransaction, Script, Transaction};
+    use ckb_types::packed::{Byte32, Bytes, OutPoint, RawTransaction, Script, Transaction};
 
     fn pack_assembled(
         inputs: Vec<CellInput>,
         outputs: Vec<CellOutput>,
         outputs_data: Vec<Vec<u8>>,
     ) -> AssembledTx {
+        let witnesses: Vec<ckb_types::packed::Bytes> = (0..inputs.len())
+            .map(|_| Bytes::default())
+            .collect();
         let bytes = Transaction::new_builder()
             .raw(
                 RawTransaction::new_builder()
@@ -291,6 +280,7 @@ mod tests {
                     .outputs_data(outputs_data.iter().map(|d| d.as_slice().pack()).pack())
                     .build(),
             )
+            .witnesses(witnesses.pack())
             .build()
             .as_slice()
             .to_vec();
@@ -412,6 +402,32 @@ mod tests {
         let assembled = pack_assembled(inputs, outputs, vec![vec![], proc.live_cell.data.clone()]);
         let err = validate_assembled_tx(&assembled, &[intent], &proc, usize::MAX).unwrap_err();
         assert!(matches!(err, AssembleError::InvalidAssembled(_)));
+    }
+
+    #[test]
+    fn validate_allows_process_added_extra_inputs() {
+        let proc = process([0xAB; 32], 200_000_000_000);
+        let intent = intention(1, proc.type_hash, 100_000_000_000);
+        let funding_op = OutPoint::new_builder()
+            .tx_hash(Byte32::from_slice(&[0xFEu8; 32]).unwrap())
+            .index(0u32.pack())
+            .build();
+        let inputs = vec![
+            cell_input(&intent.out_point),
+            cell_input(&proc.live_cell.out_point),
+            cell_input(&funding_op),
+        ];
+        let outputs = vec![
+            beneficiary(intent.capacity),
+            proc.live_cell.output.clone(),
+            beneficiary(50_000_000_000),
+        ];
+        let assembled = pack_assembled(
+            inputs,
+            outputs,
+            vec![vec![], proc.live_cell.data.clone(), vec![]],
+        );
+        validate_assembled_tx(&assembled, &[intent], &proc, usize::MAX).expect("extras ok");
     }
 
     #[test]

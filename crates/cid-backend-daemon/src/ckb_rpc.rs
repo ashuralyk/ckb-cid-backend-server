@@ -38,6 +38,7 @@ pub struct CkbRpc {
 
 impl CkbRpc {
     pub fn new(node_url: impl Into<String>, indexer_url: impl Into<String>) -> Self {
+        // Default agent timeout for node RPC (scan / submit / status).
         let agent = ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(30))
             .build();
@@ -45,6 +46,38 @@ impl CkbRpc {
             node_url: node_url.into(),
             indexer_url: indexer_url.into(),
             agent,
+        }
+    }
+
+    /// Host-query indexer round-trips use a dedicated 10s bound (P2-6).
+    fn host_query_rpc_call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
+        let body = json!({
+            "id": 1,
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        });
+        let resp = self
+            .agent
+            .post(&self.indexer_url)
+            .set("Content-Type", "application/json")
+            .timeout(Duration::from_secs(DEFAULT_HOST_QUERY_TIMEOUT_SECS))
+            .send_json(body)
+            .map_err(|e| RpcError::Unavailable(format_rpc_transport_error(method, e)))?;
+        let v: Value = resp
+            .into_json()
+            .map_err(|_e| RpcError::Unavailable(format!("{method}: response decode failed")))?;
+        if let Some(err) = v.get("error") {
+            let msg = err
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("rpc error");
+            let code = json_rpc_code(err);
+            return Err(map_rpc_error(method, code, msg));
+        }
+        match v.get("result") {
+            Some(r) => Ok(r.clone()),
+            None => Err(RpcError::Unavailable(format!("{method}: missing result"))),
         }
     }
 
@@ -431,17 +464,18 @@ impl HostQueryRpc for CkbRpc {
     fn get_cells_page(
         &self,
         search_key_molecule: &[u8],
+        order: u64,
         limit: u32,
         after: &[u8],
     ) -> Result<(Vec<IndexedLiveCell>, Vec<u8>), RpcError> {
-        let _ = DEFAULT_HOST_QUERY_TIMEOUT_SECS;
         let search_key = search_key_molecule_to_json(search_key_molecule)?;
         let page_limit = u64::from(limit.clamp(1, DEFAULT_HOST_QUERY_PAGE_LIMIT));
         let after_val = json_after_cursor(after);
-        let result = self.rpc_call(
-            &self.indexer_url,
+        let order_str = if order == 0 { "asc" } else { "desc" };
+        // Per-request 10s host-query timeout (P2-6); honor asc/desc (P2-7).
+        let result = self.host_query_rpc_call(
             "get_cells",
-            json!([search_key, "asc", hex_u64(page_limit), after_val]),
+            json!([search_key, order_str, hex_u64(page_limit), after_val]),
         )?;
         let objects = result
             .get("objects")
@@ -455,8 +489,7 @@ impl HostQueryRpc for CkbRpc {
             .get("last_cursor")
             .and_then(|c| c.as_str())
             .unwrap_or("");
-        // Indexer cursors are hex strings; store raw hex bytes so pagination
-        // round-trips through `json_after_cursor`.
+        // Indexer cursors are opaque hex strings (variable length).
         Ok((cells, next.as_bytes().to_vec()))
     }
 }
@@ -2407,7 +2440,7 @@ mod tests {
         };
         let key_bytes = serde_molecule::to_vec(&key, false).unwrap();
         let (page, cursor) =
-            HostQueryRpc::get_cells_page(&rpc, &key_bytes, DEFAULT_HOST_QUERY_PAGE_LIMIT, &[])
+            HostQueryRpc::get_cells_page(&rpc, &key_bytes, 0, DEFAULT_HOST_QUERY_PAGE_LIMIT, &[])
                 .unwrap();
         assert_eq!(page.len(), 1);
         assert_eq!(cursor, b"0x");

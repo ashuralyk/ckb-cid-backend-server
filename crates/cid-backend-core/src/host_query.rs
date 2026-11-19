@@ -1,7 +1,7 @@
 //! RPC-backed SSRI host-query: [`HostQueryRpc`] plus [`RpcHostQuery`] which
 //! implements the executor [`cid_process_executor::HostQuery`] trait for all
-//! seven syscalls. Assemble still consumes [`MockHost`]; seed it from RPC
-//! (or from [`RpcHostQuery`]) so the offline VM serves the same catalog.
+//! seven syscalls. Live `Process.assemble` passes [`RpcHostQuery`] into
+//! `ProcessExecutor::assemble` (generic over [`HostQuery`]).
 //!
 //! ## Syscall → [`HostQueryRpc`] mapping
 //!
@@ -27,6 +27,7 @@ use cid_process_executor::{
 use ckb_types::packed::{CellOutput, Header, OutPoint};
 use ckb_types::prelude::*;
 use std::fmt;
+use std::sync::Arc;
 
 /// Syscall numbers (ckb-ssri-std native injection catalog).
 pub const FIND_CELL_BY_OUT_POINT: u64 = 2287;
@@ -101,27 +102,38 @@ pub trait HostQueryRpc {
     fn get_header(&self, hash: &[u8; 32]) -> Result<Option<Vec<u8>>, RpcError>;
 
     /// Bounded `get_cells` page: molecule-encoded `search_key`, cursor `after`.
+    ///
+    /// `order`: `0` = ascending, `1` = descending (ckb-indexer). Cursor bytes are
+    /// opaque variable-length (indexer hex string), not a fixed 8-byte MockHost
+    /// cursor.
     fn get_cells_page(
         &self,
         search_key_molecule: &[u8],
+        order: u64,
         limit: u32,
         after: &[u8],
     ) -> Result<(Vec<IndexedLiveCell>, Vec<u8>), RpcError>;
 }
 
 /// Adapter: [`HostQueryRpc`] → executor [`HostQuery`] (all 7 syscalls).
-#[derive(Clone, Copy, Debug)]
-pub struct RpcHostQuery<'a, R: ?Sized> {
-    pub rpc: &'a R,
+///
+/// Holds [`Arc`] so it satisfies `ProcessExecutor::assemble`'s
+/// `H: HostQuery + Send + 'static` bound on the live path.
+#[derive(Clone, Debug)]
+pub struct RpcHostQuery<R: ?Sized> {
+    pub rpc: Arc<R>,
 }
 
-impl<'a, R: ?Sized> RpcHostQuery<'a, R> {
-    pub fn new(rpc: &'a R) -> Self {
+impl<R: ?Sized> RpcHostQuery<R> {
+    pub fn new(rpc: Arc<R>) -> Self {
         Self { rpc }
     }
 }
 
-impl<R: HostQueryRpc + ?Sized> HostQuery for RpcHostQuery<'_, R> {
+impl<R> HostQuery for RpcHostQuery<R>
+where
+    R: HostQueryRpc + Send + Sync + 'static + ?Sized,
+{
     fn find_cell_by_out_point(&self, out_point: &[u8]) -> Option<Vec<u8>> {
         let op = OutPoint::from_slice(out_point).ok()?;
         let live = self.rpc.get_live_cell(&op).ok().flatten()?;
@@ -191,13 +203,12 @@ impl<R: HostQueryRpc + ?Sized> HostQuery for RpcHostQuery<'_, R> {
         if order > 1 {
             return Err(ExecHostQueryError::InvalidArgs);
         }
-        if !last_cursor.is_empty() && last_cursor.len() != 8 {
-            return Err(ExecHostQueryError::InvalidArgs);
-        }
+        // Cursor is opaque variable-length indexer bytes (hex string); do not
+        // require MockHost's fixed 8-byte cursor (P2-7).
         let page_limit = u32::try_from(limit.min(u64::from(u32::MAX))).unwrap_or(u32::MAX);
         let (cells, next) = self
             .rpc
-            .get_cells_page(search_key, page_limit, last_cursor)
+            .get_cells_page(search_key, order, page_limit, last_cursor)
             .map_err(|_| ExecHostQueryError::Encoding)?;
         let with_data = serde_molecule::from_slice::<SearchKey>(search_key, false)
             .ok()
@@ -435,6 +446,7 @@ macro_rules! impl_host_query_rpc_stubs {
             fn get_cells_page(
                 &self,
                 _: &[u8],
+                _: u64,
                 _: u32,
                 _: &[u8],
             ) -> Result<(Vec<$crate::IndexedLiveCell>, Vec<u8>), $crate::rpc::RpcError> {
@@ -520,12 +532,14 @@ mod tests {
         fn get_cells_page(
             &self,
             search_key_molecule: &[u8],
+            order: u64,
             limit: u32,
             after: &[u8],
         ) -> Result<(Vec<IndexedLiveCell>, Vec<u8>), RpcError> {
             let host = self.index.lock().unwrap().clone();
-            let page = HostQuery::get_cells(&host, search_key_molecule, 0, u64::from(limit), after)
-                .map_err(|_| RpcError::Unavailable("invalid search_key".into()))?;
+            let page =
+                HostQuery::get_cells(&host, search_key_molecule, order, u64::from(limit), after)
+                    .map_err(|_| RpcError::Unavailable("invalid search_key".into()))?;
             let pag: Pagination = serde_molecule::from_slice(&page, false)
                 .map_err(|e| RpcError::Unavailable(format!("pagination: {e}")))?;
             let mut cells = Vec::with_capacity(pag.objects.len());
@@ -676,7 +690,7 @@ mod tests {
         let live = live_at(0xA1, 10);
         let mut rpc = StubHostRpc::new();
         rpc.insert(live.clone());
-        let hq = RpcHostQuery::new(&rpc);
+        let hq = RpcHostQuery::new(Arc::new(rpc));
         let got = HostQuery::find_cell_by_out_point(&hq, live.out_point.as_slice()).unwrap();
         assert_eq!(got, live.output.as_slice());
         assert!(HostQuery::find_cell_by_out_point(&hq, &[0u8; 36]).is_none());
@@ -687,7 +701,7 @@ mod tests {
         let live = live_at(0xA2, 10);
         let mut rpc = StubHostRpc::new();
         rpc.insert(live.clone());
-        let hq = RpcHostQuery::new(&rpc);
+        let hq = RpcHostQuery::new(Arc::new(rpc));
         let got = HostQuery::find_cell_data_by_out_point(&hq, live.out_point.as_slice()).unwrap();
         assert_eq!(got, live.data);
     }
@@ -697,7 +711,7 @@ mod tests {
         let live = live_at(0xA3, 10);
         let mut rpc = StubHostRpc::new();
         rpc.insert(live.clone());
-        let hq = RpcHostQuery::new(&rpc);
+        let hq = RpcHostQuery::new(Arc::new(rpc));
         let with = HostQuery::get_live_cell(&hq, live.out_point.as_slice(), true).unwrap();
         let decoded: ExecLiveCell = serde_molecule::from_slice(&with, false).unwrap();
         assert!(decoded.output.is_some());
@@ -716,7 +730,7 @@ mod tests {
         let header = sample_header(7);
         let mut rpc = StubHostRpc::new();
         rpc.insert_header(7, header.clone());
-        let hq = RpcHostQuery::new(&rpc);
+        let hq = RpcHostQuery::new(Arc::new(rpc));
         let by_number = HostQuery::get_header_by_number(&hq, 7).unwrap();
         assert_eq!(by_number, header.as_slice());
         let hash = header.calc_header_hash();
@@ -729,7 +743,7 @@ mod tests {
     fn rpc_host_query_get_block_hash() {
         let mut rpc = StubHostRpc::new();
         rpc.insert_hash(3, [0x33; 32]);
-        let hq = RpcHostQuery::new(&rpc);
+        let hq = RpcHostQuery::new(Arc::new(rpc));
         assert_eq!(HostQuery::get_block_hash(&hq, 3), Some([0x33; 32]));
         assert!(HostQuery::get_block_hash(&hq, 4).is_none());
     }
@@ -804,7 +818,7 @@ mod tests {
             group_by_transaction: None,
         };
         let key_bytes = serde_molecule::to_vec(&key, false).unwrap();
-        let hq = RpcHostQuery::new(&rpc);
+        let hq = RpcHostQuery::new(Arc::new(rpc));
         let page0 = HostQuery::get_cells(&hq, &key_bytes, 0, 10, &[]).unwrap();
         let pag: Pagination = serde_molecule::from_slice(&page0, false).unwrap();
         assert_eq!(

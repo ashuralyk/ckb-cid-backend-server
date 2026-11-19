@@ -5,7 +5,7 @@ use crate::assemble::{
 };
 const DEFAULT_MAX_ASSEMBLED_TX_BYTES: usize = 512 * 1024;
 use crate::fee::CidLockIdentity;
-use crate::host_query::{seed_host_for_batch, HostQueryError, HostQueryRpc};
+use crate::host_query::HostQueryRpc;
 use crate::process::ResolvedProcess;
 use crate::rpc::{Rpc, RpcError};
 use crate::scan::ScannedIntention;
@@ -18,6 +18,8 @@ use crate::workers::ProcessWorkerState;
 use ckb_types::packed::CellDep;
 use ckb_types::prelude::{Entity, Unpack};
 use std::fmt::Write as _;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 const LOG_TARGET: &str = "cid_backend";
 
@@ -50,12 +52,30 @@ pub struct BatchReportDelta {
 
 pub struct ProcessBatchParams<'a> {
     pub hash: [u8; 32],
-    pub worker: &'a mut ProcessWorkerState,
+    /// Shared worker state — lock only around submit/cache mutations (P2-9).
+    pub state: Arc<Mutex<ProcessWorkerState>>,
     pub process: &'a ResolvedProcess,
     pub batch: Vec<ScannedIntention>,
     pub execution_code_key: &'a [u8],
     pub tick_cell_deps: &'a [CellDep],
     pub max_assembled_tx_bytes: usize,
+    pub job_epoch: u64,
+    pub epoch: Arc<AtomicU64>,
+}
+
+fn batch_cancelled(epoch: &AtomicU64, job_epoch: u64) -> bool {
+    epoch.load(Ordering::SeqCst) != job_epoch
+}
+
+fn cancelled_delta(n: usize) -> (BatchOutcome, BatchReportDelta) {
+    (
+        BatchOutcome::Continue,
+        BatchReportDelta {
+            skipped: n,
+            last_error: Some("worker: RunBatch cancelled (epoch)".into()),
+            ..BatchReportDelta::default()
+        },
+    )
 }
 
 pub fn window_combo_cached(
@@ -70,42 +90,47 @@ pub fn window_combo_cached(
 }
 
 pub fn run_process_batch<R, S>(
-    rpc: &R,
+    rpc: Arc<R>,
     ssri: &S,
     params: ProcessBatchParams<'_>,
 ) -> (BatchOutcome, BatchReportDelta)
 where
-    R: Rpc + HostQueryRpc,
+    R: Rpc + HostQueryRpc + Send + Sync + 'static,
     S: SsriHost,
 {
     let ProcessBatchParams {
         hash,
-        worker,
+        state,
         process,
         batch,
         execution_code_key,
         tick_cell_deps,
         max_assembled_tx_bytes,
+        job_epoch,
+        epoch,
     } = params;
     let mut report = BatchReportDelta::default();
 
-    if window_combo_cached(worker, &batch, process, execution_code_key) {
-        tracing::debug!(
-            target: LOG_TARGET,
-            event = "submit.rejected_combo",
-            n = batch.len(),
-        );
-        return (BatchOutcome::CachedRejected, report);
-    }
-
-    if worker.submit.pending_occupies(&process.live_cell.out_point) {
-        tracing::warn!(
-            target: LOG_TARGET,
-            event = "tick.skip",
-            reason = "process_occupied",
-        );
-        report.skipped += batch.len();
-        return (BatchOutcome::ProcessOccupied, report);
+    // Narrow lock: cache / occupancy prechecks only.
+    {
+        let worker = state.lock().expect("process worker state");
+        if window_combo_cached(&worker, &batch, process, execution_code_key) {
+            tracing::debug!(
+                target: LOG_TARGET,
+                event = "submit.rejected_combo",
+                n = batch.len(),
+            );
+            return (BatchOutcome::CachedRejected, report);
+        }
+        if worker.submit.pending_occupies(&process.live_cell.out_point) {
+            tracing::warn!(
+                target: LOG_TARGET,
+                event = "tick.skip",
+                reason = "process_occupied",
+            );
+            report.skipped += batch.len();
+            return (BatchOutcome::ProcessOccupied, report);
+        }
     }
 
     let cell_deps = draft_cell_deps_for_batch(process, tick_cell_deps);
@@ -137,25 +162,10 @@ where
             return (BatchOutcome::Continue, report);
         }
     };
-    let host = match seed_host_for_batch(rpc, &cells, tip) {
-        Ok(h) => h,
-        Err(e) => {
-            let reason = match &e {
-                HostQueryError::Rpc(_) => "host_query_rpc",
-                HostQueryError::MissingLiveCell(_) => "host_query_missing_cell",
-                HostQueryError::MissingBlockHash { .. } => "host_query_missing_tip_hash",
-            };
-            tracing::warn!(
-                target: LOG_TARGET,
-                event = "tick.skip",
-                reason,
-                error = %e,
-            );
-            report.last_error = Some(format!("host seed: {e}"));
-            report.skipped += batch.len();
-            return (BatchOutcome::Continue, report);
-        }
-    };
+
+    if batch_cancelled(&epoch, job_epoch) {
+        return cancelled_delta(batch.len());
+    }
 
     let max_size = if max_assembled_tx_bytes == 0 {
         DEFAULT_MAX_ASSEMBLED_TX_BYTES
@@ -163,7 +173,9 @@ where
         max_assembled_tx_bytes
     };
 
-    let assemble_outcome = ssri.assemble(&process.binary, &draft, host);
+    // Assemble without holding the state mutex (P2-9). Live path passes
+    // RpcHostQuery into ProcessExecutor::assemble (P1-3).
+    let assemble_outcome = ssri.assemble_live(rpc.clone(), &process.binary, &draft, &cells, tip);
     let skeleton = match assemble_outcome {
         Ok(assembled) => {
             match validate_assembled_tx(&assembled, &batch, process, max_size) {
@@ -176,8 +188,9 @@ where
                         size,
                         max,
                     );
+                    let mut worker = state.lock().expect("process worker state");
                     return record_invalid_assembled_reject(
-                        worker,
+                        &mut worker,
                         &batch,
                         process,
                         execution_code_key,
@@ -191,8 +204,9 @@ where
                         reason = "guest_tx",
                         error = %m,
                     );
+                    let mut worker = state.lock().expect("process worker state");
                     return record_invalid_assembled_reject(
-                        worker,
+                        &mut worker,
                         &batch,
                         process,
                         execution_code_key,
@@ -219,8 +233,9 @@ where
                         reason = "execution_skeleton",
                         error = %m,
                     );
+                    let mut worker = state.lock().expect("process worker state");
                     return record_invalid_assembled_reject(
-                        worker,
+                        &mut worker,
                         &batch,
                         process,
                         execution_code_key,
@@ -245,10 +260,11 @@ where
                 event = "ssri.incompatible",
                 code,
             );
+            let mut worker = state.lock().expect("process worker state");
             // UnsupportedFundingLock (38): permanent per-combo — do not refund.
             if code == UNSUPPORTED_FUNDING_LOCK {
                 return record_invalid_assembled_reject(
-                    worker,
+                    &mut worker,
                     &batch,
                     process,
                     execution_code_key,
@@ -256,9 +272,9 @@ where
                 );
             }
             return handle_incompatible_refunds(
-                rpc,
+                rpc.as_ref(),
                 hash,
-                worker,
+                &mut worker,
                 &batch,
                 code,
                 execution_code_key,
@@ -286,22 +302,30 @@ where
     let intent_ops: Vec<_> = batch.iter().map(|i| i.out_point.clone()).collect();
     let process_op = consumed_process.then(|| process.live_cell.out_point.clone());
     let fp = combo_fingerprint(&intent_ops, process_op.as_ref(), execution_code_key);
-    if worker.submit.rejected_combos.contains(&fp) {
-        tracing::debug!(
-            target: LOG_TARGET,
-            event = "submit.rejected_combo",
-            n = batch.len(),
-        );
-        return (BatchOutcome::CachedRejected, report);
+
+    {
+        let worker = state.lock().expect("process worker state");
+        if worker.submit.rejected_combos.contains(&fp) {
+            tracing::debug!(
+                target: LOG_TARGET,
+                event = "submit.rejected_combo",
+                n = batch.len(),
+            );
+            return (BatchOutcome::CachedRejected, report);
+        }
     }
+
     let consumed: Vec<_> = skeleton
         .tx
         .inputs()
         .into_iter()
         .map(|i| i.previous_output())
         .collect();
-    match dry_run_gate(rpc, &skeleton.tx) {
+
+    // Dry-run without holding the state mutex.
+    match dry_run_gate(rpc.as_ref(), &skeleton.tx) {
         DryRunGate::Rejected(m) => {
+            let mut worker = state.lock().expect("process worker state");
             worker.submit.rejected_combos.insert(fp);
             tracing::warn!(
                 target: LOG_TARGET,
@@ -325,7 +349,14 @@ where
         }
         DryRunGate::Proceed => {}
     }
-    match submit_execution(rpc, &skeleton, &mut worker.submit, &consumed) {
+
+    // Shared cancel/epoch checked before submit (P0-1 / P0-2).
+    if batch_cancelled(&epoch, job_epoch) {
+        return cancelled_delta(batch.len());
+    }
+
+    let mut worker = state.lock().expect("process worker state");
+    match submit_execution(rpc.as_ref(), &skeleton, &mut worker.submit, &consumed) {
         Ok(tx_hash) => {
             tracing::info!(
                 target: LOG_TARGET,

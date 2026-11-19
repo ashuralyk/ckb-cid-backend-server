@@ -241,16 +241,27 @@ where
 
     /// Register (or update) a Process worker immediately.
     pub fn register_process(&mut self, entry: ProcessEntry) -> bool {
-        let created = self.workers.register(entry);
-        tracing::info!(
-            target: LOG_TARGET,
-            event = if created {
-                "process.registered"
-            } else {
-                "process.updated"
-            },
-        );
-        created
+        match self.workers.register(entry) {
+            Ok(created) => {
+                tracing::info!(
+                    target: LOG_TARGET,
+                    event = if created {
+                        "process.registered"
+                    } else {
+                        "process.updated"
+                    },
+                );
+                created
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    event = "process.register_refused",
+                    error = ?e,
+                );
+                false
+            }
+        }
     }
 
     /// Remove a Process worker when idle.
@@ -283,10 +294,25 @@ where
             match cmd {
                 WorkerCommand::Register(entry) => {
                     let hash = entry.identity_type_hash;
-                    let _ = self.register_process(entry);
-                    requeue.retain(
-                        |c| !matches!(c, WorkerCommand::Delete { hash: h, .. } if *h == hash),
-                    );
+                    match self.workers.register(entry.clone()) {
+                        Ok(_) => {
+                            tracing::info!(
+                                target: LOG_TARGET,
+                                event = "process.registered",
+                            );
+                            requeue.retain(|c| {
+                                !matches!(c, WorkerCommand::Delete { hash: h, .. } if *h == hash)
+                            });
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                target: LOG_TARGET,
+                                event = "process.register_deferred",
+                                error = ?e,
+                            );
+                            requeue.push(WorkerCommand::Register(entry));
+                        }
+                    }
                 }
                 WorkerCommand::Delete { hash, generation } => {
                     if let Some(want) = generation {
@@ -326,15 +352,9 @@ where
         }
         if !requeue.is_empty() {
             if let Some(q) = &self.worker_cmds {
-                match q.lock() {
-                    Ok(mut g) => g.extend(requeue),
-                    Err(_) => {
-                        tracing::error!(
-                            target: LOG_TARGET,
-                            event = "worker_cmds.poisoned_requeue",
-                        );
-                    }
-                }
+                // Recover deferred Deletes even if the mutex was poisoned (P2-8).
+                let mut g = q.lock().unwrap_or_else(|e| e.into_inner());
+                g.extend(requeue);
             }
         }
     }
@@ -410,6 +430,7 @@ where
                 report.last_error = Some(format!("code deps: {e}"));
                 self.clear_worker_tick_code();
                 self.tick_cell_deps.clear();
+                self.sync_busy_map();
                 return report;
             }
         };
@@ -446,6 +467,7 @@ where
                 report.last_error = Some(format!("scan unavailable: {m}"));
                 self.tick_cell_deps.clear();
                 self.clear_worker_tick_code();
+                self.sync_busy_map();
                 return report;
             }
             Err(e) => {
@@ -457,6 +479,7 @@ where
                 report.last_error = Some(format!("scan error: {e}"));
                 self.tick_cell_deps.clear();
                 self.clear_worker_tick_code();
+                self.sync_busy_map();
                 return report;
             }
         };
@@ -1048,6 +1071,14 @@ where
             max_size,
         );
         Self::apply_batch_report(report, &delta);
+        // Sync busy map immediately after submit so registry code-rebind sees
+        // pending occupancy without waiting for tick end (P1-5).
+        if matches!(
+            outcome,
+            BatchOutcome::Submitted | BatchOutcome::SubmittedProcess
+        ) {
+            self.sync_busy_map();
+        }
         outcome
     }
 }

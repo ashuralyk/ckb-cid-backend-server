@@ -1,3 +1,4 @@
+use crate::host_query::{seed_host_for_batch, HostQueryRpc, RpcHostQuery};
 use crate::process::ResolvedProcess;
 use crate::scan::ScannedIntention;
 use cid_process_executor::{AssembledTx, DraftCell, ExecutorError, MockHost, ProcessExecutor};
@@ -5,6 +6,7 @@ use ckb_types::core::DepType;
 use ckb_types::packed::{CellDep, CellInput, RawTransaction, Script, Transaction};
 use ckb_types::prelude::*;
 use std::fmt;
+use std::sync::Arc;
 
 /// Process guest exit: funding lock is not AlwaysSuccess(Data1) / is Process lock.
 pub const UNSUPPORTED_FUNDING_LOCK: i8 = 38;
@@ -43,6 +45,27 @@ pub trait SsriHost {
         draft_tx: &[u8],
         host: MockHost,
     ) -> Result<AssembledTx, SsriError>;
+
+    /// Live digest assemble entry (P1-3).
+    ///
+    /// Default (tests / scripted hosts): seed a [`MockHost`] from RPC draft cells.
+    /// [`EmbeddedSsri`] overrides this to pass [`RpcHostQuery`] into
+    /// `ProcessExecutor::assemble<H: HostQuery>`.
+    fn assemble_live<R>(
+        &self,
+        rpc: Arc<R>,
+        binary: &[u8],
+        draft_tx: &[u8],
+        draft_cells: &[DraftCell],
+        tip: u64,
+    ) -> Result<AssembledTx, SsriError>
+    where
+        R: HostQueryRpc + Send + Sync + 'static,
+    {
+        let host = seed_host_for_batch(rpc.as_ref(), draft_cells, tip)
+            .map_err(|e| SsriError::Unusable(format!("host seed: {e}")))?;
+        self.assemble(binary, draft_tx, host)
+    }
 }
 
 pub struct EmbeddedSsri;
@@ -62,6 +85,22 @@ impl SsriHost for EmbeddedSsri {
     ) -> Result<AssembledTx, SsriError> {
         ProcessExecutor::new(binary.to_vec())
             .assemble(draft_tx, host)
+            .map_err(map_executor_error)
+    }
+
+    fn assemble_live<R>(
+        &self,
+        rpc: Arc<R>,
+        binary: &[u8],
+        draft_tx: &[u8],
+        _draft_cells: &[DraftCell],
+        _tip: u64,
+    ) -> Result<AssembledTx, SsriError>
+    where
+        R: HostQueryRpc + Send + Sync + 'static,
+    {
+        ProcessExecutor::new(binary.to_vec())
+            .assemble(draft_tx, RpcHostQuery::new(rpc))
             .map_err(map_executor_error)
     }
 }

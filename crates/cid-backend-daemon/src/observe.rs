@@ -706,6 +706,7 @@ mod tests {
         fn get_cells_page(
             &self,
             _: &[u8],
+            _: u64,
             _: u32,
             _: &[u8],
         ) -> Result<
