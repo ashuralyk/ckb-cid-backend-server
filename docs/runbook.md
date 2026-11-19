@@ -63,8 +63,9 @@ Registration JSON:
 - Optional `*_type_id` fields fail-closed if they disagree with derived hashes.
 - Idempotent re-register; replacing `code_*` for the same identity updates the
   binding. Bounded by `registry.max_entries` (default 64).
-- DELETE returns 404 if missing. Worker stop is deferred while that Process
-  still has pending submits (`process.delete_deferred`).
+- DELETE returns 404 if missing. After deletion is queued, the worker stops
+  accepting new batches. It continues tracking pending transactions until it
+  can shut down (`process.delete_deferred`).
 
 Registry file: atomic write+rename JSON at `registry.path`. Loaded on startup;
 register/delete persist immediately and enqueue live worker spawn/stop.
@@ -84,7 +85,9 @@ script raw bytes then block/tx/output index (see contract
 
 Pinned `cid_process_example` pays fee from Process state and **rejects extra
 funding inputs** with `UnsupportedFundingLock` (38). Do not pass funding cells
-to the example guest / calculator submit helper.
+to the example guest / calculator submit helper. Only `IncompatibleBatch`
+(21) triggers a refund. Host query failures (36) and insufficient Process state
+capacity (37) leave Intentions live for retry.
 
 ## Ops checklist
 
@@ -94,4 +97,4 @@ to the example guest / calculator submit helper.
 3. `POST /v1/processes` for each Process you operate.
 4. Watch `/readyz` and logs (`process.unregistered` = skip; `submit.ok` =
    passthrough submit).
-5. To disable a Process: `DELETE /v1/processes/0x…` (retry if in-flight).
+5. To disable a Process, call `DELETE /v1/processes/0x…`. The worker drains any pending transactions.

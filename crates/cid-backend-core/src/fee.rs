@@ -115,6 +115,32 @@ impl CidLockIdentity {
     }
 }
 
+/// Daemon fee policy for Incompatible refunds. DigestOk fees belong to the guest.
+#[derive(Clone, Debug)]
+pub struct RefundPolicy {
+    pub fee_rate: u64,
+    pub bounded_locks: Vec<CidLockIdentity>,
+}
+
+impl Default for RefundPolicy {
+    fn default() -> Self {
+        Self {
+            fee_rate: DEFAULT_FEE_RATE,
+            bounded_locks: Vec::new(),
+        }
+    }
+}
+
+impl RefundPolicy {
+    pub fn mode_for(&self, id: &CidLockIdentity) -> RefundFeeMode {
+        if lock_allows_bounded_refund(&self.bounded_locks, id) {
+            RefundFeeMode::Bounded
+        } else {
+            RefundFeeMode::Exact
+        }
+    }
+}
+
 /// How Incompatible User Lock refunds fund the miner fee.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RefundFeeMode {

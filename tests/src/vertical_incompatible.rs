@@ -32,6 +32,8 @@ mod tests {
                 extra_cell_deps: vec![crate::helpers::placeholder_code_dep()],
                 type_id_code_deps: vec![],
                 confirmation_depth: 1,
+                extra_scan_locks: vec![],
+                refund_policy: Default::default(),
                 max_assembled_tx_bytes: 512 * 1024,
             },
             3,
@@ -64,5 +66,30 @@ mod tests {
             let code: [u8; 32] = c.lock().code_hash().unpack();
             code == user_lock().code_hash && c.capacity() == 100_0000_0000
         }));
+    }
+
+    #[test]
+    fn assemble_host_and_state_errors_do_not_refund() {
+        let mut refunded = Vec::new();
+        for code in [36, 37] {
+            let rpc = FakeRpc::new();
+            let hash = script_hash32(&process_type_script(3));
+            rpc.insert_cell(intention_cell(1, hash, 100_0000_0000));
+            rpc.insert_cell(process_cell(3, 200_0000_0000, vec![]));
+            let mut loop_ = loop_with_resolver(
+                rpc,
+                ScriptedSsri::incompatible(code),
+                crate::helpers::default_loop_config(),
+                3,
+            );
+            let _ = loop_.tick();
+            if !loop_.rpc().submitted().is_empty() {
+                refunded.push(code);
+            }
+        }
+        assert!(
+            refunded.is_empty(),
+            "guest exits triggered refunds: {refunded:?}"
+        );
     }
 }

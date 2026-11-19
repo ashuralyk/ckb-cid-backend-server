@@ -411,24 +411,31 @@ impl HostQueryRpc for CkbRpc {
             "get_live_cell",
             json!([out_point_json(out_point), true]),
         )?;
-        let status = result
-            .get("status")
-            .and_then(|s| s.as_str())
-            .unwrap_or("unknown");
-        if status != "live" {
-            return Ok(None);
+        match result.get("status").and_then(Value::as_str) {
+            Some("dead" | "unknown") => return Ok(None),
+            Some("live") => {}
+            _ => {
+                return Err(RpcError::Unavailable(
+                    "get_live_cell: invalid status".into(),
+                ))
+            }
         }
-        let Some(cell) = result.get("cell") else {
-            return Ok(None);
-        };
-        let data = match result.get("data") {
-            Some(Value::String(s)) => decode_hex(s)?,
-            _ => Vec::new(),
-        };
+        let cell = result
+            .get("cell")
+            .ok_or_else(|| RpcError::Unavailable("get_live_cell: missing live cell".into()))?;
+        let output = cell
+            .get("output")
+            .ok_or_else(|| RpcError::Unavailable("get_live_cell: missing cell.output".into()))?;
+        let content = cell
+            .pointer("/data/content")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                RpcError::Unavailable("get_live_cell: missing cell.data.content".into())
+            })?;
         Ok(Some(LiveCell {
             out_point: out_point.clone(),
-            output: json_to_output(cell)?,
-            data,
+            output: json_to_output(output)?,
+            data: decode_hex(content)?,
         }))
     }
 
@@ -1791,6 +1798,8 @@ mod tests {
             extra_cell_deps: vec![placeholder_code_dep()],
             type_id_code_deps: vec![],
             confirmation_depth: depth,
+            extra_scan_locks: vec![],
+            refund_policy: Default::default(),
             max_assembled_tx_bytes: 512 * 1024,
         }
     }
@@ -1798,8 +1807,13 @@ mod tests {
     fn indexer_cell_rpc_live(obj: &Value) -> Value {
         json!({
             "status": "live",
-            "cell": obj["output"].clone(),
-            "data": obj.get("output_data").cloned().unwrap_or(Value::String("0x".into())),
+            "cell": {
+                "output": obj["output"],
+                "data": {
+                    "content": obj.get("output_data").and_then(Value::as_str).unwrap_or("0x"),
+                    "hash": hex_bytes(&[0x01; 32]),
+                },
+            },
         })
     }
 
@@ -2118,6 +2132,8 @@ mod tests {
             extra_cell_deps: vec![placeholder_code_dep()],
             type_id_code_deps: vec![],
             confirmation_depth: 1,
+            extra_scan_locks: vec![],
+            refund_policy: Default::default(),
             max_assembled_tx_bytes: 512 * 1024,
         };
         let mut first = DigestLoop::new(
@@ -2144,6 +2160,8 @@ mod tests {
                 extra_cell_deps: vec![placeholder_code_dep()],
                 type_id_code_deps: vec![],
                 confirmation_depth: 1,
+                extra_scan_locks: vec![],
+                refund_policy: Default::default(),
                 max_assembled_tx_bytes: 512 * 1024,
             },
         );
@@ -2360,6 +2378,8 @@ mod tests {
             extra_cell_deps: vec![placeholder_code_dep()],
             type_id_code_deps: vec![],
             confirmation_depth: 1,
+            extra_scan_locks: vec![],
+            refund_policy: Default::default(),
             max_assembled_tx_bytes: 512 * 1024,
         };
         let mut loop_ = DigestLoop::new(
@@ -2396,11 +2416,16 @@ mod tests {
                 assert_eq!(op.get("index").and_then(|v| v.as_str()), Some("0x0"));
                 Ok(json!({
                     "cell": {
-                        "capacity": "0x64",
-                        "lock": lock_json(CID_CODE, &[]),
-                        "type": null,
+                        "output": {
+                            "capacity": "0x64",
+                            "lock": lock_json(CID_CODE, &[]),
+                            "type": null,
+                        },
+                        "data": {
+                            "content": "0xab",
+                            "hash": format!("0x{}", "01".repeat(32)),
+                        },
                     },
-                    "data": "0xab",
                     "status": "live",
                 }))
             }
@@ -2451,6 +2476,97 @@ mod tests {
                 .unwrap();
         assert_eq!(page.len(), 1);
         assert_eq!(cursor, b"0x");
+    }
+
+    #[test]
+    fn real_guest_assembles_through_live_cell_rpc_adapter() {
+        use cid_backend_core::host_query::RpcHostQuery;
+        use cid_backend_core::type_id::type_id_script;
+        use cid_process_executor::{
+            build_draft_tx, intention_draft_cell, process_draft_cell, ProcessExecutor,
+        };
+        use ckb_types::packed::Transaction;
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/cid_process_example");
+        let binary = match std::fs::read(&path) {
+            Ok(binary) => binary,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound && std::env::var_os("CI").is_none() =>
+            {
+                eprintln!("build the pinned fixture to run live guest test");
+                return;
+            }
+            Err(e) => panic!("could not read pinned fixture {}: {e}", path.display()),
+        };
+        let state_type = type_id_script(&[0x22; 32]);
+        let process_hash = script_hash32(&state_type);
+        let beneficiary = CidScript {
+            code_hash: [0x42; 32],
+            hash_type: 1,
+            args: vec![0x01, 0x02],
+        };
+        let cid_args = CidArgs::new(
+            process_hash,
+            beneficiary.clone(),
+            Payload::from_script(&beneficiary).unwrap(),
+        )
+        .encode()
+        .unwrap();
+        let out_point = |tag: u8| OutPoint::new_builder().tx_hash([tag; 32].pack()).build();
+        let intention =
+            intention_draft_cell(out_point(0x10), cid_args, 100_0000_0000, None, vec![0xab]);
+        let state = process_draft_cell(
+            out_point(0x11),
+            Script::new_builder()
+                .code_hash(PROC_CODE.pack())
+                .hash_type(ScriptHashType::Type.into())
+                .build(),
+            state_type,
+            200_0000_0000,
+            vec![0xcd, 0xef],
+        );
+        let cells = [intention, state];
+        let draft = Transaction::from_slice(&build_draft_tx(&cells)).unwrap();
+        let dep = CellDep::new_builder().out_point(out_point(0x12)).build();
+        let draft = draft
+            .clone()
+            .as_builder()
+            .raw(
+                draft
+                    .raw()
+                    .as_builder()
+                    .cell_deps(vec![dep.clone()].pack())
+                    .build(),
+            )
+            .build();
+        let url = spawn_mock(Arc::new(move |method, params| match method {
+            "get_live_cell" => {
+                assert_eq!(params[1], true);
+                let cell = cells
+                    .iter()
+                    .find(|cell| out_point_json(&cell.out_point) == params[0])
+                    .expect("query must use a draft input");
+                Ok(json!({
+                    "status": "live",
+                    "cell": {
+                        "output": output_json(&cell.output).unwrap(),
+                        "data": {
+                            "content": hex_bytes(&cell.data),
+                            "hash": hex_bytes(&[0x01; 32]),
+                        },
+                    },
+                }))
+            }
+            "get_block_hash" => Ok(json!(hex_bytes(&[0x02; 32]))),
+            method => panic!("unexpected RPC method {method}"),
+        }));
+        let host = RpcHostQuery::new(Arc::new(CkbRpc::new(&url, &url)));
+        let assembled = ProcessExecutor::new(binary)
+            .assemble(draft.as_slice(), host)
+            .unwrap();
+        assert_eq!(assembled.outputs_data, vec![vec![0xcd, 0xef], vec![0xab]]);
+        assert_eq!(assembled.cell_deps, vec![dep]);
     }
 
     #[test]

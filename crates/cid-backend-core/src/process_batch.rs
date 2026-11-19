@@ -1,17 +1,17 @@
 //! Process batch assembly / dry-run / submit (runs on per-Process worker threads).
 
 use crate::assemble::{
-    assemble_digest_incompatible, execution_from_assembled, validate_assembled_tx, AssembleError,
+    assemble_refund_with_policy, execution_from_assembled, validate_assembled_tx, AssembleError,
 };
 const DEFAULT_MAX_ASSEMBLED_TX_BYTES: usize = 512 * 1024;
-use crate::fee::CidLockIdentity;
+use crate::fee::{CidLockIdentity, RefundPolicy};
 use crate::host_query::HostQueryRpc;
 use crate::process::ResolvedProcess;
 use crate::rpc::{Rpc, RpcError};
 use crate::scan::ScannedIntention;
 use crate::ssri::{
     build_batch_draft, draft_cell_deps_for_batch, draft_cells_for_batch, SsriError, SsriHost,
-    UNSUPPORTED_FUNDING_LOCK,
+    INCOMPATIBLE_BATCH, UNSUPPORTED_FUNDING_LOCK,
 };
 use crate::submit::{combo_fingerprint, dry_run_gate, submit_execution, DryRunGate};
 use crate::workers::ProcessWorkerState;
@@ -58,6 +58,7 @@ pub struct ProcessBatchParams<'a> {
     pub batch: Vec<ScannedIntention>,
     pub execution_code_key: &'a [u8],
     pub tick_cell_deps: &'a [CellDep],
+    pub refund_policy: &'a RefundPolicy,
     pub max_assembled_tx_bytes: usize,
     pub job_epoch: u64,
     pub epoch: Arc<AtomicU64>,
@@ -105,6 +106,7 @@ where
         batch,
         execution_code_key,
         tick_cell_deps,
+        refund_policy,
         max_assembled_tx_bytes,
         job_epoch,
         epoch,
@@ -254,23 +256,22 @@ where
                 }
             }
         }
-        Err(SsriError::Incompatible(code)) => {
+        Err(SsriError::Incompatible(code)) if code == UNSUPPORTED_FUNDING_LOCK => {
+            let mut worker = state.lock().expect("process worker state");
+            return record_invalid_assembled_reject(
+                &mut worker,
+                &batch,
+                process,
+                execution_code_key,
+                &mut report,
+            );
+        }
+        Err(SsriError::Incompatible(code)) if code == INCOMPATIBLE_BATCH => {
             tracing::info!(
                 target: LOG_TARGET,
                 event = "ssri.incompatible",
                 code,
             );
-            // UnsupportedFundingLock (38): permanent per-combo — do not refund.
-            if code == UNSUPPORTED_FUNDING_LOCK {
-                let mut worker = state.lock().expect("process worker state");
-                return record_invalid_assembled_reject(
-                    &mut worker,
-                    &batch,
-                    process,
-                    execution_code_key,
-                    &mut report,
-                );
-            }
             // Refund path: unlock around dry-run + submit like digest_ok (P2).
             return handle_incompatible_refunds(
                 rpc.as_ref(),
@@ -280,8 +281,15 @@ where
                 code,
                 execution_code_key,
                 tick_cell_deps,
+                refund_policy,
                 &mut report,
             );
+        }
+        Err(SsriError::Incompatible(code)) => {
+            tracing::warn!(target: LOG_TARGET, event = "ssri.assemble_failed", code);
+            report.last_error = Some(format!("Process assembly failed (exit {code})"));
+            report.skipped += batch.len();
+            return (BatchOutcome::Continue, report);
         }
         Err(SsriError::Unusable(m)) => {
             tracing::warn!(
@@ -415,6 +423,7 @@ fn handle_incompatible_refunds<R: Rpc + HostQueryRpc>(
     code: i8,
     execution_code_key: &[u8],
     tick_cell_deps: &[CellDep],
+    refund_policy: &RefundPolicy,
     report: &mut BatchReportDelta,
 ) -> (BatchOutcome, BatchReportDelta) {
     let mut by_identity: Vec<(CidLockIdentity, Vec<ScannedIntention>)> = Vec::new();
@@ -437,6 +446,7 @@ fn handle_incompatible_refunds<R: Rpc + HostQueryRpc>(
     }
 
     let mut submitted = false;
+    let mut rejection = None;
     for (_id, group) in by_identity {
         if group.is_empty() {
             continue;
@@ -449,22 +459,27 @@ fn handle_incompatible_refunds<R: Rpc + HostQueryRpc>(
             code,
             execution_code_key,
             tick_cell_deps,
+            refund_policy,
             report,
         );
         match outcome {
             BatchOutcome::Submitted => submitted = true,
-            BatchOutcome::Rejected | BatchOutcome::CachedRejected => {
-                return (outcome, report.clone());
+            BatchOutcome::Rejected => rejection = Some(outcome),
+            BatchOutcome::CachedRejected => {
+                rejection.get_or_insert(outcome);
             }
             _ => {}
         }
     }
 
-    if submitted {
-        (BatchOutcome::Submitted, report.clone())
+    // Each group was authorized by the same guest result. Finish independent
+    // refunds even when another identity has to be split and retried.
+    let outcome = rejection.unwrap_or(if submitted {
+        BatchOutcome::Submitted
     } else {
-        (BatchOutcome::Continue, report.clone())
-    }
+        BatchOutcome::Continue
+    });
+    (outcome, report.clone())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -476,42 +491,54 @@ fn assemble_and_submit_refund<R: Rpc + HostQueryRpc>(
     code: i8,
     execution_code_key: &[u8],
     tick_cell_deps: &[CellDep],
+    refund_policy: &RefundPolicy,
     report: &mut BatchReportDelta,
 ) -> BatchOutcome {
-    let skeleton = match assemble_digest_incompatible(group, tick_cell_deps) {
-        Ok(s) => {
-            let out_sum: u64 =
-                s.tx.outputs()
-                    .into_iter()
-                    .map(|o| {
-                        let c: u64 = o.capacity().unpack();
-                        c
-                    })
-                    .sum();
-            let in_sum: u64 = group.iter().map(|i| i.capacity).sum();
-            let fee = in_sum.saturating_sub(out_sum);
-            tracing::info!(
-                target: LOG_TARGET,
-                event = "refund.path",
-                code,
-                path = "user_lock",
-                fee,
-                n = group.len(),
-            );
-            s
-        }
-        Err(e) => {
-            tracing::warn!(
-                target: LOG_TARGET,
-                event = "refund.path",
-                code,
-                path = "unbuildable",
-                error = %e,
-            );
-            report.skipped += group.len();
-            return BatchOutcome::Continue;
-        }
-    };
+    let mode = refund_policy.mode_for(&group[0].lock_identity());
+    let skeleton =
+        match assemble_refund_with_policy(group, tick_cell_deps, mode, refund_policy.fee_rate) {
+            Ok(s) => {
+                let out_sum: u64 =
+                    s.tx.outputs()
+                        .into_iter()
+                        .map(|o| {
+                            let c: u64 = o.capacity().unpack();
+                            c
+                        })
+                        .sum();
+                let in_sum: u64 = group.iter().map(|i| i.capacity).sum();
+                let fee = in_sum.saturating_sub(out_sum);
+                if fee == 0 {
+                    tracing::debug!(target: LOG_TARGET, event = "refund.zero_fee", n = group.len());
+                }
+                tracing::info!(
+                    target: LOG_TARGET,
+                    event = "refund.path",
+                    code,
+                    path = "user_lock",
+                    fee,
+                    n = group.len(),
+                );
+                s
+            }
+            Err(e @ AssembleError::RefundFeeUnaffordable { .. }) => {
+                tracing::warn!(target: LOG_TARGET, event = "refund.fee_unaffordable", error = %e);
+                // Reuse the split path without caching an unaffordable window.
+                report.last_error = Some(e.to_string());
+                return BatchOutcome::Rejected;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    event = "refund.path",
+                    code,
+                    path = "unbuildable",
+                    error = %e,
+                );
+                report.skipped += group.len();
+                return BatchOutcome::Continue;
+            }
+        };
 
     let intent_ops: Vec<_> = group.iter().map(|i| i.out_point.clone()).collect();
     let fp = combo_fingerprint(&intent_ops, None, execution_code_key);

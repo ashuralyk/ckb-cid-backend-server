@@ -50,6 +50,8 @@ mod tests {
             extra_cell_deps: extra,
             type_id_code_deps,
             confirmation_depth: 1,
+            extra_scan_locks: vec![],
+            refund_policy: Default::default(),
             max_assembled_tx_bytes: 512 * 1024,
         }
     }
@@ -363,6 +365,32 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "legacy extra_scan_locks / bounded_refund scan removed from LoopConfig"]
-    fn legacy_scan_and_bounded_refund_tests_removed() {}
+    fn same_process_code_upgrade_retries_rejected_batch() {
+        let code_args = [0xb3; 32];
+        let rpc = FakeRpc::new();
+        let hash = process_type_hash(14);
+        rpc.insert_cell(intention_cell(14, hash, 100_0000_0000));
+        rpc.insert_cell(process_cell_for_code(14, 200_0000_0000, vec![], code_args));
+        let code_v1 = code_cell(0x73, code_args, vec![0x7f, b'E', b'L', b'F', 1]);
+        rpc.insert_cell(code_v1.clone());
+        rpc.inject_dry_run_reject_once();
+        let mut loop_ = loop_with_resolver_and_code(
+            rpc,
+            ScriptedSsri::mimic((1, 1)),
+            default_loop_config(),
+            14,
+            code_args,
+        );
+        assert_eq!(loop_.tick().submitted, 0);
+        assert!(!loop_.state().submit.unwrap().rejected_combos.is_empty());
+        loop_.rpc().consume(&code_v1.out_point);
+        loop_
+            .rpc()
+            .insert_cell(code_cell(0x74, code_args, vec![0x7f, b'E', b'L', b'F', 2]));
+        assert_eq!(
+            loop_.tick().submitted,
+            1,
+            "same batch should retry under upgraded Process code"
+        );
+    }
 }

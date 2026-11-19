@@ -1,4 +1,4 @@
-//! Fee handling moved to guest-assembled txs; backend only passthrough-validates.
+//! The guest pays DigestOk fees; the backend handles incompatible refunds.
 
 #[cfg(test)]
 mod tests {
@@ -78,6 +78,73 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "legacy backend fee deduction removed; guest assembles complete tx"]
-    fn legacy_backend_fee_tests_removed() {}
+    fn legacy_scan_and_bounded_refund_preserve_per_lock_fee_modes() {
+        use crate::helpers::intention_cell_with_lock;
+        use cid_backend_core::{fee_for_size, tx_size_in_block, CidLockIdentity};
+        use ckb_types::core::ScriptHashType;
+
+        let rpc = FakeRpc::new();
+        let hash = script_hash32(&process_type_script(3));
+        let capacity = 100_0000_0000;
+        let legacy = CidLockIdentity::new([0xd1; 32], ScriptHashType::Data1);
+        let legacy_cell =
+            intention_cell_with_lock(2, hash, capacity, legacy.code_hash, legacy.hash_type);
+        let primary = intention_cell(1, hash, capacity);
+        rpc.insert_cell(primary.clone());
+        rpc.insert_cell(legacy_cell.clone());
+        rpc.insert_cell(process_cell(3, 200_0000_0000, vec![]));
+        let mut config = default_loop_config();
+        config.extra_scan_locks = vec![legacy];
+        config.refund_policy.bounded_locks = vec![legacy];
+        config.refund_policy.fee_rate = 2500;
+        let mut loop_ = loop_with_resolver(rpc, ScriptedSsri::incompatible(21), config, 3);
+
+        let report = loop_.tick();
+        assert_eq!(report.scanned, 2);
+        assert_eq!(report.submitted, 2, "{:?}", report.last_error);
+        for tx in loop_.rpc().submitted() {
+            assert_eq!(tx.inputs().len(), 1);
+            let input = tx.inputs().get(0).unwrap().previous_output();
+            let returned: u64 = tx.outputs().get(0).unwrap().capacity().unpack();
+            if input == legacy_cell.out_point {
+                let fee = fee_for_size(tx_size_in_block(&tx), 2500);
+                assert!(fee > 0);
+                assert_eq!(capacity - returned, fee);
+            } else {
+                assert_eq!(input, primary.out_point);
+                assert_eq!(capacity, returned);
+            }
+        }
+    }
+    #[test]
+    fn unaffordable_bounded_group_does_not_suppress_exact_refund() {
+        use crate::helpers::intention_cell_with_lock;
+        use cid_backend_core::{CidLockIdentity, MAX_FEE_RATE};
+        use ckb_types::core::ScriptHashType;
+
+        let rpc = FakeRpc::new();
+        let hash = script_hash32(&process_type_script(3));
+        let capacity = 100_0000_0000;
+        let legacy = CidLockIdentity::new([0xd1; 32], ScriptHashType::Data1);
+        let bounded = intention_cell(1, hash, capacity);
+        let exact = intention_cell_with_lock(2, hash, capacity, legacy.code_hash, legacy.hash_type);
+        rpc.insert_cell(bounded.clone());
+        rpc.insert_cell(exact.clone());
+        rpc.insert_cell(process_cell(3, 200_0000_0000, vec![]));
+        let mut config = default_loop_config();
+        config.refund_policy.bounded_locks = vec![config.scan_lock_identities()[0]];
+        config.refund_policy.fee_rate = MAX_FEE_RATE;
+        config.extra_scan_locks = vec![legacy];
+        let ssri = ScriptedSsri::ok_then_incompatible((2, 2), 0, 21);
+        let mut loop_ = loop_with_resolver(rpc, ssri, config, 3);
+
+        let report = loop_.tick();
+        assert_eq!(report.submitted, 1, "{:?}", report.last_error);
+        let tx = &loop_.rpc().submitted()[0];
+        assert_eq!(
+            tx.inputs().get(0).unwrap().previous_output(),
+            exact.out_point
+        );
+        assert!(loop_.rpc().has_cell(&bounded.out_point));
+    }
 }
