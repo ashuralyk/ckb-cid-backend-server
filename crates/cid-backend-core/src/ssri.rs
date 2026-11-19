@@ -384,6 +384,9 @@ mod tests {
         let ben_cap: u64 = assembled.outputs[1].capacity().unpack();
         assert_eq!(ben_cap, 100_0000_0000);
 
+        // CI gate greps this exact banner under `--nocapture` (do not weaken).
+        eprintln!("real SSRI guest executed: Process.batch=({min},{max}) Process.assemble n=1 ok");
+
         let _ = ProcessResolver::for_entry(entry);
         let _ = script_hash32;
     }

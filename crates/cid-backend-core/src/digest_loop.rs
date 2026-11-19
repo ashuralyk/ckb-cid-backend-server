@@ -559,6 +559,31 @@ where
         report
     }
 
+    /// Sync Rejected/CachedRejected stack frames: drop_first(+rest) then shrink.
+    /// Returns frames in push order (shrink is last / popped first) and skipped.
+    fn reject_isolate_frames(
+        window: &[ScannedIntention],
+        rest: &[ScannedIntention],
+        min: u32,
+    ) -> (Vec<Vec<ScannedIntention>>, usize) {
+        let mut drop_first = window[1..].to_vec();
+        drop_first.extend_from_slice(rest);
+        let mut frames = Vec::new();
+        let mut skipped = 0usize;
+        if window.len() > min as usize {
+            if !drop_first.is_empty() {
+                frames.push(drop_first);
+            }
+            frames.push(window[..window.len() - 1].to_vec());
+        } else {
+            skipped = 1;
+            if !drop_first.is_empty() {
+                frames.push(drop_first);
+            }
+        }
+        (frames, skipped)
+    }
+
     fn apply_polled_batch(
         worker: &crate::workers::ProcessWorker,
         report: &mut TickReport,
@@ -568,19 +593,28 @@ where
         let mut continue_round = false;
         match polled.outcome {
             BatchOutcome::Submitted | BatchOutcome::SubmittedProcess => {
+                // Keep leftover isolate_pending frames saved on ProcessOccupied.
+                let has_pending = worker.with_state(|s| !s.isolate_pending.is_empty());
+                continue_round = has_pending;
                 worker.with_state_mut(|state| {
                     if let Some(r) = polled.resume_on_continue {
                         state.isolate_resume = Some(r);
-                    } else {
+                    } else if !has_pending {
                         state.isolate_resume = None;
                         state.isolate_expanded.clear();
                     }
                 });
             }
             BatchOutcome::Rejected | BatchOutcome::CachedRejected => {
+                // P0: apply the sync drop_first + shrink pushes here — do not
+                // rely on the next round's `already` branch (rest-only under-explores).
+                let (frames, skipped) =
+                    Self::reject_isolate_frames(&polled.window, &polled.rest, polled.min);
+                report.skipped += skipped;
                 continue_round = true;
                 worker.with_state_mut(|state| {
                     state.isolate_expanded.insert(polled.window_fp);
+                    state.isolate_pending.extend(frames);
                 });
             }
             BatchOutcome::Continue => {
@@ -998,7 +1032,24 @@ where
     ) -> Option<Vec<u8>> {
         const MAX_CACHED_SPLITS: u32 = 256;
         let mut cached_splits = 0u32;
-        let mut stack = vec![items];
+        // Prefer async Rejected frames (drop_first + shrink) over re-walking the
+        // bucket via `already` (P0).
+        let mut stack = self
+            .workers
+            .get(&hash)
+            .map(|w| {
+                w.with_state_mut(|s| {
+                    if s.isolate_pending.is_empty() {
+                        Vec::new()
+                    } else {
+                        std::mem::take(&mut s.isolate_pending)
+                    }
+                })
+            })
+            .unwrap_or_default();
+        if stack.is_empty() {
+            stack.push(items);
+        }
         while let Some(items) = stack.pop() {
             let items: Vec<ScannedIntention> = items
                 .into_iter()
@@ -1028,11 +1079,9 @@ where
                 .map(|w| w.with_state(|s| s.isolate_expanded.contains(&fp)))
                 .unwrap_or(false);
             if already {
-                if !rest.is_empty() {
-                    stack.push(rest);
-                } else if window.len() > min as usize {
-                    stack.push(window[1..].to_vec());
-                }
+                // Already expanded once this sweep — do not re-push drop_first/
+                // shrink (diamond explosion). Async Rejected queues frames via
+                // isolate_pending at poll time instead of relying on this arm.
                 continue;
             }
             let cached = self.window_combo_cached(&hash, &window, process);
@@ -1062,6 +1111,8 @@ where
                     hash,
                     process,
                     window.clone(),
+                    rest.clone(),
+                    min,
                     resume_on_continue,
                     report,
                 );
@@ -1099,8 +1150,15 @@ where
                     return resume;
                 }
                 BatchOutcome::ProcessOccupied => {
-                    // Async RunBatch in flight for this window — resume here after
-                    // poll (do not skip to `rest` or we lose reject-isolate) (P1).
+                    // Preserve unprocessed frames for the next round after poll.
+                    if let Some(w) = self.workers.get(&hash) {
+                        if !stack.is_empty() {
+                            w.with_state_mut(|state| {
+                                state.isolate_pending.append(&mut stack);
+                            });
+                        }
+                    }
+                    // Resume at this window after poll (do not skip to `rest`).
                     return items.first().map(|i| out_point_key(&i.out_point));
                 }
                 BatchOutcome::Submitted | BatchOutcome::Continue => {
@@ -1112,19 +1170,9 @@ where
                     if let Some(w) = self.workers.get(&hash) {
                         w.with_state_mut(|state| state.isolate_expanded.insert(fp));
                     }
-                    let mut drop_first = window[1..].to_vec();
-                    drop_first.extend(rest);
-                    if window.len() > min as usize {
-                        if !drop_first.is_empty() {
-                            stack.push(drop_first);
-                        }
-                        stack.push(window[..window.len() - 1].to_vec());
-                    } else {
-                        report.skipped += 1;
-                        if !drop_first.is_empty() {
-                            stack.push(drop_first);
-                        }
-                    }
+                    let (frames, skipped) = Self::reject_isolate_frames(&window, &rest, min);
+                    report.skipped += skipped;
+                    stack.extend(frames);
                 }
             }
         }
@@ -1182,11 +1230,14 @@ where
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_process_batch(
         &self,
         hash: [u8; 32],
         process: &ResolvedProcess,
         batch: Vec<ScannedIntention>,
+        rest: Vec<ScannedIntention>,
+        min: u32,
         resume_on_continue: Option<Vec<u8>>,
         report: &mut TickReport,
     ) -> BatchOutcome {
@@ -1208,6 +1259,8 @@ where
             max_size,
             window_fp,
             resume_on_continue,
+            rest,
+            min,
         ) {
             Ok(()) => BatchOutcome::ProcessOccupied,
             Err(crate::workers::StartBatchError::AlreadyOutstanding) => {

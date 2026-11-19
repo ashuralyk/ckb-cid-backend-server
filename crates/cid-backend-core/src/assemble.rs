@@ -132,7 +132,9 @@ pub fn validate_assembled_tx(
     }
 
     // Every draft input (intentions + process state) must appear. Extra inputs
-    // (Process-added funding / counterparty cells) are allowed (P1-4).
+    // are allowed at the backend validator layer for Processes that emit them.
+    // The pinned `cid_process_example` guest rejects extra funding inputs with
+    // UnsupportedFundingLock (38); do not claim the example accepts funding.
     let mut expected: Vec<ckb_types::packed::OutPoint> =
         intentions.iter().map(|i| i.out_point.clone()).collect();
     expected.push(process.live_cell.out_point.clone());
@@ -404,17 +406,19 @@ mod tests {
     }
 
     #[test]
+    /// Backend validator permits Process-added extras; the example guest itself
+    /// rejects funding inputs (38) — this does not claim the example accepts them.
     fn validate_allows_process_added_extra_inputs() {
         let proc = process([0xAB; 32], 200_000_000_000);
         let intent = intention(1, proc.type_hash, 100_000_000_000);
-        let funding_op = OutPoint::new_builder()
+        let extra_op = OutPoint::new_builder()
             .tx_hash(Byte32::from_slice(&[0xFEu8; 32]).unwrap())
             .index(0u32.pack())
             .build();
         let inputs = vec![
             cell_input(&intent.out_point),
             cell_input(&proc.live_cell.out_point),
-            cell_input(&funding_op),
+            cell_input(&extra_op),
         ];
         let outputs = vec![
             beneficiary(intent.capacity),

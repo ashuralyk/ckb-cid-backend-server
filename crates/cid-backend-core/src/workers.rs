@@ -30,6 +30,10 @@ pub struct ProcessWorkerState {
     pub submit: SubmitState,
     pub isolate_resume: Option<Vec<u8>>,
     pub isolate_expanded: HashSet<Vec<u8>>,
+    /// Stack frames queued by async Rejected/CachedRejected (drop_first + shrink)
+    /// or leftover frames saved on ProcessOccupied. Consumed by the next
+    /// `isolate_window` instead of re-deriving via `already`.
+    pub isolate_pending: Vec<Vec<ScannedIntention>>,
     pub generation: u64,
 }
 
@@ -46,6 +50,7 @@ impl ProcessWorkerState {
             submit: SubmitState::default(),
             isolate_resume: None,
             isolate_expanded: HashSet::new(),
+            isolate_pending: Vec::new(),
             generation,
         }
     }
@@ -77,6 +82,10 @@ struct PendingBatch {
     window_fp: Vec<u8>,
     /// Resume key after Continue/Submitted (first of `rest`); Rejected keeps window.
     resume_on_continue: Option<Vec<u8>>,
+    /// Window + rest + min so Rejected can push the sync drop_first/shrink frames.
+    window: Vec<ScannedIntention>,
+    rest: Vec<ScannedIntention>,
+    min: u32,
 }
 
 /// Completed RunBatch poll result for the digest loop.
@@ -85,6 +94,9 @@ pub struct PolledBatch {
     pub delta: BatchReportDelta,
     pub window_fp: Vec<u8>,
     pub resume_on_continue: Option<Vec<u8>>,
+    pub window: Vec<ScannedIntention>,
+    pub rest: Vec<ScannedIntention>,
+    pub min: u32,
 }
 
 /// Handle to a Process worker thread.
@@ -147,6 +159,9 @@ impl ProcessWorker {
                     delta: result.1,
                     window_fp: pending.window_fp,
                     resume_on_continue: pending.resume_on_continue,
+                    window: pending.window,
+                    rest: pending.rest,
+                    min: pending.min,
                 })
             }
             Err(mpsc::TryRecvError::Empty) => None,
@@ -161,6 +176,9 @@ impl ProcessWorker {
                     },
                     window_fp: pending.window_fp,
                     resume_on_continue: pending.resume_on_continue,
+                    window: pending.window,
+                    rest: pending.rest,
+                    min: pending.min,
                 })
             }
         }
@@ -180,6 +198,8 @@ impl ProcessWorker {
         max_assembled_tx_bytes: usize,
         window_fp: Vec<u8>,
         resume_on_continue: Option<Vec<u8>>,
+        rest: Vec<ScannedIntention>,
+        min: u32,
     ) -> Result<(), StartBatchError> {
         if self
             .batch_outstanding
@@ -195,7 +215,7 @@ impl ProcessWorker {
             .send(ProcessWorkerJob::RunBatch {
                 job_epoch,
                 process,
-                batch,
+                batch: batch.clone(),
                 execution_code_key,
                 tick_cell_deps,
                 max_assembled_tx_bytes,
@@ -211,6 +231,9 @@ impl ProcessWorker {
             reply: reply_rx,
             window_fp,
             resume_on_continue,
+            window: batch,
+            rest,
+            min,
         });
         Ok(())
     }
@@ -445,6 +468,7 @@ where
                     if code_changed {
                         state.submit.rejected_combos.clear();
                         state.isolate_expanded.clear();
+                        state.isolate_pending.clear();
                     }
                 });
                 Ok(false)

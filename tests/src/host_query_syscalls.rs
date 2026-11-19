@@ -269,8 +269,9 @@ mod tests {
         assert_eq!(pag_mock.objects.len(), 1);
     }
 
-    /// MockHost / indexer order is `(block_number, tx_index, output_index)`;
-    /// FakeRpc + RpcHostQuery must emit the same order and `tx_index` metadata.
+    /// MockHost Prefix/Exact order is script raw bytes then
+    /// `(block_number, tx_index, output_index)` (same script ⇒ block/tx/out).
+    /// FakeRpc + RpcHostQuery must emit that order and `tx_index` metadata.
     #[test]
     fn fakerpc_get_cells_orders_by_block_tx_output_index_and_emits_tx_index() {
         let rpc = Arc::new(FakeRpc::new());

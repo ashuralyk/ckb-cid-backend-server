@@ -7,7 +7,7 @@ Isolated **dev** chain only. No testnet, mainnet, or public RPC.
 | Component | Pin |
 |-----------|-----|
 | CKB node | `v0.119.0` (matches workspace `ckb-types` 0.119) |
-| Dispatcher / Process example / CID lock | `0e1272b11c6be2e3e08a3fb5f614a5f2751f180a` |
+| Dispatcher / Process example / CID lock | `5ea581fad5922ad0e4104d99757be143ee6706f8` |
 
 ## What is HTTP-mock vs real chain
 

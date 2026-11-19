@@ -4,7 +4,7 @@ RISC-V Process guest used by the real SSRI (`EmbeddedSsri` / ckb-vm) test in
 `cid-backend-core`. Built from [`ckb-common-intention-dispatcher`](https://github.com/ashuralyk/ckb-common-intention-dispatcher)
 at the same git pin as the workspace crates:
 
-`0e1272b11c6be2e3e08a3fb5f614a5f2751f180a`
+`5ea581fad5922ad0e4104d99757be143ee6706f8`
 
 The ELF is **not** committed (reproducible from that pin). Expected SSRI
 behavior: `Process.batch` → `(1, 4)`; `Process.assemble` with `n=0` →
@@ -41,7 +41,7 @@ Or copy a binary you already built:
 ```bash
 git clone https://github.com/ashuralyk/ckb-common-intention-dispatcher
 cd ckb-common-intention-dispatcher
-git checkout 0e1272b11c6be2e3e08a3fb5f614a5f2751f180a
+git checkout 5ea581fad5922ad0e4104d99757be143ee6706f8
 rustup target add riscv64imac-unknown-none-elf
 make prepare
 make CONTRACT=cid_process_example build CLANG=clang-18
