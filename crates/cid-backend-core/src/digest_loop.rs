@@ -699,12 +699,15 @@ where
                 }
             }
             BatchOutcome::Continue => {
-                // Unbuildable / soft skip: advance past window and keep isolating.
-                // Conflict / submit failure set last_error or conflicts — next tick.
-                if polled.delta.conflicts == 0
+                if polled.refund_only {
+                    // Cached / permanent refund_only soft-skip must not re-enter
+                    // isolate rounds (would burn up to 64 RunBatch/tick).
+                } else if polled.delta.conflicts == 0
                     && polled.delta.last_error.is_none()
                     && polled.delta.skipped > 0
                 {
+                    // Unbuildable / soft skip: advance past window and keep isolating.
+                    // Conflict / submit failure set last_error or conflicts — next tick.
                     continue_round = true;
                     worker.with_state_mut(|state| {
                         if let Some(r) = polled.resume_on_continue {
@@ -1166,10 +1169,25 @@ where
             } else {
                 (items, false)
             };
-            report.isolate_windows += 1;
             let n = items.len().min(max as usize);
             let window = items[..n].to_vec();
             let rest = items[n..].to_vec();
+            // refund_only rejects cache with process=None; probe that fingerprint
+            // before dispatch so we soft-skip without RunBatch / isolate_windows.
+            if refund_only && self.refund_combo_cached(&hash, &window, process) {
+                tracing::debug!(
+                    target: LOG_TARGET,
+                    event = "submit.rejected_combo",
+                    path = "refund_only",
+                    n = window.len(),
+                );
+                report.skipped += window.len();
+                if !rest.is_empty() {
+                    stack.push(rest);
+                }
+                continue;
+            }
+            report.isolate_windows += 1;
             let fp = self.window_fingerprint(&window, process);
             let already = !refund_only
                 && self
@@ -1183,22 +1201,13 @@ where
                 // isolate_pending at poll time instead of relying on this arm.
                 continue;
             }
-            let cached = self.window_combo_cached(&hash, &window, process);
+            let cached = !refund_only && self.window_combo_cached(&hash, &window, process);
             let outcome = if cached {
                 tracing::debug!(
                     target: LOG_TARGET,
                     event = "submit.rejected_combo",
                     n = window.len(),
                 );
-                if refund_only {
-                    // Combo already permanently rejected — soft skip, no isolate
-                    // and no attempt budget burn (P3).
-                    report.skipped += window.len();
-                    if !rest.is_empty() {
-                        stack.push(rest);
-                    }
-                    continue;
-                }
                 BatchOutcome::CachedRejected
             } else {
                 if *attempts >= max_attempts {
@@ -1338,6 +1347,19 @@ where
             }
             _ => bucket,
         }
+    }
+
+    fn refund_combo_cached(
+        &self,
+        hash: &[u8; 32],
+        batch: &[ScannedIntention],
+        process: &ResolvedProcess,
+    ) -> bool {
+        self.workers.get(hash).is_some_and(|w| {
+            w.with_state(|state| {
+                process_batch::refund_combo_cached(state, batch, &self.batch_code_key(process))
+            })
+        })
     }
 
     fn window_combo_cached(
