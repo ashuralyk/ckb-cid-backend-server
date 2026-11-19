@@ -190,6 +190,67 @@ mod tests {
         assert!(seen.iter().all(|b| b != &state_elf));
     }
 
+    /// Type-ID execution_code_key rotation must clear isolate_pending and
+    /// isolate_resume (same as rejected_combos / isolate_expanded).
+    #[test]
+    fn type_id_execution_code_key_rotation_clears_isolate_pending_and_resume() {
+        let cid_args = [0xa9; 32];
+        let code_args = worker_code_args();
+        let rpc = FakeRpc::new();
+        let hash = process_type_hash(40);
+        rpc.insert_cell(process_cell_for_code(40, 200_0000_0000, vec![], code_args));
+        rpc.insert_cell(code_cell(0x11, code_args, FIXTURE_ELF.to_vec()));
+        let cid_v1 = code_cell(0x10, cid_args, vec![0x7f, b'E', b'L', b'F']);
+        rpc.insert_cell(cid_v1.clone());
+
+        let mut loop_ = loop_with_resolver_and_code(
+            rpc,
+            ScriptedSsri::mimic((1, 4)),
+            cfg(
+                vec![TypeIdCodeDep {
+                    label: "cid_lock".into(),
+                    identity: TypeIdIdentity::new(cid_args),
+                }],
+                vec![],
+            ),
+            40,
+            code_args,
+        );
+        let _ = loop_.tick();
+
+        loop_.workers().get(&hash).unwrap().with_state_mut(|s| {
+            s.submit.rejected_combos.insert(vec![0xAA]);
+            s.isolate_expanded.insert(vec![0xBB]);
+            s.isolate_pending.push(Vec::new());
+            s.isolate_resume = Some(vec![0xCC]);
+        });
+
+        loop_.rpc().consume(&cid_v1.out_point);
+        loop_
+            .rpc()
+            .insert_cell(code_cell(0x20, cid_args, vec![0x7f, b'E', b'L', b'F']));
+        let _ = loop_.tick();
+
+        loop_.workers().get(&hash).unwrap().with_state(|s| {
+            assert!(
+                s.submit.rejected_combos.is_empty(),
+                "rejected_combos must clear on Type-ID code rotation"
+            );
+            assert!(
+                s.isolate_expanded.is_empty(),
+                "isolate_expanded must clear on Type-ID code rotation"
+            );
+            assert!(
+                s.isolate_pending.is_empty(),
+                "isolate_pending must clear on Type-ID code rotation"
+            );
+            assert!(
+                s.isolate_resume.is_none(),
+                "isolate_resume must clear on Type-ID code rotation"
+            );
+        });
+    }
+
     #[test]
     fn process_code_upgrade_refreshes_ssri_binary() {
         let code_args = [0xb3; 32];

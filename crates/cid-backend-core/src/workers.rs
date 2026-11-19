@@ -469,6 +469,7 @@ where
                         state.submit.rejected_combos.clear();
                         state.isolate_expanded.clear();
                         state.isolate_pending.clear();
+                        state.isolate_resume = None;
                     }
                 });
                 Ok(false)
@@ -643,11 +644,15 @@ mod tests {
         pool.get(&hash).unwrap().with_state_mut(|w| {
             w.submit.rejected_combos.insert(vec![0x01]);
             w.isolate_expanded.insert(vec![0x02]);
+            w.isolate_pending.push(Vec::new());
+            w.isolate_resume = Some(vec![0x03]);
         });
         assert!(!pool.register(entry([0x10; 32], [0x21; 32])).unwrap());
         pool.get(&hash).unwrap().with_state(|w| {
             assert!(w.submit.rejected_combos.is_empty());
             assert!(w.isolate_expanded.is_empty());
+            assert!(w.isolate_pending.is_empty());
+            assert!(w.isolate_resume.is_none());
         });
     }
 
