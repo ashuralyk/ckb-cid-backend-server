@@ -54,4 +54,17 @@ impl WorkerPool {
     pub fn get_mut(&mut self, process_type_hash: &[u8; 32]) -> Option<&mut ProcessWorker> {
         self.workers.get_mut(process_type_hash)
     }
+
+    pub fn get(&self, process_type_hash: &[u8; 32]) -> Option<&ProcessWorker> {
+        self.workers.get(process_type_hash)
+    }
+
+    pub fn for_each_mut<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&mut ProcessWorker),
+    {
+        for w in self.workers.values_mut() {
+            f(w);
+        }
+    }
 }
