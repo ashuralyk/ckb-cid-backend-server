@@ -442,6 +442,8 @@ where
                     w.with_state_mut(|state| {
                         state.submit.rejected_combos.clear();
                         state.isolate_expanded.clear();
+                        state.isolate_pending.clear();
+                        state.isolate_resume = None;
                     });
                 });
             }
