@@ -101,6 +101,15 @@ pub fn validate_assembled_tx(
         });
     }
 
+    // Process.assemble emits one witness per input; backend fills nothing.
+    if assembled.witnesses.len() != assembled.inputs.len() {
+        return Err(AssembleError::InvalidAssembled(format!(
+            "witness count {} != input count {} (backend must not fill witnesses)",
+            assembled.witnesses.len(),
+            assembled.inputs.len()
+        )));
+    }
+
     let inputs = input_out_points(assembled);
     for intent in intentions {
         if !inputs

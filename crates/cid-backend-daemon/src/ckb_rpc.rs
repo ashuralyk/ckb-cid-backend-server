@@ -8,11 +8,12 @@
 
 use crate::config::{ConfigError, DaemonConfig};
 use cid_backend_core::host_query::{
-    HostQueryRpc, DEFAULT_HOST_QUERY_PAGE_LIMIT, DEFAULT_HOST_QUERY_TIMEOUT_SECS,
+    search_key_molecule_to_json, HostQueryRpc, DEFAULT_HOST_QUERY_PAGE_LIMIT,
+    DEFAULT_HOST_QUERY_TIMEOUT_SECS,
 };
 use cid_backend_core::rpc::{script_hash32, LiveCell, Rpc, RpcError, TxStatus};
 use ckb_types::core::{DepType, ScriptHashType, TransactionView};
-use ckb_types::packed::{Byte32, CellInput, CellOutput, OutPoint, Script};
+use ckb_types::packed::{Byte32, CellInput, CellOutput, Header, OutPoint, RawHeader, Script};
 use ckb_types::prelude::*;
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -416,9 +417,7 @@ impl HostQueryRpc for CkbRpc {
         if result.is_null() {
             return Ok(None);
         }
-        serde_json::to_vec(&result)
-            .map(Some)
-            .map_err(|e| RpcError::Unavailable(format!("get_header_by_number encode: {e}")))
+        Ok(Some(json_header_to_molecule(&result)?))
     }
 
     fn get_header(&self, hash: &[u8; 32]) -> Result<Option<Vec<u8>>, RpcError> {
@@ -426,9 +425,7 @@ impl HostQueryRpc for CkbRpc {
         if result.is_null() {
             return Ok(None);
         }
-        serde_json::to_vec(&result)
-            .map(Some)
-            .map_err(|e| RpcError::Unavailable(format!("get_header encode: {e}")))
+        Ok(Some(json_header_to_molecule(&result)?))
     }
 
     fn get_cells_page(
@@ -438,7 +435,7 @@ impl HostQueryRpc for CkbRpc {
         after: &[u8],
     ) -> Result<(Vec<LiveCell>, Vec<u8>), RpcError> {
         let _ = DEFAULT_HOST_QUERY_TIMEOUT_SECS;
-        let search_key = search_key_json_from_molecule(search_key_molecule)?;
+        let search_key = search_key_molecule_to_json(search_key_molecule)?;
         let page_limit = u64::from(limit.clamp(1, DEFAULT_HOST_QUERY_PAGE_LIMIT));
         let after_val = json_after_cursor(after);
         let result = self.rpc_call(
@@ -458,17 +455,93 @@ impl HostQueryRpc for CkbRpc {
             .get("last_cursor")
             .and_then(|c| c.as_str())
             .unwrap_or("");
+        // Indexer cursors are hex strings; store raw hex bytes so pagination
+        // round-trips through `json_after_cursor`.
         Ok((cells, next.as_bytes().to_vec()))
     }
 }
 
-fn search_key_json_from_molecule(bytes: &[u8]) -> Result<Value, RpcError> {
-    serde_json::from_slice(bytes).map_err(|_| {
-        RpcError::Unavailable(
-            "get_cells_page: search_key must be JSON bytes (molecule decode pending catalog)"
-                .into(),
+/// Pack a CKB JSON-RPC header view into molecule `Header` bytes for HostQuery.
+fn json_header_to_molecule(v: &Value) -> Result<Vec<u8>, RpcError> {
+    // Accept either a HeaderView (`{header: {...}, hash}`) or a flat header object.
+    let h = v.get("header").unwrap_or(v);
+    let version = parse_u32_field(h, "version")?;
+    let compact_target = parse_u32_field(h, "compact_target")?;
+    let timestamp = parse_uint(
+        h.get("timestamp")
+            .ok_or_else(|| RpcError::Unavailable("header: missing timestamp".into()))?,
+    )?;
+    let number = parse_uint(
+        h.get("number")
+            .ok_or_else(|| RpcError::Unavailable("header: missing number".into()))?,
+    )?;
+    let epoch = parse_uint(
+        h.get("epoch")
+            .ok_or_else(|| RpcError::Unavailable("header: missing epoch".into()))?,
+    )?;
+    let parent_hash = parse_byte32_field(h, "parent_hash")?;
+    let transactions_root = parse_byte32_field(h, "transactions_root")?;
+    let proposals_hash = parse_byte32_field(h, "proposals_hash")?;
+    let extra_hash = parse_byte32_field(h, "extra_hash").or_else(|_| {
+        // Pre-ckb2021 nodes may still expose `uncles_hash`.
+        parse_byte32_field(h, "uncles_hash")
+    })?;
+    let dao = parse_byte32_field(h, "dao")?;
+    let nonce = parse_u128_field(h, "nonce")?;
+    let header = Header::new_builder()
+        .raw(
+            RawHeader::new_builder()
+                .version(version.pack())
+                .compact_target(compact_target.pack())
+                .timestamp(timestamp.pack())
+                .number(number.pack())
+                .epoch(epoch.pack())
+                .parent_hash(parent_hash)
+                .transactions_root(transactions_root)
+                .proposals_hash(proposals_hash)
+                .extra_hash(extra_hash)
+                .dao(dao)
+                .build(),
         )
-    })
+        .nonce(nonce.pack())
+        .build();
+    Ok(header.as_slice().to_vec())
+}
+
+fn parse_u32_field(h: &Value, field: &str) -> Result<u32, RpcError> {
+    let v = h
+        .get(field)
+        .ok_or_else(|| RpcError::Unavailable(format!("header: missing {field}")))?;
+    let n = parse_uint(v)?;
+    u32::try_from(n).map_err(|_| RpcError::Unavailable(format!("header: {field} out of u32")))
+}
+
+fn parse_byte32_field(h: &Value, field: &str) -> Result<Byte32, RpcError> {
+    let hex = h
+        .get(field)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| RpcError::Unavailable(format!("header: missing {field}")))?;
+    let bytes = decode_hex(hex)?;
+    Byte32::from_slice(&bytes)
+        .map_err(|_| RpcError::Unavailable(format!("header: {field} not 32 bytes")))
+}
+
+fn parse_u128_field(h: &Value, field: &str) -> Result<u128, RpcError> {
+    let v = h
+        .get(field)
+        .ok_or_else(|| RpcError::Unavailable(format!("header: missing {field}")))?;
+    match v {
+        Value::String(s) => {
+            let s = s.strip_prefix("0x").unwrap_or(s.as_str());
+            u128::from_str_radix(s, 16)
+                .map_err(|_| RpcError::Unavailable(format!("header: bad {field}")))
+        }
+        Value::Number(n) => n
+            .as_u64()
+            .map(u128::from)
+            .ok_or_else(|| RpcError::Unavailable(format!("header: bad {field}"))),
+        _ => Err(RpcError::Unavailable(format!("header: bad {field}"))),
+    }
 }
 
 fn json_after_cursor(after: &[u8]) -> Value {
@@ -2287,19 +2360,24 @@ mod tests {
             .unwrap()
             .expect("hash");
         assert_eq!(hash, [0xcd; 32]);
-        let key = json!({
-            "script": json_script(&CID_CODE, ScriptHashType::Type, &[]),
-            "script_type": "lock",
-            "script_search_mode": "prefix",
-            "with_data": true,
-        });
-        let (page, cursor) = HostQueryRpc::get_cells_page(
-            &rpc,
-            &serde_json::to_vec(&key).unwrap(),
-            DEFAULT_HOST_QUERY_PAGE_LIMIT,
-            &[],
-        )
-        .unwrap();
+        use cid_process_executor::host_query::{Script as HqScript, ScriptType, SearchMode};
+        use cid_process_executor::SearchKey;
+        let key = SearchKey {
+            script: HqScript {
+                code_hash: CID_CODE,
+                hash_type: 1,
+                args: vec![],
+            },
+            script_type: ScriptType::Lock,
+            script_search_mode: Some(SearchMode::Prefix),
+            filter: None,
+            with_data: Some(true),
+            group_by_transaction: None,
+        };
+        let key_bytes = serde_molecule::to_vec(&key, false).unwrap();
+        let (page, cursor) =
+            HostQueryRpc::get_cells_page(&rpc, &key_bytes, DEFAULT_HOST_QUERY_PAGE_LIMIT, &[])
+                .unwrap();
         assert_eq!(page.len(), 1);
         assert_eq!(cursor, b"0x");
     }
