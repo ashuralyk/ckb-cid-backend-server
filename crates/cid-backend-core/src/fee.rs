@@ -10,7 +10,8 @@
 //! Two modes, selected per Intention by an **explicit allowlist** of audited
 //! CID lock identities ([`CidLockIdentity`]), **defaulting to legacy
 //! exact-refund** when the allowlist is empty or the Intention's lock is
-//! absent:
+//! absent. The allowlist selects fee mode only for already-scanned identities
+//! (primary / `extra_scan_locks`); it never expands the indexer scan set:
 //!
 //! - [`RefundFeeMode::Exact`] (default): User Lock capacity copied exactly;
 //!   paid fee is always 0. Required for currently deployed CID locks that

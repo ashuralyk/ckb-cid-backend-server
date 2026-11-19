@@ -48,7 +48,9 @@ type_id = "<CID_LOCK_TYPE_ID_FULL_HASH_32>"   # optional verify; must match deri
 # type_id_args; code_hash ≠ derived type_id when both set).
 # Bounded Incompatible refund fee allowlist (≤ 0.01 CKB / Intention).
 # Empty (default) = exact refund for all locks. List ONLY audited deployed
-# identities that enforce contract PR #12 (F>=S). Never undeployed candidates.
+# identities that enforce contract PR #12 (F>=S) and that are already scanned
+# (primary or legacy_scan_locks). Allowlist never expands the scan set —
+# config load rejects entries that are not scanned identities.
 # See docs/refund-fee-migration.md.
 # [[cid_lock.bounded_refund_locks]]
 # code_hash = "<AUDITED_DEPLOYED_CID_LOCK_TYPE_ID_OR_HASH_32>"

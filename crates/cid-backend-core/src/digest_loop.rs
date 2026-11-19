@@ -46,28 +46,30 @@ pub struct LoopConfig {
     /// allowlisted locks. Default [`crate::fee::DEFAULT_FEE_RATE`].
     pub fee_rate: u64,
     /// Audited CID lock identities that may use bounded refund fee mode.
-    /// Empty (default) ⇒ legacy exact refunds for every Intention. May list
-    /// multiple verified deployed identities after migration; the digest
-    /// loop never co-bundles distinct identities in one refund tx. Never
-    /// put an undeployed candidate hash here.
+    /// Empty (default) ⇒ legacy exact refunds for every Intention. Selects
+    /// fee mode only for identities that are already scanned (primary or
+    /// [`Self::extra_scan_locks`]); never expands the scan set. Daemon
+    /// config fail-closes if an allowlist entry is not a scanned identity.
+    /// The digest loop never co-bundles distinct identities in one refund
+    /// tx. Never put an undeployed candidate hash here.
     pub bounded_refund_locks: Vec<CidLockIdentity>,
     /// Extra CID lock identities to scan in addition to
-    /// [`Self::cid_code_hash`] / [`Self::hash_type`] (e.g. legacy locks still
-    /// draining after a redeploy). Deduped with the primary and allowlist.
+    /// [`Self::cid_code_hash`] / [`Self::hash_type`] (e.g. legacy data-hash
+    /// locks still draining after a Type-ID redeploy). Deduped with the
+    /// primary. This — not [`Self::bounded_refund_locks`] — is how old
+    /// Intentions stay discoverable.
     pub extra_scan_locks: Vec<CidLockIdentity>,
 }
 
 impl LoopConfig {
-    /// Unique scan targets: primary + allowlist + extras.
+    /// Unique scan targets: primary + [`Self::extra_scan_locks`] only.
+    /// [`Self::bounded_refund_locks`] is a fee-mode allowlist and must not
+    /// add scan identities.
     pub fn scan_lock_identities(&self) -> Vec<CidLockIdentity> {
         let mut out = Vec::new();
         let primary = CidLockIdentity::new(self.cid_code_hash, self.hash_type);
         out.push(primary);
-        for id in self
-            .bounded_refund_locks
-            .iter()
-            .chain(self.extra_scan_locks.iter())
-        {
+        for id in &self.extra_scan_locks {
             if !out.iter().any(|x| x == id) {
                 out.push(*id);
             }
