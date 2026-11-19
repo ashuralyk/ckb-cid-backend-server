@@ -1,15 +1,15 @@
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
-    use cid_backend_core::digest_loop::{DigestLoop, LoopConfig, NopClock};
-    use cid_backend_core::process::ProcessResolver;
+    use cid_backend_core::digest_loop::LoopConfig;
     use cid_backend_core::rpc::script_hash32;
     use ckb_types::core::ScriptHashType;
     use ckb_types::prelude::*;
+    use std::time::Duration;
 
     use crate::fake_rpc::FakeRpc;
-    use crate::helpers::{intention_cell, process_cell, process_type_script, user_lock, CID_CODE, loop_with_resolver};
+    use crate::helpers::{
+        intention_cell, loop_with_resolver, process_cell, process_type_script, user_lock, CID_CODE,
+    };
     use crate::scripted_ssri::ScriptedSsri;
 
     #[test]

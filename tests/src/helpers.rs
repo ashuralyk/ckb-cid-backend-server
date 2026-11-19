@@ -4,9 +4,7 @@ use cid_backend_core::digest_loop::{DigestLoop, LoopConfig, NopClock};
 use cid_backend_core::process::{ProcessEntry, ProcessResolver};
 use cid_backend_core::rpc::{LiveCell, Rpc};
 use cid_backend_core::ssri::SsriHost;
-use cid_backend_core::type_id::{
-    type_id_script, type_id_script_hash, TypeIdIdentity, TYPE_ID_CODE_HASH,
-};
+use cid_backend_core::type_id::{type_id_script, type_id_script_hash, TypeIdIdentity};
 use cid_protocol::{CidArgs, Payload, Script as CidScript};
 use ckb_types::core::ScriptHashType;
 use ckb_types::packed::{Byte32, CellOutput, OutPoint, Script};
@@ -109,10 +107,16 @@ pub fn digest_loop_empty<R: Rpc, S: SsriHost>(
     DigestLoop::new(rpc, NopClock, ssri, config)
 }
 
-pub fn register_fixture(loop_: &mut DigestLoop<impl Rpc, impl cid_backend_core::digest_loop::Clock, impl SsriHost>, unique: u8) {
+pub fn register_fixture(
+    loop_: &mut DigestLoop<impl Rpc, impl cid_backend_core::digest_loop::Clock, impl SsriHost>,
+    unique: u8,
+) {
     let entry = fixture_process_entry(unique);
     loop_.register_process(entry);
-    if let Some(w) = loop_.workers_mut().get_mut(&fixture_process_entry(unique).identity_type_hash) {
+    if let Some(w) = loop_
+        .workers_mut()
+        .get_mut(&fixture_process_entry(unique).identity_type_hash)
+    {
         w.resolver = ProcessResolver::for_entry(fixture_process_entry(unique))
             .with_fallback_binary(FIXTURE_ELF.to_vec());
     }

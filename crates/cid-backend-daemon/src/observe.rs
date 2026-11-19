@@ -396,10 +396,9 @@ fn close_stream(stream: TcpStream) {
 mod tests {
     use super::*;
     use cid_backend_core::digest_loop::{DigestLoop, LoopConfig, NopClock};
-    use cid_backend_core::process::ProcessResolver;
     use cid_backend_core::rpc::{LiveCell, Rpc, RpcError, TxStatus};
     use cid_backend_core::ssri::{SsriError, SsriHost};
-    use cid_process_executor::{IntentionInput, PartialTx};
+    use cid_process_executor::{AssembledTx, MockHost};
     use ckb_types::core::{ScriptHashType, TransactionView};
     use ckb_types::packed::Byte32;
     use std::io::{Read, Write};
@@ -706,7 +705,7 @@ mod tests {
         fn get_batch_bounds(&self, _: &[u8]) -> Result<(u32, u32), SsriError> {
             Ok((1, 1))
         }
-        fn assemble(&self, _: &[u8], _: &[IntentionInput]) -> Result<PartialTx, SsriError> {
+        fn assemble(&self, _: &[u8], _: &[u8], _: MockHost) -> Result<AssembledTx, SsriError> {
             Err(SsriError::Unusable("noop".into()))
         }
     }
@@ -719,24 +718,24 @@ mod tests {
             extra_cell_deps: vec![],
             type_id_code_deps: vec![],
             confirmation_depth: 1,
-            fee_rate: 1000,
-            bounded_refund_locks: vec![],
-            extra_scan_locks: vec![],
+            max_assembled_tx_bytes: 512 * 1024,
         }
     }
 
     #[test]
     fn mock_tick_increments_metrics_and_sets_ready() {
-        let mut loop_ = DigestLoop::new(
-            EmptyRpc,
-            NopClock,
-            NoopSsri,
-            loop_cfg(),
-            ProcessResolver::new(),
-        );
+        let mut loop_ = DigestLoop::new(EmptyRpc, NopClock, NoopSsri, loop_cfg());
         let stats = DaemonStats::new();
         let report = loop_.tick();
-        stats.observe(&report, loop_.state().submit.pending.len());
+        stats.observe(
+            &report,
+            loop_
+                .state()
+                .submit
+                .as_ref()
+                .map(|s| s.pending.len())
+                .unwrap_or(0),
+        );
         let snap = stats.snapshot();
         assert_eq!(snap.ticks, 1);
         assert!(report.scan_ok);
@@ -747,13 +746,7 @@ mod tests {
 
     #[test]
     fn unavailable_mock_tick_is_not_ready() {
-        let mut loop_ = DigestLoop::new(
-            DownRpc,
-            NopClock,
-            NoopSsri,
-            loop_cfg(),
-            ProcessResolver::new(),
-        );
+        let mut loop_ = DigestLoop::new(DownRpc, NopClock, NoopSsri, loop_cfg());
         let stats = DaemonStats::new();
         let report = loop_.tick();
         stats.observe(&report, 0);

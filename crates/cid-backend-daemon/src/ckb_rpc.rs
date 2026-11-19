@@ -289,7 +289,10 @@ impl Rpc for CkbRpc {
         process_type_hash: &[u8; 32],
     ) -> Result<Option<LiveCell>, RpcError> {
         let mut candidates = Vec::new();
-        let mut prefixes: Vec<[u8; 32]> = vec![*process_type_hash];
+        // Prefer TYPE_ID code-hash prefix (Process-as-lock state cells), then any
+        // configured process type code hashes / hash-as-code-hash legacy probes.
+        let mut prefixes: Vec<[u8; 32]> = vec![cid_backend_core::TYPE_ID_CODE_HASH];
+        prefixes.push(*process_type_hash);
         prefixes.extend_from_slice(&self.process_type_code_hashes);
         for code_hash in prefixes {
             for ht in HASH_TYPES {
@@ -693,11 +696,10 @@ fn parse_uint(v: &Value) -> Result<u64, RpcError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cid_backend_core::digest_loop::{DigestLoop, LoopConfig, NopClock};
-    use cid_backend_core::process::ProcessResolver;
+    use cid_backend_core::digest_loop::{Clock, DigestLoop, LoopConfig, NopClock};
     use cid_backend_core::rpc::out_point_key;
     use cid_backend_core::ssri::{SsriError, SsriHost};
-    use cid_process_executor::{IntentionInput, PartialTx};
+    use cid_process_executor::{AssembledTx, MockHost};
     use cid_protocol::{CidArgs, Payload, Script as CidScript};
     use serde_json::json;
     use std::io::{Read, Write};
@@ -825,7 +827,7 @@ mod tests {
 
     fn process_type_script(unique: u8) -> Script {
         Script::new_builder()
-            .code_hash(PROC_CODE.pack())
+            .code_hash(cid_backend_core::TYPE_ID_CODE_HASH.pack())
             .hash_type(ScriptHashType::Type.into())
             .args([unique; 32].to_vec().pack())
             .build()
@@ -845,17 +847,84 @@ mod tests {
             .unwrap()
     }
 
+    const PROC_CODE_ARGS: [u8; 32] = [0xCDu8; 32];
+
+    fn register_fixture_process<R: Rpc, C: Clock, S: SsriHost>(
+        loop_: &mut DigestLoop<R, C, S>,
+        unique: u8,
+    ) {
+        let identity = cid_backend_core::TypeIdIdentity::new([unique; 32]);
+        let code = cid_backend_core::TypeIdIdentity::new(PROC_CODE_ARGS);
+        let entry = cid_backend_core::ProcessEntry {
+            identity_type_hash: identity.type_script_hash(),
+            identity: identity.clone(),
+            code,
+            ssri_elf_path: None,
+        };
+        let hash = entry.identity_type_hash;
+        loop_.register_process(entry.clone());
+        if let Some(w) = loop_.workers_mut().get_mut(&hash) {
+            w.resolver = cid_backend_core::ProcessResolver::for_entry(entry)
+                .with_fallback_binary(vec![0x7f, b'E', b'L', b'F', 1]);
+        }
+    }
+
     struct StubSsri;
     impl SsriHost for StubSsri {
         fn get_batch_bounds(&self, _: &[u8]) -> Result<(u32, u32), SsriError> {
             Ok((1, 1))
         }
-        fn assemble(&self, _: &[u8], _: &[IntentionInput]) -> Result<PartialTx, SsriError> {
-            let bytes = ckb_types::packed::Transaction::new_builder()
+        fn assemble(
+            &self,
+            _: &[u8],
+            draft_tx: &[u8],
+            host: MockHost,
+        ) -> Result<AssembledTx, SsriError> {
+            use ckb_types::packed::{CellInput, CellOutput, RawTransaction, Transaction};
+            use ckb_types::prelude::*;
+            let draft = Transaction::from_slice(draft_tx)
+                .map_err(|e| SsriError::Unusable(format!("draft: {e:?}")))?;
+            let mut inputs = Vec::new();
+            let mut outputs = Vec::new();
+            let mut outputs_data = Vec::new();
+            let mut process_out: Option<(CellOutput, Vec<u8>)> = None;
+            for input in draft.raw().inputs().into_iter() {
+                let op = input.previous_output();
+                let cell = host
+                    .get_cell(op.as_slice())
+                    .ok_or_else(|| SsriError::Unusable("missing host cell".into()))?;
+                inputs.push(CellInput::new_builder().previous_output(op).build());
+                if cell.output.type_().to_opt().is_some()
+                    && cid_protocol::CidArgs::decode(&cell.output.lock().args().raw_data()).is_err()
+                {
+                    process_out = Some((cell.output.clone(), cell.data.clone()));
+                } else {
+                    outputs.push(cell.output.clone());
+                    outputs_data.push(cell.data.clone());
+                }
+            }
+            let (proc_out, proc_data) =
+                process_out.ok_or_else(|| SsriError::Unusable("no process".into()))?;
+            // Process recreate first (TYPE_ID continuity), then beneficiaries.
+            let mut final_outputs = vec![proc_out];
+            let mut final_data = vec![proc_data];
+            final_outputs.extend(outputs);
+            final_data.extend(outputs_data);
+            let witnesses: Vec<ckb_types::packed::Bytes> =
+                (0..inputs.len()).map(|_| Default::default()).collect();
+            let bytes = Transaction::new_builder()
+                .raw(
+                    RawTransaction::new_builder()
+                        .inputs(inputs.pack())
+                        .outputs(final_outputs.pack())
+                        .outputs_data(final_data.iter().map(|d| d.as_slice().pack()).pack())
+                        .build(),
+                )
+                .witnesses(witnesses.pack())
                 .build()
                 .as_slice()
                 .to_vec();
-            Ok(PartialTx::from_bytes(&bytes).expect("empty partial"))
+            AssembledTx::from_bytes(&bytes).map_err(|e| SsriError::Unusable(e.to_string()))
         }
     }
 
@@ -1322,9 +1391,7 @@ mod tests {
             extra_cell_deps: vec![],
             type_id_code_deps: vec![],
             confirmation_depth: depth,
-            fee_rate: 1000,
-            bounded_refund_locks: vec![],
-            extra_scan_locks: vec![],
+            max_assembled_tx_bytes: 512 * 1024,
         }
     }
 
@@ -1334,10 +1401,11 @@ mod tests {
         let type_json = script_json(&ts);
         let args = cid_args(hash);
         let intent = indexer_cell(1, 0, lock_json(CID_CODE, &args), None, 100_0000_0000, &[]);
+        let code_hash = cid_backend_core::type_id_script_hash(&PROC_CODE_ARGS);
         let proc = indexer_cell(
             0x50,
             0,
-            lock_json([0; 32], &[]),
+            lock_json(code_hash, &[]),
             Some(type_json),
             200_0000_0000,
             &[0x7f, b'E', b'L', b'F', 1],
@@ -1376,8 +1444,8 @@ mod tests {
             NopClock,
             StubSsri,
             digest_loop_cfg(1),
-            ProcessResolver::new(),
         );
+        register_fixture_process(&mut loop_, 1);
         let first = loop_.tick();
         assert_eq!(first.submitted, 0, "pool full must not count as submit");
         assert_eq!(sends.load(Ordering::SeqCst), 1);
@@ -1389,8 +1457,9 @@ mod tests {
             !loop_
                 .state()
                 .submit
-                .rejected
-                .contains(&out_point_key(&intent_op)),
+                .as_ref()
+                .map(|s| s.rejected.contains(&out_point_key(&intent_op)))
+                .unwrap_or(false),
             "PoolIsFull must not blacklist the Intention"
         );
         let second = loop_.tick();
@@ -1399,8 +1468,9 @@ mod tests {
         assert!(!loop_
             .state()
             .submit
-            .rejected
-            .contains(&out_point_key(&intent_op)));
+            .as_ref()
+            .map(|s| s.rejected.contains(&out_point_key(&intent_op)))
+            .unwrap_or(false));
     }
 
     #[test]
@@ -1442,15 +1512,28 @@ mod tests {
             NopClock,
             StubSsri,
             digest_loop_cfg(24),
-            ProcessResolver::new(),
         );
+        register_fixture_process(&mut loop_, 1);
         assert_eq!(loop_.tick().submitted, 1);
-        assert_eq!(loop_.state().submit.pending.len(), 1);
+        assert_eq!(
+            loop_
+                .state()
+                .submit
+                .as_ref()
+                .map(|s| s.pending.len())
+                .unwrap_or(0),
+            1
+        );
 
         let after_null = loop_.tick();
         assert_eq!(after_null.submitted, 0);
         assert_eq!(
-            loop_.state().submit.pending.len(),
+            loop_
+                .state()
+                .submit
+                .as_ref()
+                .map(|s| s.pending.len())
+                .unwrap_or(0),
             1,
             "get_header null must not settle (would be Committed(0) vs tip=100)"
         );
@@ -1459,7 +1542,12 @@ mod tests {
         let after_height = loop_.tick();
         assert_eq!(after_height.submitted, 0);
         assert_eq!(
-            loop_.state().submit.pending.len(),
+            loop_
+                .state()
+                .submit
+                .as_ref()
+                .map(|s| s.pending.len())
+                .unwrap_or(0),
             1,
             "commit height 90 / tip 100 / depth 24 still confirming"
         );
@@ -1468,7 +1556,12 @@ mod tests {
         let settled = loop_.tick();
         assert_eq!(settled.submitted, 0);
         assert!(
-            loop_.state().submit.pending.is_empty(),
+            loop_
+                .state()
+                .submit
+                .as_ref()
+                .map(|s| s.pending.is_empty())
+                .unwrap_or(true),
             "known height + enough confirmations must settle"
         );
     }
@@ -1536,10 +1629,11 @@ mod tests {
         let type_json = script_json(&ts);
         let args = cid_args(hash);
         let intent = indexer_cell(1, 0, lock_json(CID_CODE, &args), None, 100_0000_0000, &[]);
+        let code_hash = cid_backend_core::type_id_script_hash(&PROC_CODE_ARGS);
         let proc = indexer_cell(
             0x50,
             0,
-            lock_json([0; 32], &[]),
+            lock_json(code_hash, &[]),
             Some(type_json),
             200_0000_0000,
             &[0x7f, b'E', b'L', b'F', 1],
@@ -1575,17 +1669,15 @@ mod tests {
             extra_cell_deps: vec![],
             type_id_code_deps: vec![],
             confirmation_depth: 1,
-            fee_rate: 1000,
-            bounded_refund_locks: vec![],
-            extra_scan_locks: vec![],
+            max_assembled_tx_bytes: 512 * 1024,
         };
         let mut first = DigestLoop::new(
             CkbRpc::with_process_code_hashes(&url, &url, vec![PROC_CODE]),
             NopClock,
             StubSsri,
             cfg,
-            ProcessResolver::new(),
         );
+        register_fixture_process(&mut first, 1);
         let r1 = first.tick();
         assert_eq!(r1.submitted, 1, "first process submits");
         assert_eq!(*submitted.lock().unwrap(), 1);
@@ -1603,12 +1695,10 @@ mod tests {
                 extra_cell_deps: vec![],
                 type_id_code_deps: vec![],
                 confirmation_depth: 1,
-                fee_rate: 1000,
-                bounded_refund_locks: vec![],
-                extra_scan_locks: vec![],
+                max_assembled_tx_bytes: 512 * 1024,
             },
-            ProcessResolver::new(),
         );
+        register_fixture_process(&mut second, 1);
         let r2 = second.tick();
         assert_eq!(r2.submitted, 1, "restart resubmits; no persisted occupancy");
         assert_eq!(*submitted.lock().unwrap(), 2);
@@ -1759,10 +1849,11 @@ mod tests {
         let hash = script_hash32(&ts);
         let type_json = script_json(&ts);
         let args = cid_args(hash);
+        let code_hash = cid_backend_core::type_id_script_hash(&PROC_CODE_ARGS);
         let proc = indexer_cell(
             0x50,
             0,
-            lock_json([0; 32], &[]),
+            lock_json(code_hash, &[]),
             Some(type_json),
             200_0000_0000,
             &[0x7f, b'E', b'L', b'F', 1],
@@ -1808,17 +1899,15 @@ mod tests {
             extra_cell_deps: vec![],
             type_id_code_deps: vec![],
             confirmation_depth: 1,
-            fee_rate: 1000,
-            bounded_refund_locks: vec![],
-            extra_scan_locks: vec![],
+            max_assembled_tx_bytes: 512 * 1024,
         };
         let mut loop_ = DigestLoop::new(
             CkbRpc::with_process_code_hashes(&url, &url, vec![PROC_CODE]),
             NopClock,
             StubSsri,
             cfg,
-            ProcessResolver::new(),
         );
+        register_fixture_process(&mut loop_, 1);
         let r1 = loop_.tick();
         assert_eq!(
             r1.scanned, 1,

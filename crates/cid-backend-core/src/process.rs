@@ -43,9 +43,7 @@ pub struct ProcessResolver {
 impl ProcessResolver {
     pub fn for_entry(entry: ProcessEntry) -> Self {
         if entry.identity_type_hash != entry.identity.type_script_hash() {
-            log::warn!(
-                "ProcessEntry identity_type_hash does not match derived state TYPE_ID hash"
-            );
+            log::warn!("ProcessEntry identity_type_hash does not match derived state TYPE_ID hash");
         }
         Self {
             entry,
@@ -60,14 +58,11 @@ impl ProcessResolver {
         self
     }
 
+    /// Test / fixture helper: use `binary` when no Process code cell or
+    /// `ssri_elf_path` is available. Process-as-lock state cell data is never
+    /// treated as the SSRI ELF, so this always returns the provided bytes.
     pub fn with_fallback_binary(mut self, binary: Vec<u8>) -> Self {
-        self.fallback = Some(Box::new(move |_hash, cell| {
-            if looks_like_elf(&cell.data) {
-                None
-            } else {
-                Some(binary.clone())
-            }
-        }));
+        self.fallback = Some(Box::new(move |_hash, _cell| Some(binary.clone())));
         self
     }
 
@@ -95,7 +90,10 @@ impl ProcessResolver {
         if process_type_hash != &self.entry.identity_type_hash {
             return Ok(None);
         }
-        let Some(cell) = rpc.get_live_process_by_type_hash(process_type_hash)? else {
+        // Process-as-lock: state cell type is built-in TYPE_ID; discover by exact
+        // type script (args), not by treating process_type_hash as a type code_hash.
+        let matches = rpc.find_live_cells_by_type_script(&self.entry.identity.type_script(), 2)?;
+        let Some(cell) = matches.into_iter().next() else {
             log::warn!(
                 "no live Process cell for type hash {:02x?}",
                 process_type_hash
@@ -148,19 +146,13 @@ impl ProcessResolver {
                 code.data.len()
             );
         } else {
-            log::warn!(
-                "no tick Process code snapshot (code deps refresh missing process_code?)"
-            );
+            log::warn!("no tick Process code snapshot (code deps refresh missing process_code?)");
         }
         if let Some(path) = &self.entry.ssri_elf_path {
             match std::fs::read(path) {
                 Ok(b) if looks_like_elf(&b) => return Some(b),
                 Ok(b) => {
-                    log::warn!(
-                        "ssri_elf_path {:?} is not ELF ({} bytes)",
-                        path,
-                        b.len()
-                    );
+                    log::warn!("ssri_elf_path {:?} is not ELF ({} bytes)", path, b.len());
                 }
                 Err(e) => {
                     log::warn!("ssri_elf_path {:?} read failed: {e}", path);
@@ -228,10 +220,10 @@ fn looks_like_elf(data: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::type_id::{type_id_script, type_id_script_hash};
     use crate::rpc::{LiveCell, Rpc, RpcError, TxStatus};
-    use ckb_types::packed::Script;
+    use crate::type_id::{type_id_script, type_id_script_hash};
     use ckb_types::core::{ScriptHashType, TransactionView};
+    use ckb_types::packed::Script;
     use ckb_types::packed::{Byte32, CellOutput, OutPoint};
     use std::cell::RefCell;
 
@@ -255,10 +247,22 @@ mod tests {
         }
         fn find_live_cells_by_type_script(
             &self,
-            _: &Script,
-            _: usize,
+            type_script: &Script,
+            max_results: usize,
         ) -> Result<Vec<LiveCell>, RpcError> {
-            Ok(Vec::new())
+            let want = script_hash32(type_script);
+            let mut out = Vec::new();
+            if let Some(cell) = self.cell.borrow().clone() {
+                if cell
+                    .type_script()
+                    .map(|ts| script_hash32(&ts) == want)
+                    .unwrap_or(false)
+                {
+                    out.push(cell);
+                }
+            }
+            out.truncate(max_results);
+            Ok(out)
         }
         fn submit_transaction(&self, _tx: &TransactionView) -> Result<Byte32, RpcError> {
             Err(RpcError::Unavailable("no".into()))

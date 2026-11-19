@@ -10,12 +10,13 @@ use crate::scan::{bucket_by_process_type_hash, scan_intentions_multi, ScannedInt
 use crate::ssri::{build_batch_draft, draft_cells_for_batch, SsriError, SsriHost};
 use crate::submit::{combo_fingerprint, execution_code_key, submit_execution, SubmitState};
 use crate::type_id::TypeIdCodeDep;
-use crate::workers::WorkerPool;
+use crate::workers::{WorkerPool, WorkerRemoveError};
 use ckb_types::core::ScriptHashType;
 use ckb_types::packed::{Byte32, CellDep};
 use ckb_types::prelude::*;
 use std::collections::HashSet;
 use std::fmt::Write as _;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const LOG_TARGET: &str = "cid_backend";
@@ -48,9 +49,6 @@ pub struct LoopConfig {
     /// occupancy is released. `1` settles on first sight of Committed at the
     /// tip. Daemon default is [`DEFAULT_CONFIRMATION_DEPTH`].
     pub confirmation_depth: u64,
-    /// Configured Processes (one worker each). Unknown `process_type_hash` on
-    /// chain is skipped (not a permanent failure).
-    pub process_entries: Vec<ProcessEntry>,
     /// Max molecule bytes for `Process.assemble` passthrough txs.
     pub max_assembled_tx_bytes: usize,
 }
@@ -123,12 +121,21 @@ impl Clock for RealClock {
     }
 }
 
+/// Deferred register/delete from the HTTP registry API (applied at tick start).
+#[derive(Clone, Debug)]
+pub enum WorkerCommand {
+    Register(ProcessEntry),
+    Delete([u8; 32]),
+}
+
 pub struct DigestLoop<R: Rpc, C: Clock, S: SsriHost> {
     rpc: R,
     clock: C,
     ssri: S,
     config: LoopConfig,
     workers: WorkerPool,
+    /// Optional shared command queue for live registry API updates.
+    worker_cmds: Option<Arc<Mutex<Vec<WorkerCommand>>>>,
     last_tip: Option<u64>,
     tick_cell_deps: Vec<CellDep>,
     execution_code_key: Vec<u8>,
@@ -136,39 +143,52 @@ pub struct DigestLoop<R: Rpc, C: Clock, S: SsriHost> {
 
 impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
     pub fn new(rpc: R, clock: C, ssri: S, config: LoopConfig) -> Self {
-        let workers = WorkerPool::from_entries(config.process_entries.clone());
+        Self::with_workers(
+            rpc,
+            clock,
+            ssri,
+            config,
+            WorkerPool::from_entries(vec![]),
+            None,
+        )
+    }
+
+    pub fn with_workers(
+        rpc: R,
+        clock: C,
+        ssri: S,
+        config: LoopConfig,
+        workers: WorkerPool,
+        worker_cmds: Option<Arc<Mutex<Vec<WorkerCommand>>>>,
+    ) -> Self {
         Self {
             rpc,
             clock,
             ssri,
             config,
             workers,
+            worker_cmds,
             last_tip: None,
             tick_cell_deps: Vec::new(),
             execution_code_key: Vec::new(),
         }
     }
 
-    /// Legacy constructor: when `process_entries` is empty, seeds one worker
-    /// from `resolver` (preserving fallback / tick code overrides).
+    /// Seed one worker from `resolver` (tests / local fixtures).
     pub fn new_with_resolver(
         rpc: R,
         clock: C,
         ssri: S,
-        mut config: LoopConfig,
+        config: LoopConfig,
         resolver: ProcessResolver,
     ) -> Self {
-        if config.process_entries.is_empty() {
-            config
-                .process_entries
-                .push(resolver.entry().clone());
-        }
-        let mut this = Self::new(rpc, clock, ssri, config);
-        let hash = resolver.entry().identity_type_hash;
-        if let Some(w) = this.workers.get_mut(&hash) {
+        let entry = resolver.entry().clone();
+        let hash = entry.identity_type_hash;
+        let mut pool = WorkerPool::from_entries(vec![entry]);
+        if let Some(w) = pool.get_mut(&hash) {
             w.resolver = resolver;
         }
-        this
+        Self::with_workers(rpc, clock, ssri, config, pool, None)
     }
 
     pub fn rpc(&self) -> &R {
@@ -187,8 +207,85 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
         &mut self.workers
     }
 
+    pub fn worker_cmds(&self) -> Option<Arc<Mutex<Vec<WorkerCommand>>>> {
+        self.worker_cmds.clone()
+    }
+
+    /// Register (or update) a Process worker immediately.
+    pub fn register_process(&mut self, entry: ProcessEntry) -> bool {
+        let created = self.workers.register(entry);
+        tracing::info!(
+            target: LOG_TARGET,
+            event = if created {
+                "process.registered"
+            } else {
+                "process.updated"
+            },
+        );
+        created
+    }
+
+    /// Remove a Process worker when idle.
+    pub fn unregister_process(
+        &mut self,
+        hash: &[u8; 32],
+    ) -> Result<Option<crate::workers::ProcessWorker>, WorkerRemoveError> {
+        let removed = self.workers.try_remove(hash)?;
+        if removed.is_some() {
+            tracing::info!(
+                target: LOG_TARGET,
+                event = "process.disabled",
+                process_type_hash = %hex_pref(hash),
+            );
+        }
+        Ok(removed)
+    }
+
+    fn drain_worker_commands(&mut self) {
+        let Some(cmds) = &self.worker_cmds else {
+            return;
+        };
+        let batch = std::mem::take(&mut *cmds.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut requeue = Vec::new();
+        for cmd in batch {
+            match cmd {
+                WorkerCommand::Register(entry) => {
+                    let _ = self.register_process(entry);
+                }
+                WorkerCommand::Delete(hash) => match self.workers.try_remove(&hash) {
+                    Ok(Some(_)) => {
+                        tracing::info!(
+                            target: LOG_TARGET,
+                            event = "process.disabled",
+                            process_type_hash = %hex_pref(&hash),
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(WorkerRemoveError::InFlight) => {
+                        requeue.push(WorkerCommand::Delete(hash));
+                        tracing::info!(
+                            target: LOG_TARGET,
+                            event = "process.delete_deferred",
+                            process_type_hash = %hex_pref(&hash),
+                        );
+                    }
+                },
+            }
+        }
+        if !requeue.is_empty() {
+            if let Some(q) = &self.worker_cmds {
+                q.lock().unwrap_or_else(|e| e.into_inner()).extend(requeue);
+            }
+        }
+    }
+
     pub fn state(&self) -> LoopState {
-        let submit = self.sole_worker_submit().cloned();
+        let hashes = self.workers.hashes();
+        let submit = if hashes.len() == 1 {
+            self.workers.get(&hashes[0]).map(|w| w.submit.clone())
+        } else {
+            None
+        };
         LoopState {
             last_tip: self.last_tip,
             tick_cell_deps: self.tick_cell_deps.clone(),
@@ -203,17 +300,6 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
 
     pub fn config_mut(&mut self) -> &mut LoopConfig {
         &mut self.config
-    }
-
-    fn sole_worker_submit(&self) -> Option<&SubmitState> {
-        if self.config.process_entries.len() == 1 {
-            let hash = self.config.process_entries[0].identity_type_hash;
-            return self.workers.get(&hash).map(|w| &w.submit);
-        }
-        if self.config.process_entries.is_empty() && self.workers.get(&[0u8; 32]).is_some() {
-            return None;
-        }
-        None
     }
 
     pub fn run(&mut self) {
@@ -240,6 +326,7 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
     }
 
     fn tick_inner(&mut self) -> TickReport {
+        self.drain_worker_commands();
         let mut report = TickReport::default();
         let tip = self.refresh_tip();
         self.reconcile_pending(tip);
@@ -325,13 +412,16 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                 report.skipped += 1;
                 tracing::debug!(
                     target: LOG_TARGET,
-                    event = "process.unconfigured",
+                    event = "process.unregistered",
                     process_type_hash = %hex_pref(&i.args.process_type_hash),
                 );
                 continue;
             }
             let k = out_point_key(&i.out_point);
-            let w = self.workers.get(&i.args.process_type_hash).expect("checked");
+            let w = self
+                .workers
+                .get(&i.args.process_type_hash)
+                .expect("checked");
             if w.submit.in_flight.contains(&k) || w.submit.rejected.contains(&k) {
                 continue;
             }
@@ -348,13 +438,16 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
     }
 
     fn refresh_worker_process_code(&mut self) {
-        for entry in &self.config.process_entries {
-            let Some(w) = self.workers.get_mut(&entry.identity_type_hash) else {
-                continue;
-            };
+        let snapshots: Vec<([u8; 32], crate::type_id::TypeIdIdentity)> = self
+            .workers
+            .hashes()
+            .into_iter()
+            .filter_map(|h| self.workers.get(&h).map(|w| (h, w.entry.code.clone())))
+            .collect();
+        for (identity_hash, code) in snapshots {
             let spec = TypeIdCodeDep {
-                label: format!("worker_code_{}", hex_pref(&entry.identity_type_hash)),
-                identity: entry.code.clone(),
+                label: format!("worker_code_{}", hex_pref(&identity_hash)),
+                identity: code,
             };
             let code_cell = match resolve_type_id_code_cell(&self.rpc, &spec) {
                 Ok(r) => Some(r.cell),
@@ -362,14 +455,15 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                     tracing::warn!(
                         target: LOG_TARGET,
                         event = "worker.code_resolve_miss",
-                        process_type_hash = %hex_pref(&entry.identity_type_hash),
+                        process_type_hash = %hex_pref(&identity_hash),
                         error = %e,
                     );
                     None
                 }
             };
-            w.resolver
-                .set_tick_process_code(code_cell.as_ref().map(|c| c));
+            if let Some(w) = self.workers.get_mut(&identity_hash) {
+                w.resolver.set_tick_process_code(code_cell.as_ref());
+            }
         }
     }
 
@@ -399,12 +493,7 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
 
     fn reconcile_pending(&mut self, tip: Option<u64>) {
         let depth = self.config.confirmation_depth.max(1);
-        let worker_hashes: Vec<[u8; 32]> = self
-            .config
-            .process_entries
-            .iter()
-            .map(|e| e.identity_type_hash)
-            .collect();
+        let worker_hashes: Vec<[u8; 32]> = self.workers.hashes();
         for process_hash in worker_hashes {
             let hashes: Vec<Vec<u8>> = self
                 .workers
@@ -637,7 +726,16 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
             .get(&hash)
             .and_then(|w| w.isolate_resume.clone());
         let bucket = Self::rotate_bucket(bucket, resume_key.as_ref());
-        let resume = self.isolate_window(hash, &process, bucket, min, max, report, &mut attempts, MAX_ATTEMPTS);
+        let resume = self.isolate_window(
+            hash,
+            &process,
+            bucket,
+            min,
+            max,
+            report,
+            &mut attempts,
+            MAX_ATTEMPTS,
+        );
         let worker = self.workers.get_mut(&hash).expect("exists");
         if let Some(k) = resume {
             worker.isolate_resume = Some(k);
@@ -884,15 +982,14 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
         };
         let skeleton = match assemble_digest_incompatible(group, &self.tick_cell_deps) {
             Ok(s) => {
-                let out_sum: u64 = s
-                    .tx
-                    .outputs()
-                    .into_iter()
-                    .map(|o| {
-                        let c: u64 = o.capacity().unpack();
-                        c
-                    })
-                    .sum();
+                let out_sum: u64 =
+                    s.tx.outputs()
+                        .into_iter()
+                        .map(|o| {
+                            let c: u64 = o.capacity().unpack();
+                            c
+                        })
+                        .sum();
                 let in_sum: u64 = group.iter().map(|i| i.capacity).sum();
                 let fee = in_sum.saturating_sub(out_sum);
                 tracing::info!(
@@ -1105,11 +1202,7 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
             .any(|i| i.previous_output() == process.live_cell.out_point);
         let intent_ops: Vec<_> = batch.iter().map(|i| i.out_point.clone()).collect();
         let process_op = consumed_process.then(|| process.live_cell.out_point.clone());
-        let fp = combo_fingerprint(
-            &intent_ops,
-            process_op.as_ref(),
-            &self.execution_code_key,
-        );
+        let fp = combo_fingerprint(&intent_ops, process_op.as_ref(), &self.execution_code_key);
         let worker = self.workers.get_mut(&hash).expect("exists");
         if worker.submit.rejected_combos.contains(&fp) {
             tracing::debug!(
@@ -1212,5 +1305,137 @@ mod confirmation_math {
         assert_eq!(confirmation_count(9, 10), 0);
         assert_eq!(confirmation_count(10, 10), 1);
         assert_eq!(confirmation_count(12, 10), 3);
+    }
+}
+#[cfg(test)]
+mod worker_cmd_tests {
+    use super::*;
+    use crate::process::ProcessEntry;
+    use crate::rpc::{LiveCell, Rpc, RpcError, TxStatus};
+    use crate::ssri::{SsriError, SsriHost};
+    use crate::type_id::{type_id_script_hash, TypeIdIdentity};
+    use cid_process_executor::{AssembledTx, MockHost};
+    use ckb_types::core::{ScriptHashType, TransactionView};
+    use ckb_types::packed::Byte32;
+    use std::time::Duration;
+
+    struct EmptyRpc;
+    impl Rpc for EmptyRpc {
+        fn list_live_intentions(
+            &self,
+            _: &[u8; 32],
+            _: ScriptHashType,
+        ) -> Result<Vec<LiveCell>, RpcError> {
+            Ok(vec![])
+        }
+        fn get_live_process_by_type_hash(
+            &self,
+            _: &[u8; 32],
+        ) -> Result<Option<LiveCell>, RpcError> {
+            Ok(None)
+        }
+        fn find_live_cells_by_type_script(
+            &self,
+            _: &ckb_types::packed::Script,
+            _: usize,
+        ) -> Result<Vec<LiveCell>, RpcError> {
+            Ok(vec![])
+        }
+        fn submit_transaction(&self, _: &TransactionView) -> Result<Byte32, RpcError> {
+            Err(RpcError::Unavailable("no".into()))
+        }
+        fn get_transaction_status(&self, _: &Byte32) -> Result<TxStatus, RpcError> {
+            Err(RpcError::Unavailable("no".into()))
+        }
+        fn tip_block_number(&self) -> Result<u64, RpcError> {
+            Ok(0)
+        }
+    }
+
+    struct NopSsri;
+    impl SsriHost for NopSsri {
+        fn get_batch_bounds(&self, _: &[u8]) -> Result<(u32, u32), SsriError> {
+            Ok((1, 1))
+        }
+        fn assemble(&self, _: &[u8], _: &[u8], _: MockHost) -> Result<AssembledTx, SsriError> {
+            Err(SsriError::Unusable("nop".into()))
+        }
+    }
+
+    fn entry(state: [u8; 32], code: [u8; 32]) -> ProcessEntry {
+        ProcessEntry {
+            identity_type_hash: type_id_script_hash(&state),
+            identity: TypeIdIdentity::new(state),
+            code: TypeIdIdentity::new(code),
+            ssri_elf_path: None,
+        }
+    }
+
+    fn cfg() -> LoopConfig {
+        LoopConfig {
+            cid_code_hash: [0xC1; 32],
+            hash_type: ScriptHashType::Type,
+            poll_interval: Duration::from_secs(1),
+            extra_cell_deps: vec![],
+            type_id_code_deps: vec![],
+            confirmation_depth: 1,
+            max_assembled_tx_bytes: 512 * 1024,
+        }
+    }
+
+    #[test]
+    fn worker_command_register_and_delete_take_effect_on_tick() {
+        let cmds = Arc::new(Mutex::new(Vec::new()));
+        let mut loop_ = DigestLoop::with_workers(
+            EmptyRpc,
+            NopClock,
+            NopSsri,
+            cfg(),
+            WorkerPool::from_entries(vec![]),
+            Some(cmds.clone()),
+        );
+        assert!(loop_.workers().is_empty());
+
+        let e = entry([0x11; 32], [0x22; 32]);
+        let hash = e.identity_type_hash;
+        cmds.lock().unwrap().push(WorkerCommand::Register(e));
+        let _ = loop_.tick();
+        assert!(
+            loop_.workers().contains(&hash),
+            "register must spawn worker"
+        );
+
+        cmds.lock().unwrap().push(WorkerCommand::Delete(hash));
+        let _ = loop_.tick();
+        assert!(
+            !loop_.workers().contains(&hash),
+            "delete must stop idle worker"
+        );
+    }
+
+    #[test]
+    fn worker_command_delete_deferred_while_in_flight() {
+        let cmds = Arc::new(Mutex::new(Vec::new()));
+        let e = entry([0x33; 32], [0x44; 32]);
+        let hash = e.identity_type_hash;
+        let mut pool = WorkerPool::from_entries(vec![e]);
+        pool.get_mut(&hash).unwrap().submit.pending.insert(
+            vec![0x01],
+            crate::submit::PendingTx {
+                consumed: vec![],
+                created: vec![],
+                seen_committed: false,
+            },
+        );
+        let mut loop_ =
+            DigestLoop::with_workers(EmptyRpc, NopClock, NopSsri, cfg(), pool, Some(cmds.clone()));
+        cmds.lock().unwrap().push(WorkerCommand::Delete(hash));
+        let _ = loop_.tick();
+        assert!(
+            loop_.workers().contains(&hash),
+            "in-flight delete must stay deferred"
+        );
+        assert_eq!(cmds.lock().unwrap().len(), 1);
+        assert!(matches!(cmds.lock().unwrap()[0], WorkerCommand::Delete(_)));
     }
 }

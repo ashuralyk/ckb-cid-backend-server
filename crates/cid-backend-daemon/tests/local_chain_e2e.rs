@@ -15,7 +15,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use cid_backend_core::digest_loop::{DigestLoop, NopClock};
-use cid_backend_core::process::ProcessResolver;
 use cid_backend_core::rpc::{script_hash32, Rpc, TxStatus};
 use cid_backend_core::ssri::EmbeddedSsri;
 use cid_backend_daemon::{CkbRpc, DaemonConfig};
@@ -459,6 +458,9 @@ fn scan_resolve_ssri_submit_confirms_on_local_dev_chain() {
         type_id_code_deps: vec![],
         process_type_code_hashes: vec![process_code_hash],
         health_bind: None,
+        api_bind: None,
+        registry_path: std::env::temp_dir().join("cid-local-e2e-registry.json"),
+        registry_max_entries: 64,
         confirmation_depth: 1,
         fee_rate: cid_backend_core::DEFAULT_FEE_RATE,
         bounded_refund_locks: vec![],
@@ -469,13 +471,10 @@ fn scan_resolve_ssri_submit_confirms_on_local_dev_chain() {
         log_format: cid_backend_daemon::logging::LogFormat::Json,
     };
     let live_rpc = CkbRpc::from_config(&cfg);
-    let mut loop_ = DigestLoop::new(
-        live_rpc,
-        NopClock,
-        EmbeddedSsri,
-        cfg.to_loop_config(),
-        ProcessResolver::new(),
-    );
+    // Local e2e still uses data1 fixtures; register Process after Process-as-lock
+    // cutover lands on the local chain script set. Until then, empty workers
+    // will skip Intentions — this suite is #[ignore] without a live node.
+    let mut loop_ = DigestLoop::new(live_rpc, NopClock, EmbeddedSsri, cfg.to_loop_config());
 
     let mut submitted_hash: Option<Byte32> = None;
     for i in 0..20 {
@@ -485,7 +484,11 @@ fn scan_resolve_ssri_submit_confirms_on_local_dev_chain() {
             report.scanned, report.submitted, report.skipped
         );
         if report.submitted > 0 {
-            let pending = loop_.state().submit.pending.keys().next().cloned();
+            let pending = loop_
+                .state()
+                .submit
+                .as_ref()
+                .and_then(|s| s.pending.keys().next().cloned());
             submitted_hash = pending.map(|b| Byte32::from_slice(&b).unwrap());
             break;
         }

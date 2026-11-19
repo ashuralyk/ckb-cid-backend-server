@@ -1,7 +1,6 @@
 #[cfg(test)]
 mod tests {
     use cid_backend_core::process::ProcessResolver;
-    use cid_backend_core::rpc::script_hash32;
     use cid_backend_core::type_id::TYPE_ID_CODE_HASH;
     use ckb_types::core::ScriptHashType;
     use ckb_types::prelude::*;
@@ -35,7 +34,8 @@ mod tests {
         );
         rpc.insert_cell(proc);
         let entry = fixture_process_entry(unique);
-        let mut resolver = ProcessResolver::for_entry(entry).with_fallback_binary(FIXTURE_ELF.to_vec());
+        let mut resolver =
+            ProcessResolver::for_entry(entry).with_fallback_binary(FIXTURE_ELF.to_vec());
         let got = resolver.resolve(&rpc, &hash).unwrap().expect("resolved");
         assert_eq!(got.binary, FIXTURE_ELF);
         assert_eq!(got.type_hash, hash);
@@ -54,7 +54,8 @@ mod tests {
             vec![],
         ));
         let entry = fixture_process_entry(unique);
-        let mut resolver = ProcessResolver::for_entry(entry).with_fallback_binary(FIXTURE_ELF.to_vec());
+        let mut resolver =
+            ProcessResolver::for_entry(entry).with_fallback_binary(FIXTURE_ELF.to_vec());
         assert!(resolver.resolve(&rpc, &hash).unwrap().is_none());
     }
 }

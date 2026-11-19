@@ -1,12 +1,12 @@
-use cid_backend_core::code_deps::PROCESS_CODE_LABEL;
-use cid_backend_core::digest_loop::{DigestLoop, NopClock};
-use cid_backend_core::process::ProcessResolver;
+use cid_backend_core::digest_loop::{DigestLoop, NopClock, WorkerCommand};
 use cid_backend_core::ssri::EmbeddedSsri;
+use cid_backend_core::{ProcessRegistry, WorkerPool};
 use cid_backend_daemon::observe::{spawn_health, DaemonStats};
+use cid_backend_daemon::registry_api::{spawn_registry_api, RegistryApiState};
 use cid_backend_daemon::{
     parse_cli, resolve_config_path, rpc_endpoint_for_log, usage, CkbRpc, CliAction, DaemonConfig,
 };
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -57,7 +57,8 @@ fn main() {
         indexer = %rpc_endpoint_for_log(&config.indexer_url),
         static_cell_deps = config.extra_cell_deps.len(),
         type_id_code_deps = config.type_id_code_deps.len(),
-        process_prefixes = config.process_type_code_hashes.len(),
+        registry_path = %config.registry_path.display(),
+        registry_max_entries = config.registry_max_entries,
     );
     let stats = Arc::new(DaemonStats::new());
     if let Some(addr) = config.health_bind {
@@ -78,6 +79,67 @@ fn main() {
             }
         }
     }
+
+    let registry = match ProcessRegistry::open(&config.registry_path, config.registry_max_entries) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(
+                target: "cid_backend",
+                event = "registry.load_failed",
+                error = %e,
+            );
+            eprintln!("cid-backend-daemon registry load failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    tracing::info!(
+        target: "cid_backend",
+        event = "registry.loaded",
+        path = %config.registry_path.display(),
+        entries = registry.len(),
+    );
+
+    let mut workers = WorkerPool::from_entries(vec![]);
+    for reg in registry.list() {
+        match reg.to_process_entry() {
+            Ok(entry) => {
+                let _ = workers.register(entry);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "cid_backend",
+                    event = "registry.entry_invalid",
+                    error = %e,
+                );
+            }
+        }
+    }
+    let worker_cmds: Arc<Mutex<Vec<WorkerCommand>>> = Arc::new(Mutex::new(Vec::new()));
+    let registry = Arc::new(Mutex::new(registry));
+
+    if let Some(addr) = config.api_bind {
+        let state = RegistryApiState {
+            registry: registry.clone(),
+            worker_cmds: worker_cmds.clone(),
+        };
+        match spawn_registry_api(addr, state) {
+            Ok(h) => tracing::info!(
+                target: "cid_backend",
+                event = "registry.api.listen",
+                bind = %h.local_addr,
+            ),
+            Err(e) => {
+                tracing::error!(
+                    target: "cid_backend",
+                    event = "config.load_failed",
+                    error = %e,
+                );
+                eprintln!("cid-backend-daemon registry API bind failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     let rpc = CkbRpc::from_config(&config);
     if config.validate_genesis {
         let expected = config
@@ -100,21 +162,24 @@ fn main() {
     }
     let loop_config = config.to_loop_config();
     let poll = config.poll_interval;
-    // Type-ID Process code → SSRI executes the resolved code-cell ELF (same
-    // snapshot as the CellDep); state type script must reference that TYPE_ID.
-    // Legacy / local data1 keeps state-cell ELF.
-    let resolver = match config
-        .type_id_code_deps
-        .iter()
-        .find(|d| d.label == PROCESS_CODE_LABEL)
-    {
-        Some(dep) => ProcessResolver::with_type_id_process_code(dep.identity.type_script_hash()),
-        None => ProcessResolver::new(),
-    };
-    let mut digest = DigestLoop::new(rpc, NopClock, EmbeddedSsri, loop_config, resolver);
+    let mut digest = DigestLoop::with_workers(
+        rpc,
+        NopClock,
+        EmbeddedSsri,
+        loop_config,
+        workers,
+        Some(worker_cmds),
+    );
     loop {
         let report = digest.tick();
-        stats.observe(&report, digest.state().submit.pending.len());
+        let pending = digest
+            .workers()
+            .hashes()
+            .iter()
+            .filter_map(|h| digest.workers().get(h))
+            .map(|w| w.submit.pending.len())
+            .sum();
+        stats.observe(&report, pending);
         std::thread::sleep(poll);
     }
 }

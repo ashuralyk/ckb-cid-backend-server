@@ -1,6 +1,9 @@
 use crate::logging::LogFormat;
-use cid_backend_core::digest_loop::{LoopConfig, DEFAULT_CONFIRMATION_DEPTH};
+use cid_backend_core::digest_loop::{
+    LoopConfig, DEFAULT_CONFIRMATION_DEPTH, DEFAULT_MAX_ASSEMBLED_TX_BYTES,
+};
 use cid_backend_core::type_id::{TypeIdCodeDep, TypeIdIdentity};
+use cid_backend_core::DEFAULT_MAX_REGISTRY_ENTRIES;
 use cid_backend_core::{CidLockIdentity, DEFAULT_FEE_RATE, MAX_FEE_RATE};
 use ckb_types::core::{DepType, ScriptHashType};
 use ckb_types::packed::{Byte32, CellDep, OutPoint};
@@ -33,6 +36,12 @@ pub struct DaemonConfig {
     pub process_type_code_hashes: Vec<[u8; 32]>,
     /// Optional health/stats bind. Unset/empty disables the listener.
     pub health_bind: Option<SocketAddr>,
+    /// Optional Process registry HTTP API bind. Unset/empty disables the listener.
+    pub api_bind: Option<SocketAddr>,
+    /// On-disk Process registry JSON path (atomic write+rename).
+    pub registry_path: PathBuf,
+    /// Max registered Processes.
+    pub registry_max_entries: usize,
     /// Confirmation depth for submitted execution txs. Default 24.
     pub confirmation_depth: u64,
     /// Shannons per 1000 bytes (KW) for digest_ok fee from Process recreate.
@@ -131,11 +140,15 @@ impl DaemonConfig {
             hash_type: self.hash_type,
             poll_interval: self.poll_interval,
             extra_cell_deps: self.extra_cell_deps.clone(),
-            type_id_code_deps: self.type_id_code_deps.clone(),
+            // CID lock Type-ID only; Process code Type IDs come from the registry.
+            type_id_code_deps: self
+                .type_id_code_deps
+                .iter()
+                .filter(|d| d.label == "cid_lock")
+                .cloned()
+                .collect(),
             confirmation_depth: self.confirmation_depth,
-            fee_rate: self.fee_rate,
-            bounded_refund_locks: self.bounded_refund_locks.clone(),
-            extra_scan_locks: self.extra_scan_locks.clone(),
+            max_assembled_tx_bytes: DEFAULT_MAX_ASSEMBLED_TX_BYTES,
         }
     }
 }
@@ -223,6 +236,8 @@ struct FileConfig {
     digest: Option<LoopSection>,
     #[serde(default)]
     observe: Option<ObserveSection>,
+    #[serde(default)]
+    registry: Option<RegistrySection>,
 }
 
 #[derive(Default, Deserialize)]
@@ -331,8 +346,20 @@ struct LoopSection {
 struct ObserveSection {
     #[serde(default)]
     health_bind: Option<String>,
+    /// Process registry HTTP API bind (POST/GET/DELETE /v1/processes).
+    #[serde(default)]
+    api_bind: Option<String>,
     #[serde(default)]
     log_format: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegistrySection {
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    max_entries: Option<usize>,
 }
 
 fn read_file_config(path: &Path) -> Result<FileConfig, ConfigError> {
@@ -415,6 +442,7 @@ fn merge<F: Fn(&str) -> Option<String>>(
     let process_lock = file.process_lock.unwrap_or_default();
     let digest = file.digest.unwrap_or_default();
     let observe = file.observe.unwrap_or_default();
+    let registry = file.registry.unwrap_or_default();
 
     let node_url = match nonempty(&get, "CID_CKB_RPC_URL") {
         Some(v) => v,
@@ -631,6 +659,44 @@ fn merge<F: Fn(&str) -> Option<String>>(
         },
     };
 
+    let api_bind = match nonempty(&get, "CID_API_BIND") {
+        Some(s) => Some(parse_health_bind(&s)?),
+        None => match observe.api_bind.filter(|s| !s.trim().is_empty()) {
+            Some(s) => Some(parse_health_bind(&s)?),
+            None => None,
+        },
+    };
+
+    let registry_path = match nonempty(&get, "CID_REGISTRY_PATH") {
+        Some(s) => PathBuf::from(s),
+        None => match registry.path.filter(|s| !s.trim().is_empty()) {
+            Some(s) => PathBuf::from(s),
+            None => PathBuf::from("data/process-registry.json"),
+        },
+    };
+    let registry_max_entries = match nonempty(&get, "CID_REGISTRY_MAX_ENTRIES") {
+        Some(s) => {
+            let n: usize = s
+                .parse()
+                .map_err(|_| ConfigError::Invalid("CID_REGISTRY_MAX_ENTRIES not usize".into()))?;
+            if n == 0 {
+                return Err(ConfigError::Invalid(
+                    "CID_REGISTRY_MAX_ENTRIES must be >= 1".into(),
+                ));
+            }
+            n
+        }
+        None => match registry.max_entries {
+            Some(0) => {
+                return Err(ConfigError::Invalid(
+                    "registry.max_entries must be >= 1".into(),
+                ));
+            }
+            Some(n) => n,
+            None => DEFAULT_MAX_REGISTRY_ENTRIES,
+        },
+    };
+
     let confirmation_depth = match nonempty(&get, "CID_CONFIRMATION_DEPTH") {
         Some(s) => parse_confirmation_depth(&s)?,
         None => match digest.confirmation_depth {
@@ -715,6 +781,9 @@ fn merge<F: Fn(&str) -> Option<String>>(
         type_id_code_deps,
         process_type_code_hashes,
         health_bind,
+        api_bind,
+        registry_path,
+        registry_max_entries,
         confirmation_depth,
         fee_rate,
         bounded_refund_locks,
@@ -1104,7 +1173,10 @@ log_format = "pretty"
             cfg.bounded_refund_locks.is_empty(),
             "legacy exact refund must remain the default (empty allowlist)"
         );
-        assert!(cfg.to_loop_config().bounded_refund_locks.is_empty());
+        assert_eq!(
+            cfg.to_loop_config().max_assembled_tx_bytes,
+            DEFAULT_MAX_ASSEMBLED_TX_BYTES
+        );
         assert!(cfg.extra_scan_locks.is_empty());
         assert!(cfg.genesis_hash.is_none());
         assert!(!cfg.validate_genesis);
@@ -1119,7 +1191,7 @@ log_format = "pretty"
         ));
         let cfg = DaemonConfig::from_file_and_vars(Some(&path), |_| None).unwrap();
         assert_eq!(cfg.fee_rate, 2500);
-        assert_eq!(cfg.to_loop_config().fee_rate, 2500);
+        let _ = cfg.fee_rate; // fee_rate retained on DaemonConfig only
 
         let cfg = DaemonConfig::from_file_and_vars(Some(&path), |k| match k {
             "CID_FEE_RATE" => Some("4000".into()),
@@ -1149,9 +1221,11 @@ log_format = "pretty"
         assert_eq!(cfg.bounded_refund_locks[0].hash_type, ScriptHashType::Data1);
         assert_eq!(cfg.extra_scan_locks.len(), 1);
         assert_eq!(cfg.extra_scan_locks[0].hash_type, ScriptHashType::Data1);
-        assert_eq!(cfg.to_loop_config().bounded_refund_locks.len(), 2);
+        assert_eq!(cfg.bounded_refund_locks.len(), 2);
         let scan = cfg.to_loop_config().scan_lock_identities();
-        assert_eq!(scan.len(), 2, "allowlist must not add a third scan target");
+        // Primary-only scan: legacy_scan_locks stay on DaemonConfig but are not
+        // LoopConfig scan targets under Process-as-lock cutover.
+        assert_eq!(scan.len(), 1, "loop scans primary CID lock only");
         assert!(!scan.iter().any(|id| id.code_hash == [0x11; 32]));
 
         // Env allowlist must still be a scanned identity (primary data1 here).
@@ -1226,10 +1300,11 @@ poll_interval_secs = 5
         assert_eq!(cfg.bounded_refund_locks.len(), 1);
         assert_eq!(cfg.bounded_refund_locks[0].hash_type, ScriptHashType::Data1);
         let loop_cfg = cfg.to_loop_config();
-        assert!(loop_cfg
-            .scan_lock_identities()
-            .contains(&CidLockIdentity::new([0xd1; 32], ScriptHashType::Data1)));
-        assert_eq!(loop_cfg.scan_lock_identities().len(), 2);
+        assert_eq!(loop_cfg.scan_lock_identities().len(), 1);
+        assert_eq!(
+            loop_cfg.scan_lock_identities()[0].hash_type,
+            ScriptHashType::Type
+        );
     }
 
     #[test]
@@ -1310,7 +1385,9 @@ poll_interval_secs = 5
         let proc_derived = type_id_script_hash(&[0xbbu8; 32]);
         assert!(cfg.process_type_code_hashes.contains(&proc_derived));
         let loop_cfg = cfg.to_loop_config();
-        assert_eq!(loop_cfg.type_id_code_deps.len(), 2);
+        // Loop only carries CID lock Type-ID; Process code deps come from registry.
+        assert_eq!(loop_cfg.type_id_code_deps.len(), 1);
+        assert_eq!(loop_cfg.type_id_code_deps[0].label, "cid_lock");
         assert_eq!(loop_cfg.cid_code_hash, expected);
     }
 
@@ -1460,7 +1537,7 @@ poll_interval_secs = 5
     }
 
     #[test]
-    fn type_id_primary_scan_identities_include_legacy_data1() {
+    fn type_id_primary_scan_identities_exclude_legacy_from_loop() {
         use cid_backend_core::type_id::type_id_script_hash;
         let derived = type_id_script_hash(&[0xaau8; 32]);
         let path = write_toml(&format!(
@@ -1487,9 +1564,12 @@ fee_rate = 1000
         let cfg = DaemonConfig::from_file_and_vars(Some(&path), |_| None).unwrap();
         assert_eq!(cfg.cid_lock_code_hash, derived);
         assert_eq!(cfg.hash_type, ScriptHashType::Type);
+        assert_eq!(cfg.extra_scan_locks.len(), 1);
         let ids = cfg.to_loop_config().scan_lock_identities();
-        assert_eq!(ids[0], CidLockIdentity::new(derived, ScriptHashType::Type));
-        assert!(ids.contains(&CidLockIdentity::new([0xd1; 32], ScriptHashType::Data1)));
+        assert_eq!(
+            ids,
+            vec![CidLockIdentity::new(derived, ScriptHashType::Type)]
+        );
     }
 
     #[test]

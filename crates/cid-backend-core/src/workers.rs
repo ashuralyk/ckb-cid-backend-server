@@ -121,7 +121,7 @@ impl WorkerPool {
 
     pub fn hashes(&self) -> Vec<[u8; 32]> {
         let mut keys: Vec<_> = self.workers.keys().copied().collect();
-        keys.sort_by(|a, b| a.cmp(b));
+        keys.sort();
         keys
     }
 }
@@ -146,7 +146,11 @@ mod tests {
         let e1 = entry([0x01; 32], [0x02; 32]);
         let hash = e1.identity_type_hash;
         assert!(pool.register(e1.clone()));
-        pool.get_mut(&hash).unwrap().submit.in_flight.insert(vec![0xaa]);
+        pool.get_mut(&hash)
+            .unwrap()
+            .submit
+            .in_flight
+            .insert(vec![0xaa]);
         pool.get_mut(&hash).unwrap().isolate_resume = Some(vec![0xbb]);
 
         let mut e1b = e1.clone();

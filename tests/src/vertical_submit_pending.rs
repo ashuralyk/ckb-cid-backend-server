@@ -1,14 +1,14 @@
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
-    use cid_backend_core::digest_loop::{DigestLoop, LoopConfig, NopClock};
-    use cid_backend_core::process::ProcessResolver;
+    use cid_backend_core::digest_loop::LoopConfig;
     use cid_backend_core::rpc::{out_point_key, script_hash32, Rpc, TxStatus};
     use ckb_types::core::ScriptHashType;
+    use std::time::Duration;
 
     use crate::fake_rpc::FakeRpc;
-    use crate::helpers::{intention_cell, process_cell, process_type_script, CID_CODE, loop_with_resolver};
+    use crate::helpers::{
+        intention_cell, loop_with_resolver, process_cell, process_type_script, CID_CODE,
+    };
     use crate::scripted_ssri::ScriptedSsri;
 
     #[test]
@@ -55,8 +55,10 @@ mod tests {
         assert!(
             loop_
                 .state()
-                .submit.as_ref().unwrap()
-            .in_flight
+                .submit
+                .as_ref()
+                .unwrap()
+                .in_flight
                 .contains(&out_point_key(&proc.out_point)),
             "Process occupancy must survive Intention-only live_keys"
         );
@@ -76,7 +78,9 @@ mod tests {
         );
         assert!(loop_
             .state()
-            .submit.as_ref().unwrap()
+            .submit
+            .as_ref()
+            .unwrap()
             .in_flight
             .contains(&out_point_key(&proc.out_point)));
 
@@ -120,12 +124,7 @@ mod tests {
         for i in 1..=4 {
             rpc.insert_cell(intention_cell(i, hash, 100_0000_0000));
         }
-        let mut loop_ = loop_with_resolver(
-            rpc,
-            ScriptedSsri::mimic((2, 2)),
-            cfg(),
-            6,
-        );
+        let mut loop_ = loop_with_resolver(rpc, ScriptedSsri::mimic((2, 2)), cfg(), 6);
 
         let first = loop_.tick();
         assert_eq!(first.submitted, 1);
@@ -138,8 +137,10 @@ mod tests {
             assert!(
                 loop_
                     .state()
-                    .submit.as_ref().unwrap()
-            .in_flight
+                    .submit
+                    .as_ref()
+                    .unwrap()
+                    .in_flight
                     .contains(&out_point_key(&proc.out_point)),
                 "Process occupancy must hold across waiting ticks"
             );
@@ -166,12 +167,7 @@ mod tests {
         for i in 1..=4 {
             rpc.insert_cell(intention_cell(i, hash, 100_0000_0000));
         }
-        let mut loop_ = loop_with_resolver(
-            rpc,
-            ScriptedSsri::mimic((2, 2)),
-            cfg(),
-            7,
-        );
+        let mut loop_ = loop_with_resolver(rpc, ScriptedSsri::mimic((2, 2)), cfg(), 7);
 
         let first = loop_.tick();
         assert_eq!(first.submitted, 1);
@@ -183,12 +179,19 @@ mod tests {
         assert!(
             loop_
                 .state()
-                .submit.as_ref().unwrap()
-            .in_flight
+                .submit
+                .as_ref()
+                .unwrap()
+                .in_flight
                 .contains(&out_point_key(&proc.out_point)),
             "Unavailable status must not release pending occupancy"
         );
-        assert!(loop_.state().submit.as_ref().unwrap().pending_occupies(&proc.out_point));
+        assert!(loop_
+            .state()
+            .submit
+            .as_ref()
+            .unwrap()
+            .pending_occupies(&proc.out_point));
     }
 
     #[test]
@@ -201,12 +204,7 @@ mod tests {
         let proc = process_cell(8, 200_0000_0000, vec![0x7f, b'E', b'L', b'F', 8]);
         rpc.insert_cell(intent.clone());
         rpc.insert_cell(proc.clone());
-        let mut loop_ = loop_with_resolver(
-            rpc,
-            ScriptedSsri::mimic((1, 4)),
-            cfg(),
-            8,
-        );
+        let mut loop_ = loop_with_resolver(rpc, ScriptedSsri::mimic((1, 4)), cfg(), 8);
 
         let first = loop_.tick();
         assert_eq!(first.submitted, 1);
@@ -270,7 +268,12 @@ mod tests {
             .inputs()
             .into_iter()
             .any(|i| i.previous_output() == proc.out_point));
-        assert!(loop_.state().submit.as_ref().unwrap().pending_occupies(&proc.out_point));
+        assert!(loop_
+            .state()
+            .submit
+            .as_ref()
+            .unwrap()
+            .pending_occupies(&proc.out_point));
 
         let second = loop_.tick();
         assert_eq!(second.submitted, 1, "refund must still submit");
@@ -292,6 +295,11 @@ mod tests {
             proc.out_point,
             "Process stays live under pending digest_ok"
         );
-        assert!(loop_.state().submit.as_ref().unwrap().pending_occupies(&proc.out_point));
+        assert!(loop_
+            .state()
+            .submit
+            .as_ref()
+            .unwrap()
+            .pending_occupies(&proc.out_point));
     }
 }

@@ -6,9 +6,9 @@ mod tests {
 
     use cid_backend_core::digest_loop::LoopConfig;
     use cid_backend_core::process::ProcessResolver;
-    use cid_backend_core::rpc::{out_point_key, script_hash32};
+    use cid_backend_core::rpc::out_point_key;
     use cid_backend_core::type_id::{TypeIdCodeDep, TypeIdIdentity};
-    use ckb_types::core::{DepType, ScriptHashType};
+    use ckb_types::core::ScriptHashType;
     use ckb_types::packed::{Byte32, CellDep, CellOutput, OutPoint, Script};
     use ckb_types::prelude::*;
 
@@ -16,7 +16,7 @@ mod tests {
     use crate::helpers::{
         default_loop_config, fixture_process_entry_with_code, intention_cell, loop_with_resolver,
         loop_with_resolver_and_code, process_cell, process_cell_for_code, process_type_hash,
-        process_type_script, FIXTURE_ELF, PROC_CODE_ARGS,
+        FIXTURE_ELF, PROC_CODE_ARGS,
     };
     use crate::scripted_ssri::ScriptedSsri;
 
@@ -54,7 +54,7 @@ mod tests {
         }
     }
 
-  /// Worker Process code is resolved from `ProcessEntry.code`, not LoopConfig.
+    /// Worker Process code is resolved from `ProcessEntry.code`, not LoopConfig.
     fn worker_code_args() -> [u8; 32] {
         [0xb2; 32]
     }
@@ -67,12 +67,7 @@ mod tests {
         let hash = process_type_hash(1);
         let code_args = worker_code_args();
         rpc.insert_cell(intention_cell(1, hash, 100_0000_0000));
-        rpc.insert_cell(process_cell_for_code(
-            1,
-            200_0000_0000,
-            vec![],
-            code_args,
-        ));
+        rpc.insert_cell(process_cell_for_code(1, 200_0000_0000, vec![], code_args));
         rpc.insert_cell(code_cell(0x11, code_args, FIXTURE_ELF.to_vec()));
         rpc.insert_cell(code.clone());
 
@@ -169,10 +164,6 @@ mod tests {
             .contains("ambiguous"));
     }
 
-    fn code_args_stub() -> [u8; 32] {
-        PROC_CODE_ARGS
-    }
-
     #[test]
     fn process_ssri_uses_worker_code_cell_not_state_data() {
         let code_args = worker_code_args();
@@ -190,7 +181,8 @@ mod tests {
         rpc.insert_cell(code_cell(0x72, code_args, code_elf.clone()));
 
         let ssri = ScriptedSsri::mimic((1, 4));
-        let mut loop_ = loop_with_resolver_and_code(rpc, ssri, default_loop_config(), 13, code_args);
+        let mut loop_ =
+            loop_with_resolver_and_code(rpc, ssri, default_loop_config(), 13, code_args);
         let report = loop_.tick();
         assert_eq!(report.submitted, 1, "{:?}", report.last_error);
         let seen = loop_.ssri().seen_binaries.borrow().clone();
@@ -204,12 +196,18 @@ mod tests {
         let rpc = FakeRpc::new();
         let hash = process_type_hash(14);
         rpc.insert_cell(intention_cell(14, hash, 100_0000_0000));
-        rpc.insert_cell(process_cell_for_code(14, 200_0000_0000, vec![0x00], code_args));
+        rpc.insert_cell(process_cell_for_code(
+            14,
+            200_0000_0000,
+            vec![0x00],
+            code_args,
+        ));
         let code_v1 = code_cell(0x73, code_args, vec![0x7f, b'E', b'L', b'F', 0x01]);
         rpc.insert_cell(code_v1.clone());
 
         let ssri = ScriptedSsri::mimic((1, 4));
-        let mut loop_ = loop_with_resolver_and_code(rpc, ssri, default_loop_config(), 14, code_args);
+        let mut loop_ =
+            loop_with_resolver_and_code(rpc, ssri, default_loop_config(), 14, code_args);
         assert_eq!(loop_.tick().submitted, 1);
         assert!(loop_
             .ssri()
@@ -224,16 +222,19 @@ mod tests {
         let entry15 = fixture_process_entry_with_code(15, code_args);
         loop_.register_process(entry15.clone());
         if let Some(w) = loop_.workers_mut().get_mut(&entry15.identity_type_hash) {
-            w.resolver = ProcessResolver::for_entry(entry15)
-                .with_fallback_binary(FIXTURE_ELF.to_vec());
+            w.resolver =
+                ProcessResolver::for_entry(entry15).with_fallback_binary(FIXTURE_ELF.to_vec());
         }
         let hash2 = process_type_hash(15);
         loop_
             .rpc()
             .insert_cell(intention_cell(15, hash2, 100_0000_0000));
-        loop_
-            .rpc()
-            .insert_cell(process_cell_for_code(15, 200_0000_0000, vec![0x00], code_args));
+        loop_.rpc().insert_cell(process_cell_for_code(
+            15,
+            200_0000_0000,
+            vec![0x00],
+            code_args,
+        ));
         loop_.ssri().seen_binaries.borrow_mut().clear();
 
         assert_eq!(loop_.tick().submitted, 1);
@@ -266,12 +267,8 @@ mod tests {
         rpc.insert_cell(bad);
         rpc.insert_cell(code_cell(0x80, code_args, FIXTURE_ELF.to_vec()));
 
-        let mut loop_ = loop_with_resolver(
-            rpc,
-            ScriptedSsri::mimic((1, 4)),
-            default_loop_config(),
-            20,
-        );
+        let mut loop_ =
+            loop_with_resolver(rpc, ScriptedSsri::mimic((1, 4)), default_loop_config(), 20);
         let report = loop_.tick();
         assert_eq!(report.submitted, 0);
         assert!(loop_.rpc().has_cell(&intent.out_point));
@@ -285,25 +282,19 @@ mod tests {
         rpc.insert_cell(intent.clone());
         rpc.insert_cell(process_cell(99, 200_0000_0000, vec![]));
 
-        let mut loop_ = loop_with_resolver(
-            rpc,
-            ScriptedSsri::mimic((1, 4)),
-            default_loop_config(),
-            1,
-        );
+        let mut loop_ =
+            loop_with_resolver(rpc, ScriptedSsri::mimic((1, 4)), default_loop_config(), 1);
         let report = loop_.tick();
         assert_eq!(report.scanned, 1);
         assert_eq!(report.submitted, 0, "{:?}", report.last_error);
         assert!(report.skipped >= 1);
         assert!(loop_.rpc().submitted().is_empty());
-        assert!(
-            !loop_
-                .state()
-                .submit
-                .as_ref()
-                .map(|s| s.rejected.contains(&out_point_key(&intent.out_point)))
-                .unwrap_or(false)
-        );
+        assert!(!loop_
+            .state()
+            .submit
+            .as_ref()
+            .map(|s| s.rejected.contains(&out_point_key(&intent.out_point)))
+            .unwrap_or(false));
     }
 
     #[test]

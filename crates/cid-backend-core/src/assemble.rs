@@ -17,16 +17,10 @@ pub struct ExecutionSkeleton {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssembleError {
-    CapacityShortfall {
-        inputs: u64,
-        outputs: u64,
-    },
+    CapacityShortfall { inputs: u64, outputs: u64 },
     RefundUnbuildable(String),
     InvalidAssembled(String),
-    SizeLimit {
-        size: usize,
-        max: usize,
-    },
+    SizeLimit { size: usize, max: usize },
 }
 
 impl fmt::Display for AssembleError {
@@ -65,7 +59,9 @@ fn sum_output_capacity(outputs: &[CellOutput]) -> u64 {
 
 /// Parse `Process.assemble` molecule bytes into a skeleton **without** rewriting
 /// any field (byte-equal to [`AssembledTx::as_molecule_bytes`]).
-pub fn execution_from_assembled(assembled: &AssembledTx) -> Result<ExecutionSkeleton, AssembleError> {
+pub fn execution_from_assembled(
+    assembled: &AssembledTx,
+) -> Result<ExecutionSkeleton, AssembleError> {
     let bytes = assembled.as_molecule_bytes();
     let packed = ckb_types::packed::Transaction::from_slice(bytes)
         .map_err(|e| AssembleError::InvalidAssembled(format!("{e:?}")))?;
@@ -99,12 +95,18 @@ pub fn validate_assembled_tx(
 ) -> Result<(), AssembleError> {
     let size = assembled.as_molecule_bytes().len();
     if size > max_size {
-        return Err(AssembleError::SizeLimit { size, max: max_size });
+        return Err(AssembleError::SizeLimit {
+            size,
+            max: max_size,
+        });
     }
 
     let inputs = input_out_points(assembled);
     for intent in intentions {
-        if !inputs.iter().any(|op| op.as_slice() == intent.out_point.as_slice()) {
+        if !inputs
+            .iter()
+            .any(|op| op.as_slice() == intent.out_point.as_slice())
+        {
             return Err(AssembleError::InvalidAssembled(format!(
                 "missing intention input {:?}",
                 intent.out_point
@@ -323,10 +325,7 @@ mod tests {
             .build()
     }
 
-    fn valid_assembled(
-        intentions: &[ScannedIntention],
-        proc: &ResolvedProcess,
-    ) -> AssembledTx {
+    fn valid_assembled(intentions: &[ScannedIntention], proc: &ResolvedProcess) -> AssembledTx {
         let mut inputs: Vec<CellInput> = intentions
             .iter()
             .map(|i| cell_input(&i.out_point))
@@ -355,10 +354,7 @@ mod tests {
         let proc = process([0xAB; 32], 200_000_000_000);
         let intent = intention(1, proc.type_hash, 100_000_000_000);
         let inputs = vec![cell_input(&proc.live_cell.out_point)];
-        let outputs = vec![
-            beneficiary(intent.capacity),
-            proc.live_cell.output.clone(),
-        ];
+        let outputs = vec![beneficiary(intent.capacity), proc.live_cell.output.clone()];
         let assembled = pack_assembled(inputs, outputs, vec![vec![], proc.live_cell.data.clone()]);
         let err = validate_assembled_tx(&assembled, &[intent], &proc, usize::MAX).unwrap_err();
         assert!(matches!(err, AssembleError::InvalidAssembled(_)));
@@ -369,10 +365,7 @@ mod tests {
         let proc = process([0xAB; 32], 200_000_000_000);
         let intent = intention(1, proc.type_hash, 100_000_000_000);
         let inputs = vec![cell_input(&intent.out_point)];
-        let outputs = vec![
-            beneficiary(intent.capacity),
-            proc.live_cell.output.clone(),
-        ];
+        let outputs = vec![beneficiary(intent.capacity), proc.live_cell.output.clone()];
         let assembled = pack_assembled(inputs, outputs, vec![vec![], proc.live_cell.data.clone()]);
         let err = validate_assembled_tx(&assembled, &[intent], &proc, usize::MAX).unwrap_err();
         assert!(matches!(err, AssembleError::InvalidAssembled(_)));

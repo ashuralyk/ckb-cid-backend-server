@@ -2,9 +2,6 @@
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
-    use cid_backend_core::digest_loop::LoopConfig;
     use cid_backend_core::rpc::script_hash32;
     use ckb_types::prelude::*;
 
@@ -57,14 +54,14 @@ mod tests {
         let ts = process_type_script(1);
         let hash = script_hash32(&ts);
         rpc.insert_cell(intention_cell(1, hash, 100_0000_0000));
-        rpc.insert_cell(process_cell(1, 200_0000_0000, vec![0x7f, b'E', b'L', b'F', 1]));
-
-        let mut loop_ = loop_with_resolver(
-            rpc,
-            ScriptedSsri::mimic((1, 4)),
-            default_loop_config(),
+        rpc.insert_cell(process_cell(
             1,
-        );
+            200_0000_0000,
+            vec![0x7f, b'E', b'L', b'F', 1],
+        ));
+
+        let mut loop_ =
+            loop_with_resolver(rpc, ScriptedSsri::mimic((1, 4)), default_loop_config(), 1);
         assert_eq!(loop_.tick().submitted, 1);
         let tx = &loop_.rpc().submitted()[0];
         let caps: Vec<u64> = tx
@@ -74,7 +71,10 @@ mod tests {
             .collect();
         assert_eq!(caps.len(), 2);
         assert_eq!(caps[1], 100_0000_0000, "beneficiary capacity preserved");
-        assert_eq!(caps[0], 200_0000_0000, "process recreate unchanged (guest owns fee)");
+        assert_eq!(
+            caps[0], 200_0000_0000,
+            "process recreate unchanged (guest owns fee)"
+        );
     }
 
     #[test]

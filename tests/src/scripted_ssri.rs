@@ -108,7 +108,10 @@ fn is_process_state(cell: &HostCell) -> bool {
         .map(|ts| {
             let code: [u8; 32] = ts.code_hash().unpack();
             code == TYPE_ID_CODE_HASH
-                && matches!(ScriptHashType::try_from(ts.hash_type()), Ok(ScriptHashType::Type))
+                && matches!(
+                    ScriptHashType::try_from(ts.hash_type()),
+                    Ok(ScriptHashType::Type)
+                )
         })
         .unwrap_or(false)
 }
@@ -118,8 +121,8 @@ fn beneficiary_output(
     fixed_cap: Option<u64>,
 ) -> Result<(CellOutput, Vec<u8>), SsriError> {
     let lock_args: Vec<u8> = cell.output.lock().args().unpack();
-    let args = CidArgs::decode(&lock_args)
-        .map_err(|e| SsriError::Unusable(format!("cid args: {e:?}")))?;
+    let args =
+        CidArgs::decode(&lock_args).map_err(|e| SsriError::Unusable(format!("cid args: {e:?}")))?;
     let user = args.entry.user_lock;
     let lock = Script::new_builder()
         .code_hash(user.code_hash.pack())
@@ -169,7 +172,7 @@ fn mimic_assemble(
     let (proc_out, proc_data) =
         process_out.ok_or_else(|| SsriError::Unusable("no process input in draft".into()))?;
 
-  // Process recreate first (TYPE_ID continuity), then beneficiaries.
+    // Process recreate first (TYPE_ID continuity), then beneficiaries.
     let mut outputs = vec![proc_out];
     let mut outputs_data = vec![proc_data];
     outputs.extend(beneficiary_outputs);

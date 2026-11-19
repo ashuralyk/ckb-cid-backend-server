@@ -6,6 +6,7 @@ pub mod ckb_rpc;
 pub mod config;
 pub mod logging;
 pub mod observe;
+pub mod registry_api;
 
 pub use ckb_rpc::CkbRpc;
 pub use config::{
@@ -13,3 +14,4 @@ pub use config::{
     DaemonConfig,
 };
 pub use observe::{spawn_health, DaemonStats, HealthHandle};
+pub use registry_api::{spawn_registry_api, RegistryApiHandle, RegistryApiState};

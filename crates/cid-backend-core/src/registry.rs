@@ -149,9 +149,7 @@ impl From<&ProcessRegistration> for ProcessRegistrationSerde {
     fn from(r: &ProcessRegistration) -> Self {
         Self {
             identity_type_id_args: format_hex32(&r.identity_type_id_args),
-            identity_type_id: r
-                .identity_type_id
-                .map(|h| format_hex32(&h)),
+            identity_type_id: r.identity_type_id.map(|h| format_hex32(&h)),
             code_type_id_args: format_hex32(&r.code_type_id_args),
             code_type_id: r.code_type_id.map(|h| format_hex32(&h)),
         }
@@ -212,14 +210,11 @@ impl ProcessRegistry {
 
     pub fn list(&self) -> Vec<&ProcessRegistration> {
         let mut out: Vec<_> = self.by_identity.values().collect();
-        out.sort_by(|a, b| a.identity_type_id_args.cmp(&b.identity_type_id_args));
+        out.sort_by_key(|a| a.identity_type_id_args);
         out
     }
 
-    pub fn register(
-        &mut self,
-        reg: ProcessRegistration,
-    ) -> Result<RegisterOutcome, RegistryError> {
+    pub fn register(&mut self, reg: ProcessRegistration) -> Result<RegisterOutcome, RegistryError> {
         reg.validate()?;
         let key = reg.identity_type_hash();
         let outcome = match self.by_identity.get(&key) {
@@ -322,7 +317,10 @@ fn hex32(bytes: &[u8; 32]) -> String {
 }
 
 fn parse_hex32(s: &str, field: &str) -> Result<[u8; 32], RegistryError> {
-    let hex = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    let hex = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
     if hex.len() != 64 {
         return Err(RegistryError::Corrupt(format!(
             "{field}: expected 32-byte hex (64 digits), got {} chars",
@@ -334,15 +332,15 @@ fn parse_hex32(s: &str, field: &str) -> Result<[u8; 32], RegistryError> {
         if chunk.len() != 2 {
             return Err(RegistryError::Corrupt(format!("{field}: odd hex length")));
         }
-        let pair = std::str::from_utf8(chunk).map_err(|_| {
-            RegistryError::Corrupt(format!("{field}: invalid utf-8 in hex"))
-        })?;
+        let pair = std::str::from_utf8(chunk)
+            .map_err(|_| RegistryError::Corrupt(format!("{field}: invalid utf-8 in hex")))?;
         out[i] = u8::from_str_radix(pair, 16)
             .map_err(|_| RegistryError::Corrupt(format!("{field}: invalid hex")))?;
     }
     Ok(out)
 }
 
+#[cfg(test)]
 fn unique_temp_registry_path(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
         "cid-process-registry-test-{}-{}",
@@ -365,10 +363,7 @@ mod tests {
         }
     }
 
-    fn sample_reg_with_expected(
-        state_args: [u8; 32],
-        code_args: [u8; 32],
-    ) -> ProcessRegistration {
+    fn sample_reg_with_expected(state_args: [u8; 32], code_args: [u8; 32]) -> ProcessRegistration {
         ProcessRegistration {
             identity_type_id_args: state_args,
             identity_type_id: Some(type_id_script_hash(&state_args)),
@@ -414,7 +409,12 @@ mod tests {
         let r2 = sample_reg(state, [0x21; 32]);
         assert_eq!(reg.register(r1).unwrap(), RegisterOutcome::Created);
         assert_eq!(reg.register(r2.clone()).unwrap(), RegisterOutcome::Updated);
-        assert_eq!(reg.get(&type_id_script_hash(&state)).unwrap().code_type_id_args, [0x21; 32]);
+        assert_eq!(
+            reg.get(&type_id_script_hash(&state))
+                .unwrap()
+                .code_type_id_args,
+            [0x21; 32]
+        );
         let _ = fs::remove_file(&path);
     }
 
@@ -483,7 +483,11 @@ mod tests {
         let mut reg = ProcessRegistry::open(&path, DEFAULT_MAX_REGISTRY_ENTRIES).unwrap();
         reg.register(sample_reg([0x02; 32], [0x01; 32])).unwrap();
         reg.register(sample_reg([0x01; 32], [0x01; 32])).unwrap();
-        let listed: Vec<_> = reg.list().iter().map(|r| r.identity_type_id_args[0]).collect();
+        let listed: Vec<_> = reg
+            .list()
+            .iter()
+            .map(|r| r.identity_type_id_args[0])
+            .collect();
         assert_eq!(listed, vec![0x01, 0x02]);
         let _ = fs::remove_file(&path);
     }
