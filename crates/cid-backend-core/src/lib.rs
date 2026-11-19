@@ -4,6 +4,7 @@ pub mod code_deps;
 pub mod digest_loop;
 pub mod fee;
 pub mod process;
+pub mod registry;
 pub mod rpc;
 pub mod scan;
 pub mod ssri;
@@ -37,6 +38,10 @@ pub use fee::{
     RefundFeeMode, DEFAULT_FEE_RATE, MAX_FEE_RATE, MAX_REFUND_FEE,
 };
 pub use process::{ProcessEntry, ProcessResolver, ResolvedProcess};
+pub use registry::{
+    ProcessRegistration, ProcessRegistry, RegisterOutcome, RegistryError,
+    DEFAULT_MAX_REGISTRY_ENTRIES,
+};
 pub use rpc::{out_point_key, script_hash32, LiveCell, Rpc, RpcError, TxStatus};
 pub use scan::{
     bucket_by_process_type_hash, decode_cells, scan_intentions, scan_intentions_multi,
@@ -46,7 +51,7 @@ pub use ssri::{
     build_batch_draft, draft_cells_for_batch, map_executor_error, EmbeddedSsri, SsriError, SsriHost,
 };
 pub use submit::{combo_fingerprint, execution_code_key, submit_execution, PendingTx, SubmitState};
-pub use workers::{ProcessWorker, WorkerPool};
+pub use workers::{ProcessWorker, WorkerPool, WorkerRemoveError};
 pub use type_id::{
     type_id_script, type_id_script_hash, TypeIdCodeDep, TypeIdIdentity, TYPE_ID_CODE_HASH,
 };
