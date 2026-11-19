@@ -73,12 +73,24 @@ impl std::error::Error for HostQueryError {
     }
 }
 
+/// One indexer live cell with ckb-indexer order metadata.
+///
+/// Order key is `(block_number, tx_index, output_index)` — same as MockHost /
+/// ckb-indexer — so [`RpcHostQuery::get_cells`] can emit matching `tx_index`.
+#[derive(Clone, Debug)]
+pub struct IndexedLiveCell {
+    pub cell: LiveCell,
+    pub block_number: u64,
+    pub tx_index: u32,
+}
+
 /// Minimal RPC surface for host-query seeding and indexer pagination.
 /// Implement on the live CKB adapter without extending the core [`crate::rpc::Rpc`] trait.
 ///
 /// Header methods must return **packed molecule `Header` bytes** (not JSON).
 /// `get_cells_page` takes a molecule [`SearchKey`] and returns a page of live
-/// cells plus the next cursor (empty when exhausted).
+/// cells plus the next cursor (empty when exhausted). Pages must be ordered by
+/// `(block_number, tx_index, output_index)` ascending when `order=0`.
 pub trait HostQueryRpc {
     fn get_live_cell(&self, out_point: &OutPoint) -> Result<Option<LiveCell>, RpcError>;
 
@@ -94,7 +106,7 @@ pub trait HostQueryRpc {
         search_key_molecule: &[u8],
         limit: u32,
         after: &[u8],
-    ) -> Result<(Vec<LiveCell>, Vec<u8>), RpcError>;
+    ) -> Result<(Vec<IndexedLiveCell>, Vec<u8>), RpcError>;
 }
 
 /// Adapter: [`HostQueryRpc`] → executor [`HostQuery`] (all 7 syscalls).
@@ -193,15 +205,12 @@ impl<R: HostQueryRpc + ?Sized> HostQuery for RpcHostQuery<'_, R> {
             .unwrap_or(true);
         let objects: Vec<IndexerCell> = cells
             .iter()
-            .map(|cell| {
-                let block_number = 0u64;
-                IndexerCell {
-                    output: IndexerCellOutput::from(&cell.output),
-                    output_data: with_data.then(|| cell.data.clone()),
-                    out_point: IndexerOutPoint::from(&cell.out_point),
-                    block_number,
-                    tx_index: 0,
-                }
+            .map(|indexed| IndexerCell {
+                output: IndexerCellOutput::from(&indexed.cell.output),
+                output_data: with_data.then(|| indexed.cell.data.clone()),
+                out_point: IndexerOutPoint::from(&indexed.cell.out_point),
+                block_number: indexed.block_number,
+                tx_index: indexed.tx_index,
             })
             .collect();
         let pagination = Pagination {
@@ -428,7 +437,7 @@ macro_rules! impl_host_query_rpc_stubs {
                 _: &[u8],
                 _: u32,
                 _: &[u8],
-            ) -> Result<(Vec<$crate::rpc::LiveCell>, Vec<u8>), $crate::rpc::RpcError> {
+            ) -> Result<(Vec<$crate::IndexedLiveCell>, Vec<u8>), $crate::rpc::RpcError> {
                 Ok((Vec::new(), Vec::new()))
             }
         }
@@ -513,7 +522,7 @@ mod tests {
             search_key_molecule: &[u8],
             limit: u32,
             after: &[u8],
-        ) -> Result<(Vec<LiveCell>, Vec<u8>), RpcError> {
+        ) -> Result<(Vec<IndexedLiveCell>, Vec<u8>), RpcError> {
             let host = self.index.lock().unwrap().clone();
             let page = HostQuery::get_cells(&host, search_key_molecule, 0, u64::from(limit), after)
                 .map_err(|_| RpcError::Unavailable("invalid search_key".into()))?;
@@ -528,7 +537,11 @@ mod tests {
                 let Some(live) = self.cells.get(op.as_slice()) else {
                     continue;
                 };
-                cells.push(live.clone());
+                cells.push(IndexedLiveCell {
+                    cell: live.clone(),
+                    block_number: obj.block_number,
+                    tx_index: obj.tx_index,
+                });
             }
             Ok((cells, pag.last_cursor))
         }

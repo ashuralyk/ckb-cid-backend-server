@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
-use cid_backend_core::host_query::HostQueryRpc;
+use cid_backend_core::host_query::{HostQueryRpc, IndexedLiveCell};
 use cid_backend_core::rpc::{out_point_key, script_hash32, LiveCell, Rpc, RpcError, TxStatus};
-use cid_process_executor::{HostQuery, MockHost, Pagination};
+use cid_process_executor::{HostCell, HostQuery, MockHost, Pagination};
 use ckb_types::core::{ScriptHashType, TransactionView};
 use ckb_types::packed::{Byte32, Header, OutPoint, Script};
 use ckb_types::prelude::*;
@@ -31,6 +31,8 @@ struct Inner {
     headers_by_number: HashMap<u64, Vec<u8>>,
     headers_by_hash: HashMap<[u8; 32], Vec<u8>>,
     block_hashes: HashMap<u64, [u8; 32]>,
+    /// Optional indexer order metadata keyed by out_point bytes.
+    cell_index_meta: HashMap<Vec<u8>, (u64, u32)>,
 }
 
 pub struct FakeRpc {
@@ -70,13 +72,30 @@ impl FakeRpc {
         self.inner.lock().unwrap().block_hashes.insert(number, hash);
     }
 
+    /// Set indexer `(block_number, tx_index)` for `get_cells` order / metadata.
+    pub fn set_cell_index_meta(&self, out_point: &OutPoint, block_number: u64, tx_index: u32) {
+        self.inner
+            .lock()
+            .unwrap()
+            .cell_index_meta
+            .insert(out_point_key(out_point), (block_number, tx_index));
+    }
+
     fn index_host(inner: &Inner) -> MockHost {
         let host = MockHost::new();
         for cell in inner.cells.values() {
-            host.insert_cell(
+            let key = out_point_key(&cell.out_point);
+            let (block_number, tx_index) =
+                inner.cell_index_meta.get(&key).copied().unwrap_or((0, 0));
+            host.insert_cell_ex(
                 cell.out_point.clone(),
-                cell.output.clone(),
-                cell.data.clone(),
+                HostCell {
+                    output: cell.output.clone(),
+                    data: cell.data.clone(),
+                    block_hash: None,
+                    block_number: Some(block_number),
+                    tx_index: Some(tx_index),
+                },
             );
         }
         for (&number, bytes) in &inner.headers_by_number {
@@ -497,7 +516,7 @@ impl HostQueryRpc for FakeRpc {
         search_key_molecule: &[u8],
         limit: u32,
         after: &[u8],
-    ) -> Result<(Vec<LiveCell>, Vec<u8>), RpcError> {
+    ) -> Result<(Vec<IndexedLiveCell>, Vec<u8>), RpcError> {
         let inner = self.inner.lock().unwrap();
         let host = Self::index_host(&inner);
         let page = HostQuery::get_cells(&host, search_key_molecule, 0, u64::from(limit), after)
@@ -511,7 +530,11 @@ impl HostQueryRpc for FakeRpc {
                 .index(obj.out_point.index.pack())
                 .build();
             if let Some(live) = inner.cells.get(&out_point_key(&op)) {
-                cells.push(live.clone());
+                cells.push(IndexedLiveCell {
+                    cell: live.clone(),
+                    block_number: obj.block_number,
+                    tx_index: obj.tx_index,
+                });
             }
         }
         Ok((cells, pag.last_cursor))
