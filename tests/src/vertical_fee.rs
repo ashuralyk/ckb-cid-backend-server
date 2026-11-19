@@ -353,9 +353,15 @@ mod tests {
         assert_eq!(loop_.tick().submitted, 1);
         loop_.config_mut().refund_policy.fee_rate = DEFAULT_FEE_RATE;
         loop_.rpc().inject_dry_run_reject_once();
+        let dry_before = loop_.rpc().dry_run_attempts();
         let report2 = loop_.tick();
         assert_eq!(report2.submitted, 0, "{:?}", report2.last_error);
         assert!(loop_.rpc().has_cell(&bounded.out_point));
+        assert_eq!(
+            loop_.rpc().dry_run_attempts(),
+            dry_before + 1,
+            "first refund_only attempt should dry-run once"
+        );
         loop_.workers().get(&hash).unwrap().with_state(|s| {
             assert!(
                 s.isolate_expanded.is_empty(),
@@ -367,12 +373,23 @@ mod tests {
             );
         });
 
-        // Later ticks must not explode isolate attempts; cell stays live (cached).
+        // Later ticks: soft-skip via process=None refund fingerprint — no
+        // isolate_windows, no further RunBatch/dry-run, no continue_round burn.
+        let dry_cached = loop_.rpc().dry_run_attempts();
         for _ in 0..3 {
             let r = loop_.tick();
             assert_eq!(r.submitted, 0);
+            assert_eq!(
+                r.isolate_windows, 0,
+                "cached refund_only must soft-skip before isolate_windows"
+            );
             assert!(loop_.rpc().has_cell(&bounded.out_point));
         }
+        assert_eq!(
+            loop_.rpc().dry_run_attempts(),
+            dry_cached,
+            "cached refund_only must not dispatch RunBatch / dry-run again"
+        );
         assert!(loop_
             .workers()
             .get(&hash)

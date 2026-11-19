@@ -95,6 +95,17 @@ pub fn window_combo_cached(
     worker.submit.rejected_combos.contains(&fp)
 }
 
+/// Refund txs fingerprint with `process = None` (see assemble_and_submit_refund).
+pub fn refund_combo_cached(
+    worker: &ProcessWorkerState,
+    batch: &[ScannedIntention],
+    execution_code_key: &[u8],
+) -> bool {
+    let ops: Vec<_> = batch.iter().map(|i| i.out_point.clone()).collect();
+    let fp = combo_fingerprint(&ops, None, execution_code_key);
+    worker.submit.rejected_combos.contains(&fp)
+}
+
 pub fn run_process_batch<R, S>(
     rpc: Arc<R>,
     ssri: &S,
