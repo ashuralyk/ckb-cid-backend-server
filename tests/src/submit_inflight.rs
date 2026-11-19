@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use cid_backend_core::assemble::ExecutionSkeleton;
-    use cid_backend_core::rpc::{out_point_key, Rpc};
+    use cid_backend_core::rpc::out_point_key;
     use cid_backend_core::submit::{submit_execution, SubmitState};
     use ckb_types::core::{ScriptHashType, TransactionBuilder};
     use ckb_types::packed::CellInput;
@@ -34,7 +34,8 @@ mod tests {
             fee_guard: None,
         };
         let mut state = SubmitState::default();
-        let hash = submit_execution(&rpc, &skeleton, &mut state, &[op.clone()]).unwrap();
+        let hash =
+            submit_execution(&rpc, &skeleton, &mut state, std::slice::from_ref(&op)).unwrap();
         assert!(!hash.as_slice().is_empty() || hash.as_slice().len() == 32);
         assert!(state.in_flight.contains(&out_point_key(&op)));
         assert!(state.failed.is_empty());
@@ -65,7 +66,7 @@ mod tests {
                 fee_guard: None,
             },
             &mut state2,
-            &[op2.clone()],
+            std::slice::from_ref(&op2),
         )
         .unwrap_err();
         assert!(matches!(err, cid_backend_core::rpc::RpcError::Conflict(_)));

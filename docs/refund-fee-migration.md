@@ -43,17 +43,36 @@ rejection for mixed CID identities in one DigestIncompatible tx.
 
 Empty allowlist ⇒ legacy exact for every Intention. Listing a lock on the
 allowlist alone does **not** fix `-1104` against an old lock that still
-demands exact capacity.
+demands exact capacity, and **does not** make the daemon scan that lock.
+`bounded_refund_locks` selects fee mode only for identities already in the
+scan set (primary or `legacy_scan_locks`). Config load fail-closes if an
+allowlist entry is not a scanned identity.
 
 ## Enabling bounded refunds (after revised lock ships)
 
 1. Deploy the audited CID lock that enforces PR #12 rules (OWNER redeploy).
-2. Point primary `cid_lock.code_hash` / Type-ID at the **new** deployed hash.
-3. Add that identity to `[[cid_lock.bounded_refund_locks]]` (or
-   `CID_BOUNDED_REFUND_LOCKS=0x…:hash_type`). Never list undeployed candidates.
-4. Optionally list old locks under `[[cid_lock.legacy_scan_locks]]` so the
-   daemon continues draining exact-refund Intentions after redeploy.
-5. Keep `digest_ok` Process fee path unchanged (`loop.fee_rate`).
+2. Point primary CID identity at the **new** deployed lock — prefer
+   `cid_lock.type_id_args` so scan `code_hash` is the Type-ID type-script hash
+   with `hash_type=type` (CellDeps refresh across upgrades). Do not point the
+   primary at a stale binary `data_hash` on Type-ID networks.
+3. Add that **already-scanned** identity to `[[cid_lock.bounded_refund_locks]]`
+   (or `CID_BOUNDED_REFUND_LOCKS=0x…:hash_type`). Never list undeployed
+   candidates. Never use the allowlist as a scan source.
+4. List old data-hash locks under `[[cid_lock.legacy_scan_locks]]` so the
+   daemon continues draining those Intentions after redeploy; add them to
+   `bounded_refund_locks` only if that legacy lock also accepts bounded fees.
+5. **Legacy Data1/Data/Data2 code CellDep (required for drain):**
+   `legacy_scan_locks` only adds an indexer query. Assembly still attaches
+   the current Type-ID code cell (new binary) plus configured static deps.
+   After an upgrade that changes the ELF, that Type-ID cell cannot locate a
+   legacy Data1 lock (`code_hash` = old `data_hash`; see
+   [RFC 0022 code locating](https://github.com/nervosnetwork/rfcs/blob/master/rfcs/0022-transaction-structure/0022-transaction-structure.md#code-locating)).
+   Keep a **live** cell whose **exact** old bytes hash to that `data_hash`,
+   and attach it as an unlabeled `[[cell_deps]]` / `CID_EXTRA_CELL_DEPS`
+   entry (do **not** label it `cid_lock` — that conflicts with Type-ID
+   discovery for the current role). Without that dep, FakeRpc may still
+   “accept” the tx, but a real node rejects it.
+6. Keep `digest_ok` Process fee path unchanged (`loop.fee_rate`).
 
 ## Assembly rules (bounded mode)
 
