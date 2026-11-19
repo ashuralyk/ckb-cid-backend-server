@@ -61,7 +61,18 @@ allowlist entry is not a scanned identity.
 4. List old data-hash locks under `[[cid_lock.legacy_scan_locks]]` so the
    daemon continues draining those Intentions after redeploy; add them to
    `bounded_refund_locks` only if that legacy lock also accepts bounded fees.
-5. Keep `digest_ok` Process fee path unchanged (`loop.fee_rate`).
+5. **Legacy Data1/Data/Data2 code CellDep (required for drain):**
+   `legacy_scan_locks` only adds an indexer query. Assembly still attaches
+   the current Type-ID code cell (new binary) plus configured static deps.
+   After an upgrade that changes the ELF, that Type-ID cell cannot locate a
+   legacy Data1 lock (`code_hash` = old `data_hash`; see
+   [RFC 0022 code locating](https://github.com/nervosnetwork/rfcs/blob/master/rfcs/0022-transaction-structure/0022-transaction-structure.md#code-locating)).
+   Keep a **live** cell whose **exact** old bytes hash to that `data_hash`,
+   and attach it as an unlabeled `[[cell_deps]]` / `CID_EXTRA_CELL_DEPS`
+   entry (do **not** label it `cid_lock` — that conflicts with Type-ID
+   discovery for the current role). Without that dep, FakeRpc may still
+   “accept” the tx, but a real node rejects it.
+6. Keep `digest_ok` Process fee path unchanged (`loop.fee_rate`).
 
 ## Assembly rules (bounded mode)
 

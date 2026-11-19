@@ -21,7 +21,7 @@ The current implementation is the digest loop (v0) plus optional health/metrics 
 
 The daemon continuously digests CID Intentions:
 
-1. Fetch live Intentions from the indexer by CID lock `code_hash` / `hash_type` (`get_cells`, `order=asc`, paginate until exhausted). On Type-ID networks the primary identity is **`code_hash` = TYPE_ID type-script hash**, **`hash_type` = `type`** (derived from `cid_lock.type_id_args`); binary `data_hash` Intentions are scanned only via `legacy_scan_locks`.
+1. Fetch live Intentions from the indexer by CID lock `code_hash` / `hash_type` (`get_cells`, `order=asc`, paginate until exhausted). On Type-ID networks the primary identity is **`code_hash` = TYPE_ID type-script hash**, **`hash_type` = `type`** (derived from `cid_lock.type_id_args`); binary `data_hash` Intentions are scanned only via `legacy_scan_locks`. Draining those also requires an unlabeled static `[[cell_deps]]` CellDep whose live cell data is the exact old binary (Type-ID refresh alone cannot locate Data1 after an ELF upgrade — see `docs/refund-fee-migration.md`).
 2. Decode lock args to get `process_type_hash` and bucket by that hash.
 3. Resolve the matching live Process cell. SSRI binary source: **Type-ID Process code** (when `process.type_id_args` is set) uses that code-cell ELF for the tick; otherwise legacy **state-cell data** ELF (local data1). The daemon does **not** install a Process-binary fallback.
 4. In-process SSRI: `Process.batch` yields `[min, max]`; `Process.assemble` yields a partial tx.

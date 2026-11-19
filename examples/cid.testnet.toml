@@ -31,7 +31,9 @@ type_id_args = "0xdfe0a1416c7373e8aaae5257445e940b6ff08e9cbc62ebca8541d28997370f
 type_id = "0xf3f8a56c2594030f99f05b09ff1b6a1b07e6e07ed04309c1c4e246561faad326"
 # bounded_refund_locks empty = exact Incompatible refunds (safe default).
 # Allowlist entries must already be scanned (primary / legacy_scan_locks).
-# legacy_scan_locks empty = do not scan pre-Type-ID data1 Intentions
+# legacy_scan_locks empty = do not scan pre-Type-ID data1 Intentions.
+# If you later enable legacy_scan_locks for a data_hash drain, also keep that
+# old binary live and list it as an unlabeled [[cell_deps]] (not cid_lock).
 
 [process]
 # Live Process CODE cell (at fetch time):
