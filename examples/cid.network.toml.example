@@ -2,29 +2,10 @@
 # Copy, replace EVERY <PLACEHOLDER>, then:
 #   cargo run -p cid-backend-daemon -- --config /path/to/your.toml
 #
-# Placeholders are NOT valid hex / URLs. This file cannot run as-is and
-# does not target public testnet/mainnet.
+# Placeholders are NOT valid hex / URLs. This file cannot run as-is.
 #
-# network.name is a log label only. Chain identity is genesis_hash
-# (this network's get_block_hash 0x0). It is DECLARED, not verified,
-# unless validate_genesis = true (then the daemon fail-closes on mismatch
-# or RPC error).
-#
-# Contract code discovery (preferred for Type-ID / hash_type=type networks):
-#   type_id_args = 32-byte TYPE_ID type-script args on the CODE cell
-#   type_id      = optional full type-script hash (calc_script_hash of
-#                  built-in TYPE_ID + type_id_args). Fail-closed check only.
-#   NEVER put a full type_id hash into type_id_args.
-# Intention scan identity when type_id_args is set:
-#   code_hash = derived type_id, hash_type = type
-#   (NOT the binary data_hash — that only appears via legacy_scan_locks or an
-#    explicit data/data1/data2 primary for local fixtures.)
-# Live Process *state* cells are still found by process_type_hash from CID
-# args (full type script hash) + process type code_hash prefixes — that is
-# not the same as the Process CODE cell's TYPE_ID identity.
-# Daemon never loads dispatcher deployment JSON and never auto-discovers
-# from chain without these configured identities. No keys. No signing.
-# Filled testnet example: examples/cid.testnet.toml
+# Processes are registered at runtime via the HTTP API (observe.api_bind),
+# not listed under [process]. See docs/runbook.md.
 
 [network]
 name = "<NETWORK_LABEL>"
@@ -36,71 +17,25 @@ url = "<CKB_NODE_JSON_RPC_URL>"
 # indexer_url = "<CKB_INDEXER_JSON_RPC_URL>"  # omit to use url
 
 [cid_lock]
-# Type-ID deploy (preferred): set type_id_args; scan code_hash is derived;
-# hash_type is forced to type; live code CellDep refreshed each tick.
+# Type-ID deploy: type_id_args; scan code_hash derived; hash_type=type.
 type_id_args = "<CID_LOCK_TYPE_ID_ARGS_32>"
 type_id = "<CID_LOCK_TYPE_ID_FULL_HASH_32>"   # optional verify; must match derived
-# Local / fixture data-hash primary (ALLOWED without type_id_args; no auto
-# CellDep refresh for this role — use static [[cell_deps]] / CID_*_CELL_DEP):
-# code_hash = "<CID_LOCK_DATA_HASH_32>"
-# hash_type = "data1"
-# Ambiguous mixes fail closed (type_id_args + data1 hash_type; type_id without
-# type_id_args; code_hash ≠ derived type_id when both set).
-# Bounded Incompatible refund fee allowlist (≤ 0.01 CKB / Intention).
-# Empty (default) = exact refund for all locks. List ONLY audited deployed
-# identities that enforce contract PR #12 (F>=S) and that are already scanned
-# (primary or legacy_scan_locks). Allowlist never expands the scan set —
-# config load rejects entries that are not scanned identities.
-# See docs/refund-fee-migration.md.
-# [[cid_lock.bounded_refund_locks]]
-# code_hash = "<AUDITED_DEPLOYED_CID_LOCK_TYPE_ID_OR_HASH_32>"
-# hash_type = "type"
-# Optional: keep scanning legacy data-hash Intentions after Type-ID redeploy.
-# [[cid_lock.legacy_scan_locks]]
-# code_hash = "<LEGACY_CID_LOCK_DATA_HASH_32>"
-# hash_type = "data1"
-# Also keep a LIVE cell with the exact old binary bytes and list it below as
-# an unlabeled [[cell_deps]] (not label=cid_lock). Type-ID refresh alone
-# cannot resolve Data1 locks after the ELF changes — see
-# docs/refund-fee-migration.md.
 
-[process]
-# Process CODE cell Type ID (not the live Process state cell).
-type_id_args = "<PROCESS_CODE_TYPE_ID_ARGS_32>"
-type_id = "<PROCESS_CODE_TYPE_ID_FULL_HASH_32>"  # optional verify
-# Extra indexer prefixes if needed; derived type_id is auto-added when
-# type_id_args is set.
-# type_code_hashes = ["<PROCESS_TYPE_CODE_HASH_32>"]
-
-# Optional: Process *lock* code cell via Type ID (e.g. always-success on chain).
-# [process_lock]
-# type_id_args = "<PROCESS_LOCK_TYPE_ID_ARGS_32>"
-# type_id = "<PROCESS_LOCK_TYPE_ID_FULL_HASH_32>"
-
-# Static extras only (secp, xUDT, local always-success, leftover Data1 code
-# cell for legacy_scan_locks drains, etc.).
-# Do NOT set label = "cid_lock" / "process_code" / "process_lock" when that
-# role uses type_id_args — config load rejects the conflict (stale outpoints
-# after upgrades). Unlabeled extras cannot be inferred as role code cells.
-# Same outpoint with a different dep_type vs a Type-ID dep also fails closed.
+# Static extras only (secp, xUDT, always-success, …).
 # [[cell_deps]]
-# label = "xudt"
 # tx_hash = "<XUDT_CODE_CELL_TX>"
 # index = 0
 # dep_type = "code"
-# Legacy Data1 drain example (unlabeled; data must match legacy data_hash):
-# [[cell_deps]]
-# tx_hash = "<LEGACY_CID_LOCK_CODE_CELL_TX>"
-# index = 0
-# dep_type = "code"
+
+[registry]
+path = "data/process-registry.json"
+max_entries = 64
 
 [loop]
 poll_interval_secs = 5
 confirmation_depth = 24
-# Shannons per 1000 bytes (KW). digest_ok pays by reducing Process recreate
-# capacity (no fee input). Default 1000. Must be > 0 and <= 10000000.
-# fee_rate = 1000
 
 [observe]
-# health_bind = "127.0.0.1:9100"           # omit/empty disables HTTP
-log_format = "json"                        # json | pretty | text
+# health_bind = "127.0.0.1:9100"
+api_bind = "127.0.0.1:9101"
+log_format = "json"

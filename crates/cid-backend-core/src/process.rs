@@ -1,130 +1,85 @@
-use crate::rpc::{out_point_key, LiveCell, Rpc, RpcError};
+use crate::rpc::{out_point_key, script_hash32, LiveCell, Rpc, RpcError};
+use crate::type_id::{TypeIdIdentity, TYPE_ID_CODE_HASH};
 use ckb_types::core::ScriptHashType;
 use ckb_types::prelude::*;
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 pub type ProcessFallback = Box<dyn Fn(&[u8; 32], &LiveCell) -> Option<Vec<u8>> + Send + Sync>;
+
+/// Static configuration for one Process (Process-as-lock on chain).
+#[derive(Clone, Debug)]
+pub struct ProcessEntry {
+    /// `calc_script_hash` of the state cell built-in TYPE_ID type script (= Intention `process_type_hash`).
+    pub identity_type_hash: [u8; 32],
+    /// TYPE_ID args on the Process **state** cell type script.
+    pub identity: TypeIdIdentity,
+    /// TYPE_ID identity of the Process **code** cell (SSRI ELF).
+    pub code: TypeIdIdentity,
+    /// Optional local ELF fallback when the live code cell is empty/unusable.
+    pub ssri_elf_path: Option<PathBuf>,
+}
 
 #[derive(Clone, Debug)]
 pub struct ResolvedProcess {
     pub type_hash: [u8; 32],
     pub live_cell: LiveCell,
     pub binary: Vec<u8>,
+    pub code_cell: Option<LiveCell>,
 }
 
 struct CachedBinary {
-    /// Fingerprint of the SSRI source (code-cell outpoint key, or state data).
     source_key: Vec<u8>,
     binary: Vec<u8>,
 }
 
-/// How `ProcessResolver` chooses the RISC-V ELF for SSRI.
-///
-/// - [`SsriBinarySource::StateCellData`]: legacy / local data1 fixtures — ELF
-///   is the live Process **state** cell data (same bytes often also published
-///   as a code cell). Daemon production without Process Type-ID uses this.
-/// - [`SsriBinarySource::TypeIdCodeCell`]: Process **code** is discovered via
-///   Type ID; SSRI must execute the resolved code-cell bytes for the tick, and
-///   the tx CellDep must reference that same outpoint. The live Process
-///   **state** type script must use `hash_type=type` and `code_hash` equal to
-///   the derived Process code TYPE_ID script hash (fail-closed otherwise).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum SsriBinarySource {
-    #[default]
-    StateCellData,
-    TypeIdCodeCell,
-}
-
 pub struct ProcessResolver {
+    entry: ProcessEntry,
     fallback: Option<ProcessFallback>,
     binary_cache: HashMap<[u8; 32], CachedBinary>,
-    ssri_source: SsriBinarySource,
-    /// Derived TYPE_ID script hash for Process **code** (`hash_type=type`
-    /// `code_hash` expected on live Process state cells). Required in
-    /// [`SsriBinarySource::TypeIdCodeCell`] mode.
-    expected_process_type_code_hash: Option<[u8; 32]>,
-    /// Per-tick Process code snapshot when `ssri_source == TypeIdCodeCell`.
-    tick_process_code: Option<(Vec<u8>, Vec<u8>)>,
-}
-
-impl Default for ProcessResolver {
-    fn default() -> Self {
-        Self::new()
-    }
+    tick_process_code: Option<LiveCell>,
 }
 
 impl ProcessResolver {
-    pub fn new() -> Self {
+    pub fn for_entry(entry: ProcessEntry) -> Self {
+        if entry.identity_type_hash != entry.identity.type_script_hash() {
+            log::warn!("ProcessEntry identity_type_hash does not match derived state TYPE_ID hash");
+        }
         Self {
+            entry,
             fallback: None,
             binary_cache: HashMap::new(),
-            ssri_source: SsriBinarySource::StateCellData,
-            expected_process_type_code_hash: None,
             tick_process_code: None,
         }
     }
 
-    pub fn with_ssri_source(ssri_source: SsriBinarySource) -> Self {
-        Self {
-            fallback: None,
-            binary_cache: HashMap::new(),
-            ssri_source,
-            expected_process_type_code_hash: None,
-            tick_process_code: None,
-        }
+    pub fn with_fallback(mut self, fallback: ProcessFallback) -> Self {
+        self.fallback = Some(fallback);
+        self
     }
 
-    /// Type-ID Process code mode with the derived TYPE_ID script hash that
-    /// live Process **state** type scripts must reference (`code_hash`).
-    pub fn with_type_id_process_code(expected_type_code_hash: [u8; 32]) -> Self {
-        Self {
-            fallback: None,
-            binary_cache: HashMap::new(),
-            ssri_source: SsriBinarySource::TypeIdCodeCell,
-            expected_process_type_code_hash: Some(expected_type_code_hash),
-            tick_process_code: None,
-        }
+    /// Test / fixture helper: use `binary` when no Process code cell or
+    /// `ssri_elf_path` is available. Process-as-lock state cell data is never
+    /// treated as the SSRI ELF, so this always returns the provided bytes.
+    pub fn with_fallback_binary(mut self, binary: Vec<u8>) -> Self {
+        self.fallback = Some(Box::new(move |_hash, _cell| Some(binary.clone())));
+        self
     }
 
-    pub fn with_fallback(fallback: ProcessFallback) -> Self {
-        Self {
-            fallback: Some(fallback),
-            binary_cache: HashMap::new(),
-            ssri_source: SsriBinarySource::StateCellData,
-            expected_process_type_code_hash: None,
-            tick_process_code: None,
-        }
+    pub fn entry(&self) -> &ProcessEntry {
+        &self.entry
     }
 
-    pub fn with_fallback_binary(binary: Vec<u8>) -> Self {
-        Self::with_fallback(Box::new(move |_hash, cell| {
-            if looks_like_elf(&cell.data) {
-                None
-            } else {
-                Some(binary.clone())
-            }
-        }))
-    }
-
-    pub fn ssri_source(&self) -> SsriBinarySource {
-        self.ssri_source
-    }
-
-    pub fn expected_process_type_code_hash(&self) -> Option<[u8; 32]> {
-        self.expected_process_type_code_hash
-    }
-
-    /// Install (or clear) this tick's Process **code** cell snapshot.
-    /// Required when `ssri_source == TypeIdCodeCell`. Clears the binary cache
-    /// when the code outpoint changes.
     pub fn set_tick_process_code(&mut self, code: Option<&LiveCell>) {
-        let next = code.map(|c| (out_point_key(&c.out_point), c.data.clone()));
-        if self.tick_process_code.as_ref().map(|(k, _)| k.as_slice())
-            != next.as_ref().map(|(k, _)| k.as_slice())
-        {
+        let next_key = code.map(|c| out_point_key(&c.out_point));
+        let prev_key = self
+            .tick_process_code
+            .as_ref()
+            .map(|c| out_point_key(&c.out_point));
+        if next_key != prev_key {
             self.binary_cache.clear();
         }
-        self.tick_process_code = next;
+        self.tick_process_code = code.cloned();
     }
 
     pub fn resolve<R: Rpc>(
@@ -132,14 +87,37 @@ impl ProcessResolver {
         rpc: &R,
         process_type_hash: &[u8; 32],
     ) -> Result<Option<ResolvedProcess>, RpcError> {
-        let Some(cell) = rpc.get_live_process_by_type_hash(process_type_hash)? else {
+        if process_type_hash != &self.entry.identity_type_hash {
+            return Ok(None);
+        }
+        // Process-as-lock: state cell type is built-in TYPE_ID; discover by exact
+        // type script (args), not by treating process_type_hash as a type code_hash.
+        let matches = rpc.find_live_cells_by_type_script(&self.entry.identity.type_script(), 2)?;
+        if matches.is_empty() {
             log::warn!(
                 "no live Process cell for type hash {:02x?}",
                 process_type_hash
             );
             return Ok(None);
-        };
-        let source_key = self.source_key(&cell);
+        }
+        if matches.len() > 1 {
+            log::warn!(
+                "ambiguous Process state cells for type hash {:02x?} (count={})",
+                process_type_hash,
+                matches.len()
+            );
+            return Ok(None);
+        }
+        let cell = matches.into_iter().next().expect("len==1");
+        if !state_is_process_lock(&self.entry, &cell) {
+            log::warn!("live Process cell failed Process-as-lock validation");
+            return Ok(None);
+        }
+        let source_key = self
+            .tick_process_code
+            .as_ref()
+            .map(|c| out_point_key(&c.out_point))
+            .unwrap_or_default();
         let binary = match self.binary_cache.get(process_type_hash) {
             Some(cached) if cached.source_key == source_key => cached.binary.clone(),
             _ => match self.derive_binary(process_type_hash, &cell) {
@@ -163,91 +141,85 @@ impl ProcessResolver {
             type_hash: *process_type_hash,
             live_cell: cell,
             binary,
+            code_cell: self.tick_process_code.clone(),
         }))
     }
 
-    fn source_key(&self, cell: &LiveCell) -> Vec<u8> {
-        match self.ssri_source {
-            SsriBinarySource::TypeIdCodeCell => self
-                .tick_process_code
-                .as_ref()
-                .map(|(k, _)| k.clone())
-                .unwrap_or_default(),
-            SsriBinarySource::StateCellData => cell.data.clone(),
-        }
-    }
-
-    /// Fail-closed: Process state type script must use hash_type=type and
-    /// code_hash == derived Process code TYPE_ID script hash.
-    fn state_binds_to_process_code(&self, cell: &LiveCell) -> bool {
-        let Some(expected) = self.expected_process_type_code_hash else {
-            log::warn!("Type-ID Process code mode missing expected type code_hash");
-            return false;
-        };
-        let Some(ts) = cell.type_script() else {
-            log::warn!("Process state cell has no type script");
-            return false;
-        };
-        let Ok(ht) = ScriptHashType::try_from(ts.hash_type()) else {
-            log::warn!("Process state type script hash_type unreadable");
-            return false;
-        };
-        if ht != ScriptHashType::Type {
-            log::warn!(
-                "Process state type script hash_type={ht:?} (Type-ID code mode requires type)"
-            );
-            return false;
-        }
-        let code_hash: [u8; 32] = ts.code_hash().unpack();
-        if code_hash != expected {
-            log::warn!(
-                "Process state type code_hash does not match configured Process code TYPE_ID"
-            );
-            return false;
-        }
-        true
-    }
-
     fn derive_binary(&self, process_type_hash: &[u8; 32], cell: &LiveCell) -> Option<Vec<u8>> {
-        match self.ssri_source {
-            SsriBinarySource::TypeIdCodeCell => {
-                if !self.state_binds_to_process_code(cell) {
-                    return None;
-                }
-                let Some((_, data)) = &self.tick_process_code else {
-                    log::warn!(
-                        "Type-ID Process code mode but no tick process_code snapshot \
-                         (code deps refresh missing process_code?)"
-                    );
-                    return None;
-                };
-                if looks_like_elf(data) {
-                    return Some(data.clone());
-                }
-                log::warn!(
-                    "Type-ID Process code cell data is not a usable ELF ({} bytes)",
-                    data.len()
-                );
-                None
+        if let Some(code) = &self.tick_process_code {
+            if looks_like_elf(&code.data) {
+                return Some(code.data.clone());
             }
-            SsriBinarySource::StateCellData => {
-                if looks_like_elf(&cell.data) {
-                    return Some(cell.data.clone());
+            log::warn!(
+                "Process code cell data is not a usable ELF ({} bytes)",
+                code.data.len()
+            );
+        } else {
+            log::warn!("no tick Process code snapshot (code deps refresh missing process_code?)");
+        }
+        if let Some(path) = &self.entry.ssri_elf_path {
+            match std::fs::read(path) {
+                Ok(b) if looks_like_elf(&b) => return Some(b),
+                Ok(b) => {
+                    log::warn!("ssri_elf_path {:?} is not ELF ({} bytes)", path, b.len());
                 }
-                if let Some(fb) = &self.fallback {
-                    match fb(process_type_hash, cell) {
-                        Some(b) if looks_like_elf(&b) => return Some(b),
-                        _ => {
-                            log::warn!("Process cell data empty/unusable and fallback missing");
-                            return None;
-                        }
-                    }
+                Err(e) => {
+                    log::warn!("ssri_elf_path {:?} read failed: {e}", path);
                 }
-                log::warn!("Process cell data empty/unusable; no fallback installed");
-                None
             }
         }
+        if let Some(fb) = &self.fallback {
+            match fb(process_type_hash, cell) {
+                Some(b) if looks_like_elf(&b) => return Some(b),
+                _ => log::warn!("Process fallback missing or not ELF"),
+            }
+        }
+        None
     }
+}
+
+/// Process **state** cell: built-in TYPE_ID type; lock references Process code TYPE_ID (`hash_type=type`).
+pub fn state_is_process_lock(entry: &ProcessEntry, cell: &LiveCell) -> bool {
+    let Some(ts) = cell.type_script() else {
+        log::warn!("Process state cell has no type script");
+        return false;
+    };
+    let code_hash: [u8; 32] = ts.code_hash().unpack();
+    if code_hash != TYPE_ID_CODE_HASH {
+        log::warn!("Process state type is not built-in TYPE_ID");
+        return false;
+    }
+    let Ok(ht) = ScriptHashType::try_from(ts.hash_type()) else {
+        return false;
+    };
+    if ht != ScriptHashType::Type {
+        log::warn!("Process state type script hash_type={ht:?} (requires type)");
+        return false;
+    }
+    let args: Vec<u8> = ts.args().unpack();
+    if args.len() != 32 || args.as_slice() != entry.identity.args.as_slice() {
+        log::warn!("Process state TYPE_ID args do not match configured identity");
+        return false;
+    }
+    if script_hash32(&ts) != entry.identity_type_hash {
+        log::warn!("Process state type hash does not match identity_type_hash");
+        return false;
+    }
+    let lock = cell.lock();
+    let lock_code: [u8; 32] = lock.code_hash().unpack();
+    let expected_lock = entry.code.type_script_hash();
+    if lock_code != expected_lock {
+        log::warn!("Process lock code_hash does not match Process code TYPE_ID");
+        return false;
+    }
+    let Ok(lock_ht) = ScriptHashType::try_from(lock.hash_type()) else {
+        return false;
+    };
+    if lock_ht != ScriptHashType::Type {
+        log::warn!("Process lock hash_type={lock_ht:?} (requires type)");
+        return false;
+    }
+    true
 }
 
 fn looks_like_elf(data: &[u8]) -> bool {
@@ -258,9 +230,10 @@ fn looks_like_elf(data: &[u8]) -> bool {
 mod tests {
     use super::*;
     use crate::rpc::{LiveCell, Rpc, RpcError, TxStatus};
-    use crate::type_id::type_id_script_hash;
+    use crate::type_id::{type_id_script, type_id_script_hash};
     use ckb_types::core::{ScriptHashType, TransactionView};
-    use ckb_types::packed::{Byte32, CellOutput, OutPoint, Script};
+    use ckb_types::packed::Script;
+    use ckb_types::packed::{Byte32, CellOutput, OutPoint};
     use std::cell::RefCell;
 
     struct TestRpc {
@@ -283,10 +256,25 @@ mod tests {
         }
         fn find_live_cells_by_type_script(
             &self,
-            _: &Script,
-            _: usize,
+            type_script: &Script,
+            max_results: usize,
         ) -> Result<Vec<LiveCell>, RpcError> {
-            Ok(Vec::new())
+            let want = script_hash32(type_script);
+            let mut out = Vec::new();
+            if let Some(cell) = self.cell.borrow().clone() {
+                if cell
+                    .type_script()
+                    .map(|ts| script_hash32(&ts) == want)
+                    .unwrap_or(false)
+                {
+                    out.push(cell);
+                }
+            }
+            out.truncate(max_results);
+            Ok(out)
+        }
+        fn dry_run_transaction(&self, _tx: &TransactionView) -> Result<(), RpcError> {
+            Ok(())
         }
         fn submit_transaction(&self, _tx: &TransactionView) -> Result<Byte32, RpcError> {
             Err(RpcError::Unavailable("no".into()))
@@ -299,8 +287,23 @@ mod tests {
         }
     }
 
-    fn process_cell_with_type(ts: Script, data: Vec<u8>) -> ([u8; 32], LiveCell) {
-        let hash = crate::rpc::script_hash32(&ts);
+    fn test_entry(state_args: [u8; 32], code_args: [u8; 32]) -> ProcessEntry {
+        ProcessEntry {
+            identity_type_hash: type_id_script_hash(&state_args),
+            identity: TypeIdIdentity::new(state_args),
+            code: TypeIdIdentity::new(code_args),
+            ssri_elf_path: None,
+        }
+    }
+
+    fn process_state_cell(entry: &ProcessEntry, data: Vec<u8>) -> ([u8; 32], LiveCell) {
+        let hash = entry.identity_type_hash;
+        let lock = Script::new_builder()
+            .code_hash(entry.code.type_script_hash().pack())
+            .hash_type(ScriptHashType::Type.into())
+            .args(Vec::<u8>::new().pack())
+            .build();
+        let ts = type_id_script(&entry.identity.args);
         let op = OutPoint::new_builder()
             .tx_hash(Byte32::from_slice(&[0x77; 32]).unwrap())
             .index(0u32.pack())
@@ -309,27 +312,12 @@ mod tests {
             out_point: op,
             output: CellOutput::new_builder()
                 .capacity(500_0000_0000u64.pack())
-                .lock(
-                    Script::new_builder()
-                        .code_hash([0u8; 32].pack())
-                        .hash_type(ScriptHashType::Type.into())
-                        .args(Vec::<u8>::new().pack())
-                        .build(),
-                )
+                .lock(lock)
                 .type_(Some(ts).pack())
                 .build(),
             data,
         };
         (hash, cell)
-    }
-
-    fn process_cell(data: Vec<u8>) -> ([u8; 32], LiveCell) {
-        let ts = Script::new_builder()
-            .code_hash([0x51u8; 32].pack())
-            .hash_type(ScriptHashType::Type.into())
-            .args([0xABu8; 32].to_vec().pack())
-            .build();
-        process_cell_with_type(ts, data)
     }
 
     fn code_live(tx_byte: u8, data: Vec<u8>) -> LiveCell {
@@ -353,55 +341,157 @@ mod tests {
     }
 
     #[test]
-    fn resolve_uses_live_cell_data_when_non_empty() {
-        let (hash, cell) = process_cell(vec![0x7f, b'E', b'L', b'F', 0x01]);
+    fn resolve_uses_code_cell_elf_not_state_data() {
+        let entry = test_entry([0xab; 32], [0xcd; 32]);
+        let (hash, state) = process_state_cell(&entry, vec![0x7f, b'E', b'L', b'F', 0xAA]);
+        let code = code_live(0x10, vec![0x7f, b'E', b'L', b'F', 0xBB]);
         let rpc = TestRpc {
-            cell: RefCell::new(Some(cell)),
+            cell: RefCell::new(Some(state)),
         };
-        let mut resolver = ProcessResolver::new();
+        let mut resolver = ProcessResolver::for_entry(entry);
+        resolver.set_tick_process_code(Some(&code));
         let got = resolver.resolve(&rpc, &hash).unwrap().expect("resolved");
-        assert_eq!(got.binary, vec![0x7f, b'E', b'L', b'F', 0x01]);
+        assert_eq!(got.binary, vec![0x7f, b'E', b'L', b'F', 0xBB]);
         assert_eq!(got.type_hash, hash);
+        assert!(got.code_cell.is_some());
     }
 
     #[test]
-    fn resolve_skips_missing_and_empty_without_fallback() {
-        let rpc = TestRpc {
-            cell: RefCell::new(None),
+    fn resolve_skips_ambiguous_process_state_cells() {
+        let entry = test_entry([0xab; 32], [0xcd; 32]);
+        let (hash, cell_a) = process_state_cell(&entry, vec![]);
+        let mut cell_b = cell_a.clone();
+        cell_b.out_point = OutPoint::new_builder()
+            .tx_hash(Byte32::from_slice(&[0x78; 32]).unwrap())
+            .index(1u32.pack())
+            .build();
+        struct AmbiguousRpc {
+            cells: Vec<LiveCell>,
+        }
+        impl Rpc for AmbiguousRpc {
+            fn list_live_intentions(
+                &self,
+                _: &[u8; 32],
+                _: ScriptHashType,
+            ) -> Result<Vec<LiveCell>, RpcError> {
+                Ok(vec![])
+            }
+            fn get_live_process_by_type_hash(
+                &self,
+                _: &[u8; 32],
+            ) -> Result<Option<LiveCell>, RpcError> {
+                Ok(None)
+            }
+            fn find_live_cells_by_type_script(
+                &self,
+                type_script: &Script,
+                max_results: usize,
+            ) -> Result<Vec<LiveCell>, RpcError> {
+                let want = script_hash32(type_script);
+                Ok(self
+                    .cells
+                    .iter()
+                    .filter(|c| {
+                        c.type_script()
+                            .map(|ts| script_hash32(&ts) == want)
+                            .unwrap_or(false)
+                    })
+                    .take(max_results)
+                    .cloned()
+                    .collect())
+            }
+            fn dry_run_transaction(&self, _: &TransactionView) -> Result<(), RpcError> {
+                Ok(())
+            }
+            fn submit_transaction(&self, _: &TransactionView) -> Result<Byte32, RpcError> {
+                Err(RpcError::Unavailable("no".into()))
+            }
+            fn get_transaction_status(&self, _: &Byte32) -> Result<TxStatus, RpcError> {
+                Err(RpcError::Unavailable("no".into()))
+            }
+            fn tip_block_number(&self) -> Result<u64, RpcError> {
+                Ok(0)
+            }
+        }
+        let code = code_live(0x10, vec![0x7f, b'E', b'L', b'F']);
+        let rpc = AmbiguousRpc {
+            cells: vec![cell_a, cell_b],
         };
-        let mut resolver = ProcessResolver::new();
-        assert!(resolver.resolve(&rpc, &[0x11; 32]).unwrap().is_none());
-
-        let (hash, cell) = process_cell(vec![]);
-        *rpc.cell.borrow_mut() = Some(cell);
+        let mut resolver = ProcessResolver::for_entry(entry);
+        resolver.set_tick_process_code(Some(&code));
         assert!(resolver.resolve(&rpc, &hash).unwrap().is_none());
     }
 
     #[test]
-    fn fallback_used_when_live_data_not_elf() {
-        let (hash, cell) = process_cell(vec![0x00, 0x01]);
+    fn resolve_skips_missing_and_wrong_identity_hash() {
+        let entry = test_entry([0x11; 32], [0x22; 32]);
         let rpc = TestRpc {
-            cell: RefCell::new(Some(cell)),
+            cell: RefCell::new(None),
         };
-        let mut resolver = ProcessResolver::with_fallback_binary(vec![0x7f, b'E', b'L', b'F']);
+        let mut resolver = ProcessResolver::for_entry(entry);
+        assert!(resolver.resolve(&rpc, &[0x11; 32]).unwrap().is_none());
+
+        let wrong_entry = test_entry([0x33; 32], [0x44; 32]);
+        let (_, cell) = process_state_cell(&wrong_entry, vec![]);
+        *rpc.cell.borrow_mut() = Some(cell);
+        assert!(resolver.resolve(&rpc, &[0x99; 32]).unwrap().is_none());
+    }
+
+    #[test]
+    fn resolve_skips_when_state_not_process_lock() {
+        let entry = test_entry([0xcf; 32], [0xd0; 32]);
+        let (hash, mut state) = process_state_cell(&entry, vec![]);
+        // Wrong lock: data hash instead of Process code TYPE_ID
+        let bad_lock = Script::new_builder()
+            .code_hash([0x99u8; 32].pack())
+            .hash_type(ScriptHashType::Type.into())
+            .args(Vec::<u8>::new().pack())
+            .build();
+        state.output = CellOutput::new_builder()
+            .capacity(state.capacity().pack())
+            .lock(bad_lock)
+            .type_(state.type_script().pack())
+            .build();
+        let code = code_live(0x10, vec![0x7f, b'E', b'L', b'F']);
+        let rpc = TestRpc {
+            cell: RefCell::new(Some(state)),
+        };
+        let mut resolver = ProcessResolver::for_entry(entry);
+        resolver.set_tick_process_code(Some(&code));
+        assert!(resolver.resolve(&rpc, &hash).unwrap().is_none());
+    }
+
+    #[test]
+    fn fallback_used_when_code_cell_not_elf() {
+        let entry = test_entry([0x51; 32], [0x52; 32]);
+        let (hash, state) = process_state_cell(&entry, vec![]);
+        let code = code_live(0x10, vec![0x00, 0x01]);
+        let rpc = TestRpc {
+            cell: RefCell::new(Some(state)),
+        };
+        let mut resolver =
+            ProcessResolver::for_entry(entry).with_fallback_binary(vec![0x7f, b'E', b'L', b'F']);
+        resolver.set_tick_process_code(Some(&code));
         let got = resolver.resolve(&rpc, &hash).unwrap().expect("fallback");
         assert_eq!(got.binary, vec![0x7f, b'E', b'L', b'F']);
     }
 
     #[test]
     fn resolve_refetches_live_cell_out_point_after_recreate() {
-        let (hash, cell) = process_cell(vec![0x7f, b'E', b'L', b'F', 0x01]);
+        let entry = test_entry([0xaa; 32], [0xbb; 32]);
+        let (hash, cell) = process_state_cell(&entry, vec![]);
+        let code = code_live(0x21, vec![0x7f, b'E', b'L', b'F', 0x01]);
         let rpc = TestRpc {
             cell: RefCell::new(Some(cell.clone())),
         };
-        let mut resolver = ProcessResolver::new();
+        let mut resolver = ProcessResolver::for_entry(entry);
+        resolver.set_tick_process_code(Some(&code));
         let first = resolver.resolve(&rpc, &hash).unwrap().unwrap();
         let mut cell2 = cell;
         cell2.out_point = OutPoint::new_builder()
             .tx_hash(Byte32::from_slice(&[0x88; 32]).unwrap())
             .index(1u32.pack())
             .build();
-        cell2.data = vec![0x7f, b'E', b'L', b'F', 0x01];
         *rpc.cell.borrow_mut() = Some(cell2.clone());
         let second = resolver.resolve(&rpc, &hash).unwrap().unwrap();
         assert_eq!(second.live_cell.out_point, cell2.out_point);
@@ -409,117 +499,15 @@ mod tests {
     }
 
     #[test]
-    fn resolve_uses_updated_live_data_for_same_type_hash() {
-        let (hash, cell) = process_cell(vec![0x7f, b'E', b'L', b'F', 0x01]);
-        let rpc = TestRpc {
-            cell: RefCell::new(Some(cell)),
-        };
-        let mut resolver = ProcessResolver::new();
-        let first = resolver.resolve(&rpc, &hash).unwrap().unwrap();
-        assert_eq!(first.binary, vec![0x7f, b'E', b'L', b'F', 0x01]);
-        let (_, cell2) = process_cell(vec![0x7f, b'E', b'L', b'F', 0x02]);
-        *rpc.cell.borrow_mut() = Some(cell2);
-        let second = resolver.resolve(&rpc, &hash).unwrap().unwrap();
-        assert_eq!(second.binary, vec![0x7f, b'E', b'L', b'F', 0x02]);
-    }
-
-    #[test]
-    fn resolve_skips_when_live_data_changes_from_elf_to_non_elf_without_fallback() {
-        let (hash, cell) = process_cell(vec![0x7f, b'E', b'L', b'F', 0x01]);
-        let rpc = TestRpc {
-            cell: RefCell::new(Some(cell)),
-        };
-        let mut resolver = ProcessResolver::new();
-        assert!(resolver.resolve(&rpc, &hash).unwrap().is_some());
-        let (_, cell2) = process_cell(vec![0x00]);
-        *rpc.cell.borrow_mut() = Some(cell2);
-        assert!(resolver.resolve(&rpc, &hash).unwrap().is_none());
-    }
-
-    #[test]
-    fn resolve_fallback_when_live_data_changes_from_elf_to_non_elf() {
-        let (hash, cell) = process_cell(vec![0x7f, b'E', b'L', b'F', 0x01]);
-        let rpc = TestRpc {
-            cell: RefCell::new(Some(cell)),
-        };
-        let mut resolver =
-            ProcessResolver::with_fallback_binary(vec![0x7f, b'E', b'L', b'F', 0xFB]);
-        let first = resolver.resolve(&rpc, &hash).unwrap().unwrap();
-        assert_eq!(first.binary, vec![0x7f, b'E', b'L', b'F', 0x01]);
-        let (_, cell2) = process_cell(vec![0x00]);
-        *rpc.cell.borrow_mut() = Some(cell2);
-        let second = resolver.resolve(&rpc, &hash).unwrap().unwrap();
-        assert_eq!(second.binary, vec![0x7f, b'E', b'L', b'F', 0xFB]);
-    }
-
-    #[test]
-    fn type_id_mode_uses_code_cell_not_divergent_state_elf() {
-        let args = [0xcd; 32];
-        let expected = type_id_script_hash(&args);
-        let ts = Script::new_builder()
-            .code_hash(expected.pack())
-            .hash_type(ScriptHashType::Type.into())
-            .args([0x01u8; 32].to_vec().pack())
-            .build();
-        let (hash, state) = process_cell_with_type(ts, vec![0x7f, b'E', b'L', b'F', 0xAA]);
-        let code = code_live(0x10, vec![0x7f, b'E', b'L', b'F', 0xBB]);
-        let rpc = TestRpc {
-            cell: RefCell::new(Some(state)),
-        };
-        let mut resolver = ProcessResolver::with_type_id_process_code(expected);
-        resolver.set_tick_process_code(Some(&code));
-        let got = resolver.resolve(&rpc, &hash).unwrap().expect("resolved");
-        assert_eq!(got.binary, vec![0x7f, b'E', b'L', b'F', 0xBB]);
-    }
-
-    #[test]
-    fn type_id_mode_rejects_state_with_wrong_code_hash() {
-        let expected = type_id_script_hash(&[0xcd; 32]);
-        let (hash, state) = process_cell(vec![0x7f, b'E', b'L', b'F', 0xAA]); // code_hash 0x51…
-        let code = code_live(0x10, vec![0x7f, b'E', b'L', b'F', 0xBB]);
-        let rpc = TestRpc {
-            cell: RefCell::new(Some(state)),
-        };
-        let mut resolver = ProcessResolver::with_type_id_process_code(expected);
-        resolver.set_tick_process_code(Some(&code));
-        assert!(resolver.resolve(&rpc, &hash).unwrap().is_none());
-    }
-
-    #[test]
-    fn type_id_mode_rejects_state_with_wrong_hash_type() {
-        let args = [0xce; 32];
-        let expected = type_id_script_hash(&args);
-        let ts = Script::new_builder()
-            .code_hash(expected.pack())
-            .hash_type(ScriptHashType::Data1.into())
-            .args([0x01u8; 32].to_vec().pack())
-            .build();
-        let (hash, state) = process_cell_with_type(ts, vec![0x00]);
-        let code = code_live(0x11, vec![0x7f, b'E', b'L', b'F', 0xBB]);
-        let rpc = TestRpc {
-            cell: RefCell::new(Some(state)),
-        };
-        let mut resolver = ProcessResolver::with_type_id_process_code(expected);
-        resolver.set_tick_process_code(Some(&code));
-        assert!(resolver.resolve(&rpc, &hash).unwrap().is_none());
-    }
-
-    #[test]
     fn type_id_mode_cache_invalidates_on_code_outpoint_change() {
-        let args = [0xcf; 32];
-        let expected = type_id_script_hash(&args);
-        let ts = Script::new_builder()
-            .code_hash(expected.pack())
-            .hash_type(ScriptHashType::Type.into())
-            .args([0x02u8; 32].to_vec().pack())
-            .build();
-        let (hash, state) = process_cell_with_type(ts, vec![0x00]);
+        let entry = test_entry([0xcf; 32], [0xd1; 32]);
+        let (hash, state) = process_state_cell(&entry, vec![]);
         let code_v1 = code_live(0x21, vec![0x7f, b'E', b'L', b'F', 0x01]);
         let code_v2 = code_live(0x22, vec![0x7f, b'E', b'L', b'F', 0x02]);
         let rpc = TestRpc {
             cell: RefCell::new(Some(state)),
         };
-        let mut resolver = ProcessResolver::with_type_id_process_code(expected);
+        let mut resolver = ProcessResolver::for_entry(entry);
         resolver.set_tick_process_code(Some(&code_v1));
         assert_eq!(
             resolver
@@ -544,18 +532,37 @@ mod tests {
 
     #[test]
     fn type_id_mode_without_tick_snapshot_skips() {
-        let args = [0xd0; 32];
-        let expected = type_id_script_hash(&args);
-        let ts = Script::new_builder()
-            .code_hash(expected.pack())
-            .hash_type(ScriptHashType::Type.into())
-            .args([0x03u8; 32].to_vec().pack())
-            .build();
-        let (hash, state) = process_cell_with_type(ts, vec![0x7f, b'E', b'L', b'F', 0x01]);
+        let entry = test_entry([0xd0; 32], [0xd2; 32]);
+        let (hash, state) = process_state_cell(&entry, vec![]);
         let rpc = TestRpc {
             cell: RefCell::new(Some(state)),
         };
-        let mut resolver = ProcessResolver::with_type_id_process_code(expected);
+        let mut resolver = ProcessResolver::for_entry(entry);
+        assert!(resolver.resolve(&rpc, &hash).unwrap().is_none());
+    }
+
+    #[test]
+    fn state_is_process_lock_rejects_wrong_type_code_hash() {
+        let entry = test_entry([0xee; 32], [0xff; 32]);
+        let (hash, state) = process_state_cell(&entry, vec![]);
+        let mut bad = state.clone();
+        let ts = Script::new_builder()
+            .code_hash([0x51u8; 32].pack())
+            .hash_type(ScriptHashType::Type.into())
+            .args(entry.identity.args.to_vec().pack())
+            .build();
+        bad.output = CellOutput::new_builder()
+            .capacity(bad.capacity().pack())
+            .lock(bad.lock())
+            .type_(Some(ts).pack())
+            .build();
+        assert!(!state_is_process_lock(&entry, &bad));
+        let code = code_live(0x11, vec![0x7f, b'E', b'L', b'F']);
+        let rpc = TestRpc {
+            cell: RefCell::new(Some(bad)),
+        };
+        let mut resolver = ProcessResolver::for_entry(entry);
+        resolver.set_tick_process_code(Some(&code));
         assert!(resolver.resolve(&rpc, &hash).unwrap().is_none());
     }
 }

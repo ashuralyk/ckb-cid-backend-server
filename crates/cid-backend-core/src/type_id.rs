@@ -1,13 +1,15 @@
-//! Built-in CKB TYPE_ID helpers for **code-cell** discovery.
+//! Built-in CKB TYPE_ID helpers for **code-cell** discovery and Process-as-lock state.
 //!
 //! Distinctions (do not conflate):
-//! - `type_id_args`: 32-byte args of the code cell's TYPE_ID **type script**.
+//! - `type_id_args`: 32-byte args of a cell's TYPE_ID **type script**.
 //! - `type_id` (full hash): `calc_script_hash` of that TYPE_ID type script —
-//!   the value used as `code_hash` when other cells reference the binary with
+//!   used as `code_hash` when other cells reference the binary with
 //!   `hash_type = type`. Optional config field for fail-closed verification.
-//! - Live Process **state** cell type script / CID `process_type_hash`: a
-//!   different script that usually points at the Process **code** via the
-//!   derived `type_id` above; not the same as code-cell TYPE_ID args.
+//! - **Process-as-lock:** the live Process **state** cell uses built-in
+//!   [`TYPE_ID_CODE_HASH`] + `hash_type = type` on its **type** script; that
+//!   type-script hash is the Intention `process_type_hash`. Its **lock** uses
+//!   `code_hash` = the Process **code** cell's TYPE_ID type-script hash
+//!   (`hash_type = type`), not the state payload as SSRI binary.
 
 use ckb_types::core::ScriptHashType;
 use ckb_types::packed::{Byte32, Script};

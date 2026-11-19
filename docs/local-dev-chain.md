@@ -7,7 +7,7 @@ Isolated **dev** chain only. No testnet, mainnet, or public RPC.
 | Component | Pin |
 |-----------|-----|
 | CKB node | `v0.119.0` (matches workspace `ckb-types` 0.119) |
-| Dispatcher / Process example / CID lock | `d9ee77805f7ac930ab149648bed70f484a9886de` |
+| Dispatcher / Process example / CID lock | `5ea581fad5922ad0e4104d99757be143ee6706f8` |
 
 ## What is HTTP-mock vs real chain
 
@@ -42,7 +42,7 @@ Success prints `local-chain execution tx committed:` and `local-chain closure ok
 | `CID_LOCK_CELL_DEP` | optional; needed at run | `<tx_hash>:<index>` CID lock code cell (`DepType::Code`) |
 | `CID_PROCESS_CODE_CELL_DEP` | optional; needed at run | Process type code cell |
 | `CID_PROCESS_LOCK_CELL_DEP` | optional; needed at run | Process lock code cell (local-chain: always-success) |
-| `CID_PROCESS_CODE_HASH` | optional; needed at run | Process type script **code_hash** used as indexer type prefix (must match that type's `hash_type`; data1 local-chain uses ELF data hash). CID args store `calc_script_hash`, not this prefix |
+| `CID_PROCESS_CODE_HASH` | deprecated | Ignored; register Processes via registry API |
 | `CID_EXTRA_CELL_DEPS` | optional | Extra `tx_hash:index` list |
 | `CID_HEALTH_BIND` | optional | Opt-in health/stats HTTP (`docs/observability.md`) |
 | `CID_CONFIRMATION_DEPTH` | optional | Blocks before a committed execution tx is settled (default 24; see `docs/confirmation.md`) |
@@ -58,7 +58,7 @@ Production/dev operators may put the same public RPC / Type-ID / static cell-dep
 
 **Operator path after a Type-ID redeploy (not this local fixture):** list old Data / Data1 / Data2 Intentions under `legacy_scan_locks` / `CID_LEGACY_SCAN_LOCKS` so the indexer still finds them. That setting is **scan-only**. Assembly still attaches the **current** Type-ID code cell (new bytes) plus static extras; after an ELF change that Type-ID cell cannot locate a legacy data-hash lock. Keep a **live** cell whose **exact** old binary hashes to that `data_hash`, and attach it as an **unlabeled** `[[cell_deps]]` / `CID_EXTRA_CELL_DEPS` entry (do **not** use `label = "cid_lock"` — labeled role deps conflict with Type-ID for the same role). Full steps: [`docs/refund-fee-migration.md`](refund-fee-migration.md) (step 5). See `examples/cid.testnet.toml` / `examples/cid.network.toml.example` for Type-ID config shape.
 
-`assemble` uses the tick's merged CellDeps (Type-ID resolved + static; same-outpoint dep_type conflicts fail closed). Confirmation/reorg reconciliation runs even if Type-ID refresh fails. `CkbRpc` uses `CID_PROCESS_CODE_HASH` (and auto-derived Process code `type_id` when configured) as a type-script prefix, then filters `calc_script_hash`.
+`assemble` uses the tick's merged CellDeps (Type-ID resolved + static; same-outpoint dep_type conflicts fail closed). Confirmation/reorg reconciliation runs even if Type-ID refresh fails. Process state is resolved from the on-disk registry (exact TYPE_ID type script per entry).
 
 State is memory-only. Restarting the daemon drops in-flight occupancy and full-rescans indexer `asc`.
 
@@ -67,4 +67,4 @@ State is memory-only. Restarting the daemon drops in-flight occupancy and full-r
 - **`min_fee_rate = 0`** on the node. No fee input (D8); `digest_ok` still overpays from Process when `loop.fee_rate > 0`. Local fixture keeps an empty bounded-refund allowlist so pinned lock rules still clear exact refunds.
 - Process cell **data is the RISC-V ELF** so `ProcessResolver` (D4) can SSRI it; the same ELF is also a code cell so the Process **type** script can execute (`hash_type = data1`).
 - Process **lock** is always-success so the daemon does not hold secp keys (no post-Intention signatures).
-- Lookup of live Process cells uses `CID_PROCESS_CODE_HASH` as the Process type's `code_hash` indexer prefix, then filters `calc_script_hash`. On this local chain that prefix is the Process ELF data hash because the type uses `hash_type = data1`.
+- Register each Process with `POST /v1/processes` after deploy; the worker discovers live state cells by exact TYPE_ID args from that entry.

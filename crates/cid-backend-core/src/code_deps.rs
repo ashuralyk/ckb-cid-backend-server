@@ -260,6 +260,10 @@ mod tests {
                 .collect())
         }
 
+        fn dry_run_transaction(&self, _: &TransactionView) -> Result<(), RpcError> {
+            Ok(())
+        }
+
         fn submit_transaction(&self, _: &TransactionView) -> Result<Byte32, RpcError> {
             unreachable!()
         }
