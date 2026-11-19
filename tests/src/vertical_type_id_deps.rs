@@ -17,8 +17,8 @@ mod tests {
 
     use crate::fake_rpc::FakeRpc;
     use crate::helpers::{
-        intention_cell, intention_cell_with_lock, process_cell, process_cell_for_code,
-        process_type_script, process_type_script_for_code, CID_CODE,
+        intention_cell, intention_cell_with_lock, live_cell, lock_script, out_point, process_cell,
+        process_cell_for_code, process_type_script, process_type_script_for_code, CID_CODE,
     };
     use crate::scripted_ssri::ScriptedSsri;
 
@@ -42,6 +42,29 @@ mod tests {
             output,
             data,
         }
+    }
+
+    /// Live leftover binary for Data1 code locating (RFC 0022). Not a Type-ID cell.
+    fn legacy_data1_code_cell(
+        tx_byte: u8,
+        data: Vec<u8>,
+    ) -> (cid_backend_core::rpc::LiveCell, [u8; 32]) {
+        let data_hash = ckb_hash::blake2b_256(&data);
+        let cell = live_cell(
+            out_point(tx_byte, 0),
+            lock_script([0x98; 32], ScriptHashType::Type, vec![]),
+            None,
+            1_000_0000_0000,
+            data,
+        );
+        (cell, data_hash)
+    }
+
+    fn legacy_data1_cell_dep(cell: &cid_backend_core::rpc::LiveCell) -> CellDep {
+        CellDep::new_builder()
+            .out_point(cell.out_point.clone())
+            .dep_type(DepType::Code.into())
+            .build()
     }
 
     fn cfg(type_id_code_deps: Vec<TypeIdCodeDep>, extra: Vec<CellDep>) -> LoopConfig {
@@ -781,11 +804,14 @@ mod tests {
 
     /// Data1 (binary data_hash) Intentions are not scanned under a Type-ID
     /// primary identity unless listed in `extra_scan_locks` / legacy_scan_locks.
+    /// Drain also needs a static CellDep whose data is the exact old binary
+    /// (Type-ID code cell alone cannot locate Data1 after an ELF upgrade).
     #[test]
     fn data1_intention_ignored_unless_legacy_scan_locks() {
         let cid_args = [0xc5; 32];
         let cid_lock_hash = type_id_script_hash(&cid_args);
-        let legacy_data_hash = [0xd1; 32];
+        let legacy_bytes = vec![0x7f, b'E', b'L', b'F', 0xd1, 0x01];
+        let (legacy_code, legacy_data_hash) = legacy_data1_code_cell(0x8a, legacy_bytes);
         let rpc = FakeRpc::new();
         let ts = process_type_script(23);
         let hash = script_hash32(&ts);
@@ -802,7 +828,10 @@ mod tests {
             200_0000_0000,
             vec![0x7f, b'E', b'L', b'F', 23],
         ));
-        rpc.insert_cell(code_cell(0x86, cid_args, vec![0x7f, b'E', b'L', b'F']));
+        // Current Type-ID binary differs from legacy_bytes (upgrade case).
+        let type_id_code = code_cell(0x86, cid_args, vec![0x7f, b'E', b'L', b'F', 0xff]);
+        rpc.insert_cell(type_id_code.clone());
+        rpc.insert_cell(legacy_code.clone());
 
         let mut loop_ = DigestLoop::new(
             rpc,
@@ -826,11 +855,21 @@ mod tests {
             legacy_data_hash,
             ScriptHashType::Data1,
         )];
+        loop_.config_mut().extra_cell_deps = vec![legacy_data1_cell_dep(&legacy_code)];
         // Keep primary type-ref for CellDep; legacy identity unlocks the scan.
         assert_eq!(loop_.config().cid_code_hash, cid_lock_hash);
         let report2 = loop_.tick();
         assert_eq!(report2.submitted, 1, "{:?}", report2.last_error);
         assert!(!loop_.rpc().has_cell(&data1_intent.out_point));
+        let deps: Vec<_> = loop_.rpc().submitted()[0].cell_deps().into_iter().collect();
+        assert!(
+            deps.iter().any(|d| d.out_point() == legacy_code.out_point),
+            "submitted tx must include the leftover Data1 code CellDep; deps={deps:?}"
+        );
+        assert!(
+            deps.iter().any(|d| d.out_point() == type_id_code.out_point),
+            "Type-ID current code dep must still be present"
+        );
     }
 
     /// `bounded_refund_locks` must not expand the scan set: a data1 identity
@@ -893,12 +932,14 @@ mod tests {
     }
 
     /// data1 in both legacy scan + bounded allowlist → scanned with Bounded fee.
+    /// Legacy binary CellDep must be present for real Data1 code locating.
     #[test]
     fn data1_legacy_and_bounded_refund_uses_bounded_mode() {
         use cid_backend_core::{fee_for_size, tx_size_in_block, CidLockIdentity};
 
         let cid_args = [0xc7; 32];
-        let legacy_data_hash = [0xd3; 32];
+        let legacy_bytes = vec![0x7f, b'E', b'L', b'F', 0xd3, 0x02];
+        let (legacy_code, legacy_data_hash) = legacy_data1_code_cell(0x8b, legacy_bytes);
         let rpc = FakeRpc::new();
         let ts = process_type_script(25);
         let hash = script_hash32(&ts);
@@ -916,7 +957,12 @@ mod tests {
             200_0000_0000,
             vec![0x7f, b'E', b'L', b'F', 25],
         ));
-        rpc.insert_cell(code_cell(0x88, cid_args, vec![0x7f, b'E', b'L', b'F']));
+        rpc.insert_cell(code_cell(
+            0x88,
+            cid_args,
+            vec![0x7f, b'E', b'L', b'F', 0xee],
+        ));
+        rpc.insert_cell(legacy_code.clone());
 
         let legacy = CidLockIdentity::new(legacy_data_hash, ScriptHashType::Data1);
         let mut cfg = type_ref_cfg(
@@ -928,6 +974,7 @@ mod tests {
         );
         cfg.extra_scan_locks = vec![legacy];
         cfg.bounded_refund_locks = vec![legacy];
+        cfg.extra_cell_deps = vec![legacy_data1_cell_dep(&legacy_code)];
 
         let mut loop_ = DigestLoop::new(
             rpc,
@@ -945,6 +992,11 @@ mod tests {
         assert_eq!(
             intent_cap - out_cap,
             fee_for_size(tx_size_in_block(tx), 1000)
+        );
+        let deps: Vec<_> = tx.cell_deps().into_iter().collect();
+        assert!(
+            deps.iter().any(|d| d.out_point() == legacy_code.out_point),
+            "bounded legacy drain must carry Data1 code CellDep"
         );
     }
 
