@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use cid_backend_core::digest_loop::{DigestLoop, LoopConfig, NopClock};
+use cid_backend_core::host_query::HostQueryRpc;
 use cid_backend_core::process::{ProcessEntry, ProcessResolver};
 use cid_backend_core::rpc::{LiveCell, Rpc};
 use cid_backend_core::ssri::SsriHost;
@@ -99,7 +100,7 @@ pub fn default_loop_config() -> LoopConfig {
     }
 }
 
-pub fn digest_loop_empty<R: Rpc, S: SsriHost>(
+pub fn digest_loop_empty<R: Rpc + HostQueryRpc, S: SsriHost>(
     rpc: R,
     ssri: S,
     config: LoopConfig,
@@ -108,7 +109,11 @@ pub fn digest_loop_empty<R: Rpc, S: SsriHost>(
 }
 
 pub fn register_fixture(
-    loop_: &mut DigestLoop<impl Rpc, impl cid_backend_core::digest_loop::Clock, impl SsriHost>,
+    loop_: &mut DigestLoop<
+        impl Rpc + HostQueryRpc,
+        impl cid_backend_core::digest_loop::Clock,
+        impl SsriHost,
+    >,
     unique: u8,
 ) {
     let entry = fixture_process_entry(unique);
@@ -122,7 +127,7 @@ pub fn register_fixture(
     }
 }
 
-pub fn loop_with_resolver<R: Rpc, S: SsriHost>(
+pub fn loop_with_resolver<R: Rpc + HostQueryRpc, S: SsriHost>(
     rpc: R,
     ssri: S,
     config: LoopConfig,
@@ -138,7 +143,7 @@ pub fn loop_with_resolver<R: Rpc, S: SsriHost>(
     )
 }
 
-pub fn loop_with_resolver_and_code<R: Rpc, S: SsriHost>(
+pub fn loop_with_resolver_and_code<R: Rpc + HostQueryRpc, S: SsriHost>(
     rpc: R,
     ssri: S,
     config: LoopConfig,

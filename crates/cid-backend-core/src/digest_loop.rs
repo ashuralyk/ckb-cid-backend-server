@@ -8,7 +8,9 @@ use crate::process::{ProcessEntry, ProcessResolver, ResolvedProcess};
 use crate::rpc::{out_point_key, Rpc, RpcError, TxStatus};
 use crate::scan::{bucket_by_process_type_hash, scan_intentions_multi, ScannedIntention};
 use crate::ssri::{build_batch_draft, draft_cells_for_batch, SsriError, SsriHost};
-use crate::submit::{combo_fingerprint, execution_code_key, submit_execution, SubmitState};
+use crate::submit::{
+    combo_fingerprint, dry_run_gate, execution_code_key, submit_execution, DryRunGate, SubmitState,
+};
 use crate::type_id::TypeIdCodeDep;
 use crate::workers::{WorkerPool, WorkerRemoveError};
 use ckb_types::core::ScriptHashType;
@@ -1026,6 +1028,31 @@ impl<R: Rpc + HostQueryRpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
             .into_iter()
             .map(|i| i.previous_output())
             .collect();
+        match dry_run_gate(&self.rpc, &skeleton.tx) {
+            DryRunGate::Rejected(m) => {
+                worker.submit.rejected_combos.insert(fp);
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    event = "dry_run.rejected",
+                    error = %m,
+                    n = group.len(),
+                );
+                report.last_error = Some(format!("dry-run rejected: {m}"));
+                return BatchOutcome::Rejected;
+            }
+            DryRunGate::Skip(m) => {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    event = "tick.skip",
+                    reason = "dry_run_unavailable",
+                    error = %m,
+                );
+                report.last_error = Some(format!("dry-run: {m}"));
+                report.skipped += group.len();
+                return BatchOutcome::Continue;
+            }
+            DryRunGate::Proceed => {}
+        }
         match submit_execution(&self.rpc, &skeleton, &mut worker.submit, &consumed) {
             Ok(hash) => {
                 tracing::info!(
@@ -1245,6 +1272,31 @@ impl<R: Rpc + HostQueryRpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
             .into_iter()
             .map(|i| i.previous_output())
             .collect();
+        match dry_run_gate(&self.rpc, &skeleton.tx) {
+            DryRunGate::Rejected(m) => {
+                worker.submit.rejected_combos.insert(fp);
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    event = "dry_run.rejected",
+                    error = %m,
+                    n = batch.len(),
+                );
+                report.last_error = Some(format!("dry-run rejected: {m}"));
+                return BatchOutcome::Rejected;
+            }
+            DryRunGate::Skip(m) => {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    event = "tick.skip",
+                    reason = "dry_run_unavailable",
+                    error = %m,
+                );
+                report.last_error = Some(format!("dry-run: {m}"));
+                report.skipped += batch.len();
+                return BatchOutcome::Continue;
+            }
+            DryRunGate::Proceed => {}
+        }
         match submit_execution(&self.rpc, &skeleton, &mut worker.submit, &consumed) {
             Ok(hash) => {
                 tracing::info!(
@@ -1368,6 +1420,9 @@ mod worker_cmd_tests {
             _: usize,
         ) -> Result<Vec<LiveCell>, RpcError> {
             Ok(vec![])
+        }
+        fn dry_run_transaction(&self, _: &TransactionView) -> Result<(), RpcError> {
+            Ok(())
         }
         fn submit_transaction(&self, _: &TransactionView) -> Result<Byte32, RpcError> {
             Err(RpcError::Unavailable("no".into()))

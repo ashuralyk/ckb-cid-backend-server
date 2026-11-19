@@ -33,6 +33,10 @@ See `examples/cid.testnet.toml` / `examples/cid.network.toml.example`.
 
 ## Process registry API
 
+**Security:** The registry HTTP API has **no authentication or API keys**. Anyone who can reach the bind address can list, register, or disable Processes. The daemon does **not** hold signing keys, but registration changes which Process workers run and can enable or disable execution for a `process_type_hash`.
+
+**Bind to loopback by default** (`127.0.0.1:<port>`). Non-loopback exposure requires an explicit operator opt-in (`allow_non_loopback_api` in config, or `CID_ALLOW_NON_LOOPBACK_API=true` when supported). Without that flag, config should reject public binds fail-closed.
+
 Bind: `observe.api_bind` / `CID_API_BIND`.
 
 | Method | Path | Body |

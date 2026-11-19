@@ -657,6 +657,9 @@ mod tests {
         ) -> Result<Vec<LiveCell>, RpcError> {
             Ok(Vec::new())
         }
+        fn dry_run_transaction(&self, _: &TransactionView) -> Result<(), RpcError> {
+            Ok(())
+        }
         fn submit_transaction(&self, _: &TransactionView) -> Result<Byte32, RpcError> {
             Err(RpcError::Unavailable("no".into()))
         }
@@ -721,6 +724,9 @@ mod tests {
             _: usize,
         ) -> Result<Vec<LiveCell>, RpcError> {
             Err(RpcError::Unavailable("indexer down".into()))
+        }
+        fn dry_run_transaction(&self, _: &TransactionView) -> Result<(), RpcError> {
+            Ok(())
         }
         fn submit_transaction(&self, _: &TransactionView) -> Result<Byte32, RpcError> {
             Err(RpcError::Unavailable("down".into()))

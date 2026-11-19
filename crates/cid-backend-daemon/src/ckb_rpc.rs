@@ -2,9 +2,9 @@
 //!
 //! HTTP only. No disk state: every scan is a fresh `get_cells` paged until the
 //! indexer is exhausted. A truncated page window is never treated as a complete
-//! live-set. Process cells are found by type-script prefix
-//! (`CID_PROCESS_CODE_HASH`) then filtered to `calc_script_hash ==
-//! process_type_hash` from CID args.
+//! live-set. Legacy Process discovery walks TYPE_ID type-script prefix only,
+//! then filters `calc_script_hash == process_type_hash`. Workers use registry +
+//! exact TYPE_ID args for state cells.
 
 use crate::config::{ConfigError, DaemonConfig};
 use cid_backend_core::host_query::{
@@ -32,37 +32,33 @@ const HASH_TYPES: [ScriptHashType; 4] = [
 pub struct CkbRpc {
     node_url: String,
     indexer_url: String,
-    process_type_code_hashes: Vec<[u8; 32]>,
     agent: ureq::Agent,
 }
 
 impl CkbRpc {
     pub fn new(node_url: impl Into<String>, indexer_url: impl Into<String>) -> Self {
-        Self::with_process_code_hashes(node_url, indexer_url, Vec::new())
-    }
-
-    pub fn with_process_code_hashes(
-        node_url: impl Into<String>,
-        indexer_url: impl Into<String>,
-        process_type_code_hashes: Vec<[u8; 32]>,
-    ) -> Self {
         let agent = ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(30))
             .build();
         Self {
             node_url: node_url.into(),
             indexer_url: indexer_url.into(),
-            process_type_code_hashes,
             agent,
         }
     }
 
+    /// Kept for test fixtures; process code-hash prefixes are no longer used.
+    pub fn with_process_code_hashes(
+        node_url: impl Into<String>,
+        indexer_url: impl Into<String>,
+        _process_type_code_hashes: Vec<[u8; 32]>,
+    ) -> Self {
+        Self::new(node_url, indexer_url)
+    }
+
     pub fn from_config(cfg: &DaemonConfig) -> Self {
-        Self::with_process_code_hashes(
-            cfg.node_url.clone(),
-            cfg.indexer_url.clone(),
-            cfg.process_type_code_hashes.clone(),
-        )
+        let _ = &cfg.process_type_code_hashes;
+        Self::new(cfg.node_url.clone(), cfg.indexer_url.clone())
     }
 
     /// Node JSON-RPC helper for local-chain bootstrap / confirmation polls.
@@ -292,21 +288,29 @@ impl Rpc for CkbRpc {
         process_type_hash: &[u8; 32],
     ) -> Result<Option<LiveCell>, RpcError> {
         let mut candidates = Vec::new();
-        // Prefer TYPE_ID code-hash prefix (Process-as-lock state cells), then any
-        // configured process type code hashes / hash-as-code-hash legacy probes.
-        let mut prefixes: Vec<[u8; 32]> = vec![cid_backend_core::TYPE_ID_CODE_HASH];
-        prefixes.push(*process_type_hash);
-        prefixes.extend_from_slice(&self.process_type_code_hashes);
-        for code_hash in prefixes {
-            for ht in HASH_TYPES {
-                candidates.extend(self.cells_by_type_prefix(&code_hash, ht)?);
-            }
+        for ht in HASH_TYPES {
+            candidates.extend(self.cells_by_type_prefix(
+                &cid_backend_core::TYPE_ID_CODE_HASH,
+                ht,
+            )?);
         }
         Ok(candidates.into_iter().find(|cell| {
             cell.type_script()
                 .map(|ts| &script_hash32(&ts) == process_type_hash)
                 .unwrap_or(false)
         }))
+    }
+
+    fn dry_run_transaction(&self, tx: &TransactionView) -> Result<(), RpcError> {
+        let tx_json = tx_view_to_json(tx)?;
+        match self.dry_run_rpc_call("test_tx_pool_accept", json!([tx_json.clone(), "passthrough"])) {
+            Ok(()) => Ok(()),
+            Err((code, msg)) if dry_run_should_fallback(code, &msg) => {
+                self.dry_run_rpc_call("estimate_cycles", json!([tx_json]))
+                    .map_err(|(c, m)| map_verify_rpc_error("estimate_cycles", c, &m))
+            }
+            Err((code, msg)) => Err(map_verify_rpc_error("test_tx_pool_accept", code, &msg)),
+        }
     }
 
     fn find_live_cells_by_type_script(
@@ -321,7 +325,7 @@ impl Rpc for CkbRpc {
         let result = self.rpc_call(
             &self.node_url,
             "send_transaction",
-            json!([tx_view_to_json(tx), "passthrough"]),
+            json!([tx_view_to_json(tx)?, "passthrough"]),
         )?;
         let hex = result
             .as_str()
@@ -542,10 +546,9 @@ fn json_rpc_code(err: &Value) -> Option<i64> {
         .or_else(|| c.as_str().and_then(|s| s.parse().ok()))
 }
 
-fn map_rpc_error(method: &str, code: Option<i64>, msg: &str) -> RpcError {
-    if method != "send_transaction" {
-        return RpcError::Unavailable(msg.into());
-    }
+const JSON_RPC_METHOD_NOT_FOUND: i64 = -32601;
+
+fn map_verify_rpc_error(method: &str, code: Option<i64>, msg: &str) -> RpcError {
     if is_conflict(msg) {
         return RpcError::Conflict(msg.into());
     }
@@ -558,10 +561,63 @@ fn map_rpc_error(method: &str, code: Option<i64>, msg: &str) -> RpcError {
         | Some(POOL_REJECTED_MALFORMED) => RpcError::SubmitRejected(msg.into()),
         Some(POOL_IS_FULL)
         | Some(POOL_REJECTED_BY_MAX_ANCESTORS)
-        | Some(POOL_REJECTED_BY_MIN_FEE_RATE) => {
-            RpcError::Unavailable(format!("send_transaction {code:?}: {msg}"))
+        | Some(POOL_REJECTED_BY_MIN_FEE_RATE) => RpcError::Unavailable(format!("{method} {code:?}: {msg}")),
+        _ => RpcError::Unavailable(format!("{method} {code:?}: {msg}")),
+    }
+}
+
+fn map_rpc_error(method: &str, code: Option<i64>, msg: &str) -> RpcError {
+    match method {
+        "send_transaction" | "test_tx_pool_accept" | "estimate_cycles" => {
+            map_verify_rpc_error(method, code, msg)
         }
-        _ => RpcError::Unavailable(format!("send_transaction {code:?}: {msg}")),
+        _ => RpcError::Unavailable(msg.into()),
+    }
+}
+
+fn dry_run_should_fallback(code: Option<i64>, msg: &str) -> bool {
+    if code == Some(JSON_RPC_METHOD_NOT_FOUND) {
+        return true;
+    }
+    let m = msg.to_ascii_lowercase();
+    m.contains("method not found") || m.contains("test_tx_pool_accept")
+}
+
+impl CkbRpc {
+    fn dry_run_rpc_call(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<(), (Option<i64>, String)> {
+        let body = json!({
+            "id": 1,
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        });
+        let resp = self
+            .agent
+            .post(&self.node_url)
+            .set("Content-Type", "application/json")
+            .send_json(body)
+            .map_err(|e| (None, format_rpc_transport_error(method, e)))?;
+        let v: Value = resp
+            .into_json()
+            .map_err(|_| (None, format!("{method}: response decode failed")))?;
+        if let Some(err) = v.get("error") {
+            let msg = err
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("rpc error")
+                .to_string();
+            let code = json_rpc_code(err);
+            return Err((code, msg));
+        }
+        if v.get("result").is_some() {
+            Ok(())
+        } else {
+            Err((None, format!("{method}: missing result")))
+        }
     }
 }
 
@@ -687,21 +743,28 @@ fn json_to_script(v: &Value) -> Result<Script, RpcError> {
         .build())
 }
 
-fn tx_view_to_json(tx: &TransactionView) -> Value {
+fn dep_type_str(dt: DepType) -> &'static str {
+    match dt {
+        DepType::Code => "code",
+        DepType::DepGroup => "dep_group",
+    }
+}
+
+fn tx_view_to_json(tx: &TransactionView) -> Result<Value, RpcError> {
     let cell_deps: Vec<Value> = tx
         .cell_deps()
         .into_iter()
         .map(|d| {
-            let dt: DepType = d.dep_type().try_into().unwrap_or(DepType::Code);
-            json!({
+            let dt: DepType = d
+                .dep_type()
+                .try_into()
+                .map_err(|_| RpcError::Unavailable("cell_dep.dep_type".into()))?;
+            Ok(json!({
                 "out_point": out_point_json(&d.out_point()),
-                "dep_type": match dt {
-                    DepType::Code => "code",
-                    DepType::DepGroup => "dep_group",
-                },
-            })
+                "dep_type": dep_type_str(dt),
+            }))
         })
-        .collect();
+        .collect::<Result<Vec<_>, RpcError>>()?;
     let header_deps: Vec<Value> = tx
         .header_deps()
         .into_iter()
@@ -718,7 +781,11 @@ fn tx_view_to_json(tx: &TransactionView) -> Value {
             })
         })
         .collect();
-    let outputs: Vec<Value> = tx.outputs().into_iter().map(|o| output_json(&o)).collect();
+    let outputs: Vec<Value> = tx
+        .outputs()
+        .into_iter()
+        .map(|o| output_json(&o))
+        .collect::<Result<Vec<_>, RpcError>>()?;
     let outputs_data: Vec<Value> = tx
         .outputs_data()
         .into_iter()
@@ -735,7 +802,7 @@ fn tx_view_to_json(tx: &TransactionView) -> Value {
             Value::String(hex_bytes(&b))
         })
         .collect();
-    json!({
+    Ok(json!({
         "version": hex_u32(tx.version()),
         "cell_deps": cell_deps,
         "header_deps": header_deps,
@@ -743,7 +810,7 @@ fn tx_view_to_json(tx: &TransactionView) -> Value {
         "outputs": outputs,
         "outputs_data": outputs_data,
         "witnesses": witnesses,
-    })
+    }))
 }
 
 fn out_point_json(op: &OutPoint) -> Value {
@@ -754,23 +821,30 @@ fn out_point_json(op: &OutPoint) -> Value {
     })
 }
 
-fn output_json(out: &CellOutput) -> Value {
+fn output_json(out: &CellOutput) -> Result<Value, RpcError> {
     let cap: u64 = out.capacity().unpack();
-    json!({
+    Ok(json!({
         "capacity": hex_u64(cap),
-        "lock": script_json(&out.lock()),
-        "type": out.type_().to_opt().map(|t| script_json(&t)),
-    })
+        "lock": script_json(&out.lock())?,
+        "type": out
+            .type_()
+            .to_opt()
+            .map(|t| script_json(&t))
+            .transpose()?,
+    }))
 }
 
-fn script_json(s: &Script) -> Value {
-    let ht: ScriptHashType = s.hash_type().try_into().unwrap_or(ScriptHashType::Type);
+fn script_json(s: &Script) -> Result<Value, RpcError> {
+    let ht: ScriptHashType = s
+        .hash_type()
+        .try_into()
+        .map_err(|_| RpcError::Unavailable("script hash_type".into()))?;
     let args: Vec<u8> = s.args().unpack();
-    json!({
+    Ok(json!({
         "code_hash": hex_bytes(s.code_hash().as_slice()),
         "hash_type": hash_type_str(ht),
         "args": hex_bytes(&args),
-    })
+    }))
 }
 
 fn cursor_is_empty(cursor: &str) -> bool {
@@ -1081,7 +1155,7 @@ mod tests {
         use cid_backend_core::type_id::{type_id_script, TYPE_ID_CODE_HASH};
         let args = [0x7eu8; 32];
         let ts = type_id_script(&args);
-        let type_json = script_json(&ts);
+        let type_json = script_json(&ts).unwrap();
         let type_json_full = type_json.clone();
         let page = Arc::new(AtomicUsize::new(0));
         let page2 = page.clone();
@@ -1179,11 +1253,11 @@ mod tests {
     fn finds_process_cell_by_script_hash_via_code_hash_prefix() {
         let ts = process_type_script(7);
         let hash = script_hash32(&ts);
-        let type_json = script_json(&ts);
+        let type_json = script_json(&ts).unwrap();
         let url = spawn_mock(Arc::new(move |method, params| {
             assert_eq!(method, "get_cells");
             let code = params[0]["script"]["code_hash"].as_str().unwrap();
-            if code == hex_bytes(&PROC_CODE) {
+            if code == hex_bytes(&cid_backend_core::TYPE_ID_CODE_HASH) {
                 Ok(cells_result(vec![indexer_cell(
                     0x50,
                     0,
@@ -1196,13 +1270,74 @@ mod tests {
                 Ok(cells_result(vec![]))
             }
         }));
-        let rpc = CkbRpc::with_process_code_hashes(&url, &url, vec![PROC_CODE]);
+        let rpc = CkbRpc::new(&url, &url);
         let cell = rpc
             .get_live_process_by_type_hash(&hash)
             .expect("rpc")
             .expect("found");
         assert_eq!(cell.data, vec![0x7f, b'E', b'L', b'F']);
         assert_eq!(script_hash32(&cell.type_script().unwrap()), hash);
+    }
+
+    #[test]
+    fn dry_run_prefers_test_tx_pool_accept() {
+        let url = spawn_mock(Arc::new(|method, _| {
+            assert_eq!(method, "test_tx_pool_accept");
+            Ok(json!({"cycles":"0x1", "fee":"0x0"}))
+        }));
+        let rpc = CkbRpc::new(&url, &url);
+        let tx = ckb_types::core::TransactionBuilder::default().build();
+        rpc.dry_run_transaction(&tx).expect("accept");
+    }
+
+    #[test]
+    fn dry_run_falls_back_to_estimate_cycles_when_accept_missing() {
+        let url = spawn_mock(Arc::new(|method, _| match method {
+            "test_tx_pool_accept" => Err((-32601, "Method not found".into())),
+            "estimate_cycles" => Ok(json!({"cycles":"0x1"})),
+            other => panic!("unexpected {other}"),
+        }));
+        let rpc = CkbRpc::new(&url, &url);
+        let tx = ckb_types::core::TransactionBuilder::default().build();
+        rpc.dry_run_transaction(&tx).expect("estimate ok");
+    }
+
+    #[test]
+    fn dry_run_maps_verify_failure_to_submit_rejected() {
+        let url = spawn_mock(Arc::new(|method, _| {
+            assert_eq!(method, "test_tx_pool_accept");
+            Err((-302, "TransactionFailedToVerify".into()))
+        }));
+        let rpc = CkbRpc::new(&url, &url);
+        let tx = ckb_types::core::TransactionBuilder::default().build();
+        let err = rpc.dry_run_transaction(&tx).unwrap_err();
+        assert!(matches!(err, RpcError::SubmitRejected(_)), "{err:?}");
+    }
+
+    #[test]
+    fn script_hash_type_molecule_json_round_trip() {
+        use super::{json_to_script, script_json};
+        for ht in [
+            ScriptHashType::Type,
+            ScriptHashType::Data,
+            ScriptHashType::Data1,
+            ScriptHashType::Data2,
+        ] {
+            let s = Script::new_builder()
+                .code_hash(Byte32::from_slice(&[ht as u8; 32]).unwrap())
+                .hash_type(ht.into())
+                .args(vec![0xab, 0xcd].pack())
+                .build();
+            let j = script_json(&s).unwrap();
+            let back = json_to_script(&j).unwrap();
+            assert_eq!(back, s);
+        }
+        let bad = json!({
+            "code_hash": hex_bytes(&[0u8; 32]),
+            "hash_type": "not_a_real_hash_type",
+            "args": "0x",
+        });
+        assert!(json_to_script(&bad).is_err());
     }
 
     #[test]
@@ -1533,6 +1668,25 @@ mod tests {
             .unwrap_or(false)
     }
 
+    fn dry_run_accept(method: &str) -> Option<Result<Value, (i64, String)>> {
+        match method {
+            "test_tx_pool_accept" | "estimate_cycles" => {
+                Some(Ok(json!({"cycles":"0x1","fee":"0x0"})))
+            }
+            _ => None,
+        }
+    }
+
+    fn host_query_or_dry_run(
+        method: &str,
+        params: &Value,
+        cells: &[Value],
+    ) -> Result<Value, (i64, String)> {
+        dry_run_accept(method)
+            .or_else(|| host_query_for_indexer_cells(method, params, cells))
+            .unwrap_or_else(|| Err((-1, format!("unexpected {method}"))))
+    }
+
     fn host_query_for_indexer_cells(
         method: &str,
         params: &Value,
@@ -1552,7 +1706,7 @@ mod tests {
     fn live_intent_and_process() -> (Value, Value, [u8; 32]) {
         let ts = process_type_script(1);
         let hash = script_hash32(&ts);
-        let type_json = script_json(&ts);
+        let type_json = script_json(&ts).unwrap();
         let args = cid_args(hash);
         let intent = indexer_cell(1, 0, lock_json(CID_CODE, &args), None, 100_0000_0000, &[]);
         let code_hash = cid_backend_core::type_id_script_hash(&PROC_CODE_ARGS);
@@ -1591,8 +1745,7 @@ mod tests {
             }
             "get_transaction" => Ok(json!({"tx_status":{"status":"pending"}})),
             "get_tip_block_number" => Ok(json!("0x0")),
-            other => host_query_for_indexer_cells(other, &params, &[intent.clone(), proc.clone()])
-                .unwrap_or_else(|| Err((-1, format!("unexpected {other}")))),
+            other => host_query_or_dry_run(other, &params, &[intent.clone(), proc.clone()]),
         }));
         let mut loop_ = DigestLoop::new(
             CkbRpc::with_process_code_hashes(&url, &url, vec![PROC_CODE]),
@@ -1660,8 +1813,7 @@ mod tests {
                 }
             }
             "get_tip_block_number" => Ok(json!(format!("0x{:x}", tip2.load(Ordering::SeqCst)))),
-            other => host_query_for_indexer_cells(other, &params, &[intent.clone(), proc.clone()])
-                .unwrap_or_else(|| Err((-1, format!("unexpected {other} params={params}")))),
+            other => host_query_or_dry_run(other, &params, &[intent.clone(), proc.clone()]),
         }));
         let mut loop_ = DigestLoop::new(
             CkbRpc::with_process_code_hashes(&url, &url, vec![PROC_CODE]),
@@ -1782,7 +1934,7 @@ mod tests {
     fn restart_full_rescan_has_no_adapter_memory() {
         let ts = process_type_script(1);
         let hash = script_hash32(&ts);
-        let type_json = script_json(&ts);
+        let type_json = script_json(&ts).unwrap();
         let args = cid_args(hash);
         let intent = indexer_cell(1, 0, lock_json(CID_CODE, &args), None, 100_0000_0000, &[]);
         let code_hash = cid_backend_core::type_id_script_hash(&PROC_CODE_ARGS);
@@ -1812,8 +1964,7 @@ mod tests {
             }
             "get_transaction" => Ok(json!({"tx_status":{"status":"pending"}})),
             "get_tip_block_number" => Ok(json!("0x0")),
-            other => host_query_for_indexer_cells(other, &params, &[intent.clone(), proc.clone()])
-                .unwrap_or_else(|| Err((-1, format!("unexpected {other}")))),
+            other => host_query_or_dry_run(other, &params, &[intent.clone(), proc.clone()]),
         }));
 
         // The handler above always returns both cells for every get_cells, including
@@ -1959,20 +2110,24 @@ mod tests {
     fn finds_process_cell_on_page_65() {
         let ts = process_type_script(7);
         let hash = script_hash32(&ts);
-        let type_json = script_json(&ts);
+        let type_json = script_json(&ts).unwrap();
         const TARGET: u32 = 6400; // first cell of page 65 (0-based, PAGE=100)
         const TOTAL: usize = 6401;
         let url = spawn_mock(Arc::new(move |method, params| {
             assert_eq!(method, "get_cells");
             let code = params[0]["script"]["code_hash"].as_str().unwrap();
             let ht = params[0]["script"]["hash_type"].as_str().unwrap();
-            if code == hex_bytes(&PROC_CODE) && ht == "type" {
+            if code == hex_bytes(&cid_backend_core::TYPE_ID_CODE_HASH) && ht == "type" {
                 let start = cursor_start(&params);
                 Ok(paged_objects(TOTAL, start, |i| {
                     let ty = if i == TARGET {
                         type_json.clone()
                     } else {
-                        json_script(&PROC_CODE, ScriptHashType::Type, &i.to_be_bytes())
+                        json_script(
+                            &cid_backend_core::TYPE_ID_CODE_HASH,
+                            ScriptHashType::Type,
+                            &i.to_be_bytes(),
+                        )
                     };
                     indexer_cell(
                         0x50,
@@ -1987,7 +2142,7 @@ mod tests {
                 Ok(cells_result(vec![]))
             }
         }));
-        let rpc = CkbRpc::with_process_code_hashes(&url, &url, vec![PROC_CODE]);
+        let rpc = CkbRpc::new(&url, &url);
         let cell = rpc
             .get_live_process_by_type_hash(&hash)
             .expect("rpc")
@@ -2004,7 +2159,7 @@ mod tests {
     fn intention_beyond_6400_not_starved_by_sticky_unprocessable() {
         let ts = process_type_script(1);
         let hash = script_hash32(&ts);
-        let type_json = script_json(&ts);
+        let type_json = script_json(&ts).unwrap();
         let args = cid_args(hash);
         let code_hash = cid_backend_core::type_id_script_hash(&PROC_CODE_ARGS);
         let proc = indexer_cell(
@@ -2049,12 +2204,7 @@ mod tests {
             }
             "get_transaction" => Ok(json!({"tx_status": {"status": "pending"}})),
             "get_tip_block_number" => Ok(json!("0x0")),
-            other => host_query_for_indexer_cells(
-                other,
-                &params,
-                &[valid_intent.clone(), proc.clone()],
-            )
-            .unwrap_or_else(|| Err((-1, format!("unexpected {other}")))),
+            other => host_query_or_dry_run(other, &params, &[valid_intent.clone(), proc.clone()]),
         }));
         let cfg = LoopConfig {
             cid_code_hash: CID_CODE,
