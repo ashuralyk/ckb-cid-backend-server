@@ -39,10 +39,12 @@ pub struct DaemonConfig {
     /// Default [`cid_backend_core::DEFAULT_FEE_RATE`].
     pub fee_rate: u64,
     /// Audited CID lock identities that may use bounded refund fee mode.
-    /// Empty (default) ⇒ legacy exact refunds. Never insert undeployed
-    /// candidate hashes.
+    /// Empty (default) ⇒ legacy exact refunds. Each entry must already be a
+    /// scanned identity (primary or `extra_scan_locks`); this list never
+    /// expands the indexer scan set. Never insert undeployed candidate hashes.
     pub bounded_refund_locks: Vec<CidLockIdentity>,
-    /// Extra CID lock identities to scan (e.g. legacy locks after redeploy).
+    /// Extra CID lock identities to scan (e.g. legacy data-hash locks after
+    /// a Type-ID redeploy). Sole way to discover non-primary Intentions.
     pub extra_scan_locks: Vec<CidLockIdentity>,
     /// Human label for logs only. Never used to select RPC or contracts.
     pub network_name: Option<String>,
@@ -261,7 +263,8 @@ struct CidLockSection {
     #[serde(default)]
     type_id: Option<String>,
     /// Audited `(code_hash, hash_type)` pairs that may use bounded refunds.
-    /// Empty (default) ⇒ legacy exact for all scanned Intentions.
+    /// Empty (default) ⇒ legacy exact for all scanned Intentions. Must be a
+    /// subset of primary + `legacy_scan_locks` (fee mode only; not a scan source).
     #[serde(default)]
     bounded_refund_locks: Vec<LockIdentityFile>,
     /// Extra locks to scan besides the Type-ID / primary identity (e.g. old
@@ -664,6 +667,12 @@ fn merge<F: Fn(&str) -> Option<String>>(
             parse_lock_identity_files(&cid_lock.legacy_scan_locks, "cid_lock.legacy_scan_locks")?
         }
     };
+    validate_bounded_refund_subset(
+        cid_lock_code_hash,
+        hash_type,
+        &extra_scan_locks,
+        &bounded_refund_locks,
+    )?;
 
     let network_name = network.name.filter(|s| !s.trim().is_empty());
 
@@ -844,6 +853,31 @@ fn parse_lock_identity_files(
         out.push(CidLockIdentity::new(code_hash, hash_type));
     }
     Ok(out)
+}
+
+/// `bounded_refund_locks` selects fee mode only; every entry must already be
+/// a scanned identity (primary or `legacy_scan_locks` / `extra_scan_locks`).
+fn validate_bounded_refund_subset(
+    primary_code_hash: [u8; 32],
+    primary_hash_type: ScriptHashType,
+    extra_scan_locks: &[CidLockIdentity],
+    bounded_refund_locks: &[CidLockIdentity],
+) -> Result<(), ConfigError> {
+    let primary = CidLockIdentity::new(primary_code_hash, primary_hash_type);
+    for id in bounded_refund_locks {
+        let scanned = *id == primary || extra_scan_locks.iter().any(|x| x == id);
+        if !scanned {
+            return Err(ConfigError::Invalid(format!(
+                "cid_lock.bounded_refund_locks / CID_BOUNDED_REFUND_LOCKS entry \
+                 0x{}:{:?} is not a scanned identity; list it under the primary \
+                 cid_lock identity or cid_lock.legacy_scan_locks / CID_LEGACY_SCAN_LOCKS \
+                 (allowlist selects fee mode only and never expands the scan set)",
+                hex::encode(id.code_hash),
+                id.hash_type,
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// `0xhash:hash_type,0xhash2:data1` (hash_type optional, default `type`).
@@ -1101,27 +1135,133 @@ log_format = "pretty"
         let cfg = DaemonConfig::from_file_and_vars(Some(&path), |_| None).unwrap();
         assert!(cfg.bounded_refund_locks.is_empty());
 
+        // Allowlist primary (data1) + scan a legacy data1; allowlist may also
+        // name the legacy identity once it is in legacy_scan_locks.
         let path = write_toml(&format!(
-            "{base}\n[[cid_lock.bounded_refund_locks]]\ncode_hash = \"0x{lock}\"\nhash_type = \"type\"\n[[cid_lock.legacy_scan_locks]]\ncode_hash = \"0x{legacy}\"\nhash_type = \"data1\"\n",
+            "{base}\n[[cid_lock.bounded_refund_locks]]\ncode_hash = \"0x{primary}\"\nhash_type = \"data1\"\n[[cid_lock.legacy_scan_locks]]\ncode_hash = \"0x{legacy}\"\nhash_type = \"data1\"\n[[cid_lock.bounded_refund_locks]]\ncode_hash = \"0x{legacy}\"\nhash_type = \"data1\"\n",
             base = minimal_toml(),
-            lock = "11".repeat(32),
+            primary = "bb".repeat(32),
             legacy = "22".repeat(32),
         ));
         let cfg = DaemonConfig::from_file_and_vars(Some(&path), |_| None).unwrap();
-        assert_eq!(cfg.bounded_refund_locks.len(), 1);
-        assert_eq!(cfg.bounded_refund_locks[0].code_hash, [0x11; 32]);
+        assert_eq!(cfg.bounded_refund_locks.len(), 2);
+        assert_eq!(cfg.bounded_refund_locks[0].code_hash, [0xbb; 32]);
+        assert_eq!(cfg.bounded_refund_locks[0].hash_type, ScriptHashType::Data1);
         assert_eq!(cfg.extra_scan_locks.len(), 1);
         assert_eq!(cfg.extra_scan_locks[0].hash_type, ScriptHashType::Data1);
-        assert_eq!(cfg.to_loop_config().bounded_refund_locks.len(), 1);
+        assert_eq!(cfg.to_loop_config().bounded_refund_locks.len(), 2);
+        let scan = cfg.to_loop_config().scan_lock_identities();
+        assert_eq!(scan.len(), 2, "allowlist must not add a third scan target");
+        assert!(!scan.iter().any(|id| id.code_hash == [0x11; 32]));
 
+        // Env allowlist must still be a scanned identity (primary data1 here).
         let cfg = DaemonConfig::from_file_and_vars(Some(&path), |k| match k {
-            "CID_BOUNDED_REFUND_LOCKS" => Some(format!("0x{}:data1", "33".repeat(32))),
+            "CID_BOUNDED_REFUND_LOCKS" => Some(format!("0x{}:data1", "bb".repeat(32))),
             _ => None,
         })
         .unwrap();
         assert_eq!(cfg.bounded_refund_locks.len(), 1);
-        assert_eq!(cfg.bounded_refund_locks[0].code_hash, [0x33; 32]);
+        assert_eq!(cfg.bounded_refund_locks[0].code_hash, [0xbb; 32]);
         assert_eq!(cfg.bounded_refund_locks[0].hash_type, ScriptHashType::Data1);
+    }
+
+    #[test]
+    fn bounded_refund_only_data1_not_in_scan_set_rejected() {
+        let path = write_toml(&format!(
+            r#"
+[network]
+genesis_hash = "0x{g}"
+[rpc]
+url = "http://127.0.0.1:8114"
+[cid_lock]
+type_id_args = "0x{args}"
+[[cid_lock.bounded_refund_locks]]
+code_hash = "0x{data1}"
+hash_type = "data1"
+[loop]
+poll_interval_secs = 5
+"#,
+            g = "11".repeat(32),
+            args = "aa".repeat(32),
+            data1 = "d1".repeat(32),
+        ));
+        let err = DaemonConfig::from_file_and_vars(Some(&path), |_| None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bounded_refund_locks") || msg.contains("CID_BOUNDED_REFUND_LOCKS"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("not a scanned identity") || msg.contains("legacy_scan_locks"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn bounded_refund_data1_ok_when_also_legacy_scan() {
+        let path = write_toml(&format!(
+            r#"
+[network]
+genesis_hash = "0x{g}"
+[rpc]
+url = "http://127.0.0.1:8114"
+[cid_lock]
+type_id_args = "0x{args}"
+[[cid_lock.legacy_scan_locks]]
+code_hash = "0x{data1}"
+hash_type = "data1"
+[[cid_lock.bounded_refund_locks]]
+code_hash = "0x{data1}"
+hash_type = "data1"
+[loop]
+poll_interval_secs = 5
+"#,
+            g = "11".repeat(32),
+            args = "aa".repeat(32),
+            data1 = "d1".repeat(32),
+        ));
+        let cfg = DaemonConfig::from_file_and_vars(Some(&path), |_| None).unwrap();
+        assert_eq!(cfg.hash_type, ScriptHashType::Type);
+        assert_eq!(cfg.extra_scan_locks.len(), 1);
+        assert_eq!(cfg.bounded_refund_locks.len(), 1);
+        assert_eq!(cfg.bounded_refund_locks[0].hash_type, ScriptHashType::Data1);
+        let loop_cfg = cfg.to_loop_config();
+        assert!(loop_cfg
+            .scan_lock_identities()
+            .contains(&CidLockIdentity::new([0xd1; 32], ScriptHashType::Data1)));
+        assert_eq!(loop_cfg.scan_lock_identities().len(), 2);
+    }
+
+    #[test]
+    fn bounded_refund_type_id_primary_ok() {
+        use cid_backend_core::type_id::type_id_script_hash;
+        let derived = type_id_script_hash(&[0xaau8; 32]);
+        let path = write_toml(&format!(
+            r#"
+[network]
+genesis_hash = "0x{g}"
+[rpc]
+url = "http://127.0.0.1:8114"
+[cid_lock]
+type_id_args = "0x{args}"
+[[cid_lock.bounded_refund_locks]]
+code_hash = "0x{tid}"
+hash_type = "type"
+[loop]
+poll_interval_secs = 5
+"#,
+            g = "11".repeat(32),
+            args = "aa".repeat(32),
+            tid = hex::encode(derived),
+        ));
+        let cfg = DaemonConfig::from_file_and_vars(Some(&path), |_| None).unwrap();
+        assert_eq!(cfg.cid_lock_code_hash, derived);
+        assert_eq!(cfg.bounded_refund_locks.len(), 1);
+        assert_eq!(cfg.bounded_refund_locks[0].code_hash, derived);
+        assert_eq!(
+            cfg.to_loop_config().scan_lock_identities(),
+            vec![CidLockIdentity::new(derived, ScriptHashType::Type)]
+        );
     }
 
     #[test]

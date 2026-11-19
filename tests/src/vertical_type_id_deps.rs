@@ -832,4 +832,167 @@ mod tests {
         assert_eq!(report2.submitted, 1, "{:?}", report2.last_error);
         assert!(!loop_.rpc().has_cell(&data1_intent.out_point));
     }
+
+    /// `bounded_refund_locks` must not expand the scan set: a data1 identity
+    /// listed only there stays invisible to the indexer search.
+    #[test]
+    fn data1_only_in_bounded_refund_locks_not_scanned() {
+        use cid_backend_core::CidLockIdentity;
+
+        let cid_args = [0xc6; 32];
+        let legacy_data_hash = [0xd2; 32];
+        let rpc = FakeRpc::new();
+        let ts = process_type_script(24);
+        let hash = script_hash32(&ts);
+        let data1_intent = intention_cell_with_lock(
+            24,
+            hash,
+            100_0000_0000,
+            legacy_data_hash,
+            ScriptHashType::Data1,
+        );
+        rpc.insert_cell(data1_intent.clone());
+        rpc.insert_cell(process_cell(
+            24,
+            200_0000_0000,
+            vec![0x7f, b'E', b'L', b'F', 24],
+        ));
+        rpc.insert_cell(code_cell(0x87, cid_args, vec![0x7f, b'E', b'L', b'F']));
+
+        let mut cfg = type_ref_cfg(
+            cid_args,
+            vec![TypeIdCodeDep {
+                label: "cid_lock".into(),
+                identity: TypeIdIdentity::new(cid_args),
+            }],
+        );
+        cfg.bounded_refund_locks = vec![CidLockIdentity::new(
+            legacy_data_hash,
+            ScriptHashType::Data1,
+        )];
+        assert_eq!(
+            cfg.scan_lock_identities(),
+            vec![CidLockIdentity::new(
+                type_id_script_hash(&cid_args),
+                ScriptHashType::Type
+            )],
+            "allowlist must not appear in scan targets"
+        );
+
+        let mut loop_ = DigestLoop::new(
+            rpc,
+            NopClock,
+            ScriptedSsri::mimic((1, 4)),
+            cfg,
+            ProcessResolver::new(),
+        );
+        let report = loop_.tick();
+        assert_eq!(report.submitted, 0);
+        assert_eq!(report.scanned, 0);
+        assert!(loop_.rpc().has_cell(&data1_intent.out_point));
+    }
+
+    /// data1 in both legacy scan + bounded allowlist → scanned with Bounded fee.
+    #[test]
+    fn data1_legacy_and_bounded_refund_uses_bounded_mode() {
+        use cid_backend_core::{fee_for_size, tx_size_in_block, CidLockIdentity};
+
+        let cid_args = [0xc7; 32];
+        let legacy_data_hash = [0xd3; 32];
+        let rpc = FakeRpc::new();
+        let ts = process_type_script(25);
+        let hash = script_hash32(&ts);
+        let intent_cap = 100_0000_0000u64;
+        let data1_intent = intention_cell_with_lock(
+            25,
+            hash,
+            intent_cap,
+            legacy_data_hash,
+            ScriptHashType::Data1,
+        );
+        rpc.insert_cell(data1_intent);
+        rpc.insert_cell(process_cell(
+            25,
+            200_0000_0000,
+            vec![0x7f, b'E', b'L', b'F', 25],
+        ));
+        rpc.insert_cell(code_cell(0x88, cid_args, vec![0x7f, b'E', b'L', b'F']));
+
+        let legacy = CidLockIdentity::new(legacy_data_hash, ScriptHashType::Data1);
+        let mut cfg = type_ref_cfg(
+            cid_args,
+            vec![TypeIdCodeDep {
+                label: "cid_lock".into(),
+                identity: TypeIdIdentity::new(cid_args),
+            }],
+        );
+        cfg.extra_scan_locks = vec![legacy];
+        cfg.bounded_refund_locks = vec![legacy];
+
+        let mut loop_ = DigestLoop::new(
+            rpc,
+            NopClock,
+            ScriptedSsri::incompatible(21),
+            cfg,
+            ProcessResolver::new(),
+        );
+        let report = loop_.tick();
+        assert_eq!(report.submitted, 1, "{:?}", report.last_error);
+        let tx = &loop_.rpc().submitted()[0];
+        assert_eq!(tx.inputs().len(), 1);
+        let out_cap: u64 = tx.outputs().get(0).unwrap().capacity().unpack();
+        assert!(out_cap < intent_cap, "bounded fee must haircut refund");
+        assert_eq!(
+            intent_cap - out_cap,
+            fee_for_size(tx_size_in_block(tx), 1000)
+        );
+    }
+
+    /// Type-ID primary listed on the bounded allowlist still Digests with
+    /// Bounded Incompatible fee (allowlist does not disturb type-ref scan).
+    #[test]
+    fn type_id_primary_on_bounded_allowlist_still_scans() {
+        use cid_backend_core::{fee_for_size, tx_size_in_block, CidLockIdentity};
+
+        let cid_args = [0xc8; 32];
+        let cid_lock_hash = type_id_script_hash(&cid_args);
+        let rpc = FakeRpc::new();
+        let ts = process_type_script(26);
+        let hash = script_hash32(&ts);
+        let intent_cap = 100_0000_0000u64;
+        let intent =
+            intention_cell_with_lock(26, hash, intent_cap, cid_lock_hash, ScriptHashType::Type);
+        rpc.insert_cell(intent);
+        rpc.insert_cell(process_cell(
+            26,
+            200_0000_0000,
+            vec![0x7f, b'E', b'L', b'F', 26],
+        ));
+        rpc.insert_cell(code_cell(0x89, cid_args, vec![0x7f, b'E', b'L', b'F']));
+
+        let mut cfg = type_ref_cfg(
+            cid_args,
+            vec![TypeIdCodeDep {
+                label: "cid_lock".into(),
+                identity: TypeIdIdentity::new(cid_args),
+            }],
+        );
+        cfg.bounded_refund_locks = vec![CidLockIdentity::new(cid_lock_hash, ScriptHashType::Type)];
+
+        let mut loop_ = DigestLoop::new(
+            rpc,
+            NopClock,
+            ScriptedSsri::incompatible(21),
+            cfg,
+            ProcessResolver::new(),
+        );
+        let report = loop_.tick();
+        assert_eq!(report.submitted, 1, "{:?}", report.last_error);
+        let tx = &loop_.rpc().submitted()[0];
+        let out_cap: u64 = tx.outputs().get(0).unwrap().capacity().unpack();
+        assert_eq!(
+            intent_cap - out_cap,
+            fee_for_size(tx_size_in_block(tx), 1000)
+        );
+    }
 }

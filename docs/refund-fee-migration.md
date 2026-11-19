@@ -43,7 +43,10 @@ rejection for mixed CID identities in one DigestIncompatible tx.
 
 Empty allowlist ⇒ legacy exact for every Intention. Listing a lock on the
 allowlist alone does **not** fix `-1104` against an old lock that still
-demands exact capacity.
+demands exact capacity, and **does not** make the daemon scan that lock.
+`bounded_refund_locks` selects fee mode only for identities already in the
+scan set (primary or `legacy_scan_locks`). Config load fail-closes if an
+allowlist entry is not a scanned identity.
 
 ## Enabling bounded refunds (after revised lock ships)
 
@@ -52,10 +55,12 @@ demands exact capacity.
    `cid_lock.type_id_args` so scan `code_hash` is the Type-ID type-script hash
    with `hash_type=type` (CellDeps refresh across upgrades). Do not point the
    primary at a stale binary `data_hash` on Type-ID networks.
-3. Add that identity to `[[cid_lock.bounded_refund_locks]]` (or
-   `CID_BOUNDED_REFUND_LOCKS=0x…:hash_type`). Never list undeployed candidates.
+3. Add that **already-scanned** identity to `[[cid_lock.bounded_refund_locks]]`
+   (or `CID_BOUNDED_REFUND_LOCKS=0x…:hash_type`). Never list undeployed
+   candidates. Never use the allowlist as a scan source.
 4. List old data-hash locks under `[[cid_lock.legacy_scan_locks]]` so the
-   daemon continues draining exact-refund Intentions after redeploy.
+   daemon continues draining those Intentions after redeploy; add them to
+   `bounded_refund_locks` only if that legacy lock also accepts bounded fees.
 5. Keep `digest_ok` Process fee path unchanged (`loop.fee_rate`).
 
 ## Assembly rules (bounded mode)
