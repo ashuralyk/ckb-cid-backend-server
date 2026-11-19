@@ -306,6 +306,7 @@ mod tests {
             type_hash: crate::rpc::script_hash32(&live.type_script().unwrap()),
             live_cell: live,
             binary: vec![0x7f, b'E', b'L', b'F'],
+            code_cell: None,
         }
     }
 

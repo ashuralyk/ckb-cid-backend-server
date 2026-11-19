@@ -84,6 +84,8 @@ dependencies = [
  "cid-protocol",
  "ckb-types",
  "log",
+ "serde",
+ "serde_json",
  "tracing",
 ]
 
