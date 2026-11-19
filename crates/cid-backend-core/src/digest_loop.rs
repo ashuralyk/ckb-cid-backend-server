@@ -1,5 +1,5 @@
 use crate::code_deps::{resolve_execution_cell_deps, resolve_type_id_code_cell, CodeDepError};
-use crate::fee::CidLockIdentity;
+use crate::fee::{CidLockIdentity, RefundPolicy};
 use crate::host_query::HostQueryRpc;
 use crate::process::{ProcessEntry, ProcessResolver, ResolvedProcess};
 use crate::process_batch::{self, BatchOutcome, BatchReportDelta};
@@ -49,14 +49,22 @@ pub struct LoopConfig {
     /// occupancy is released. `1` settles on first sight of Committed at the
     /// tip. Daemon default is [`DEFAULT_CONFIRMATION_DEPTH`].
     pub confirmation_depth: u64,
+    pub extra_scan_locks: Vec<CidLockIdentity>,
+    pub refund_policy: RefundPolicy,
     /// Max molecule bytes for `Process.assemble` passthrough txs.
     pub max_assembled_tx_bytes: usize,
 }
 
 impl LoopConfig {
-    /// Unique scan targets: primary CID lock only.
+    /// Scan the primary lock and explicitly configured legacy identities.
     pub fn scan_lock_identities(&self) -> Vec<CidLockIdentity> {
-        vec![CidLockIdentity::new(self.cid_code_hash, self.hash_type)]
+        let mut locks = vec![CidLockIdentity::new(self.cid_code_hash, self.hash_type)];
+        for lock in &self.extra_scan_locks {
+            if !locks.contains(lock) {
+                locks.push(*lock);
+            }
+        }
+        locks
     }
 }
 
@@ -120,6 +128,13 @@ pub enum WorkerCommand {
 }
 
 impl WorkerCommand {
+    fn identity(&self) -> [u8; 32] {
+        match self {
+            Self::Register(entry) => entry.identity_type_hash,
+            Self::Delete { hash, .. } => *hash,
+        }
+    }
+
     pub fn delete(hash: [u8; 32]) -> Self {
         Self::Delete {
             hash,
@@ -283,15 +298,19 @@ where
             return;
         };
         // Fail closed on poisoned queue (P2-10).
-        let batch = match cmds.lock() {
+        let mut batch = match cmds.lock() {
             Ok(mut g) => std::mem::take(&mut *g),
             Err(_) => {
                 tracing::error!(target: LOG_TARGET, event = "worker_cmds.poisoned");
                 return;
             }
         };
+        // Only the latest registry request for an identity represents desired state.
+        let mut seen = HashSet::new();
+        batch.reverse();
+        batch.retain(|cmd| seen.insert(cmd.identity()));
         let mut requeue = Vec::new();
-        for cmd in batch {
+        for cmd in batch.into_iter().rev() {
             match cmd {
                 WorkerCommand::Register(entry) => {
                     let hash = entry.identity_type_hash;
@@ -355,6 +374,7 @@ where
             if let Some(q) = &self.worker_cmds {
                 // Recover deferred Deletes even if the mutex was poisoned (P2-8).
                 let mut g = q.lock().unwrap_or_else(|e| e.into_inner());
+                requeue.retain(|old| !g.iter().any(|new| new.identity() == old.identity()));
                 g.extend(requeue);
             }
         }
@@ -439,12 +459,7 @@ where
         if code_key != self.execution_code_key {
             if !self.execution_code_key.is_empty() || !code_key.is_empty() {
                 self.workers.for_each_mut(|w| {
-                    w.with_state_mut(|state| {
-                        state.submit.rejected_combos.clear();
-                        state.isolate_expanded.clear();
-                        state.isolate_pending.clear();
-                        state.isolate_resume = None;
-                    });
+                    w.with_state_mut(|state| state.clear_execution_rejections());
                 });
             }
             self.execution_code_key = code_key;
@@ -504,8 +519,18 @@ where
             });
         });
 
+        let queued_updates: HashSet<_> = self
+            .worker_cmds
+            .as_ref()
+            .and_then(|cmds| cmds.lock().ok())
+            .map(|cmds| cmds.iter().map(WorkerCommand::identity).collect())
+            .unwrap_or_default();
         let mut eligible = Vec::new();
         for i in scanned {
+            if queued_updates.contains(&i.args.process_type_hash) {
+                report.skipped += 1;
+                continue;
+            }
             if self.workers.get(&i.args.process_type_hash).is_none() {
                 report.skipped += 1;
                 tracing::debug!(
@@ -702,7 +727,7 @@ where
                 }
             };
             if let Some(w) = self.workers.get(&identity_hash) {
-                w.with_state_mut(|state| state.resolver.set_tick_process_code(code_cell.as_ref()));
+                w.with_state_mut(|state| state.refresh_process_code(code_cell.as_ref()));
             }
         }
     }
@@ -1181,12 +1206,20 @@ where
         None
     }
 
+    fn batch_code_key(&self, process: &ResolvedProcess) -> Vec<u8> {
+        let mut key = self.execution_code_key.clone();
+        if let Some(cell) = &process.code_cell {
+            key.extend_from_slice(cell.out_point.as_slice());
+        }
+        key
+    }
+
     fn window_fingerprint(&self, batch: &[ScannedIntention], process: &ResolvedProcess) -> Vec<u8> {
         let ops: Vec<_> = batch.iter().map(|i| i.out_point.clone()).collect();
         combo_fingerprint(
             &ops,
             Some(&process.live_cell.out_point),
-            &self.execution_code_key,
+            &self.batch_code_key(process),
         )
     }
 
@@ -1218,7 +1251,12 @@ where
     ) -> bool {
         self.workers.get(hash).is_some_and(|w| {
             w.with_state(|state| {
-                process_batch::window_combo_cached(state, batch, process, &self.execution_code_key)
+                process_batch::window_combo_cached(
+                    state,
+                    batch,
+                    process,
+                    &self.batch_code_key(process),
+                )
             })
         })
     }
@@ -1247,6 +1285,16 @@ where
             Some(w) => w,
             None => return BatchOutcome::Continue,
         };
+        // Serialize dispatch with registry enqueue. A deferred delete or rebind
+        // may remain queued while the previous transactions are reconciled.
+        let _commands = if let Some(queue) = &self.worker_cmds {
+            match queue.lock() {
+                Ok(commands) if commands.iter().all(|cmd| cmd.identity() != hash) => Some(commands),
+                _ => return BatchOutcome::Continue,
+            }
+        } else {
+            None
+        };
         let max_size = if self.config.max_assembled_tx_bytes == 0 {
             DEFAULT_MAX_ASSEMBLED_TX_BYTES
         } else {
@@ -1256,8 +1304,9 @@ where
         match worker.start_batch(
             process.clone(),
             batch,
-            self.execution_code_key.clone(),
+            self.batch_code_key(process),
             self.tick_cell_deps.clone(),
+            self.config.refund_policy.clone(),
             max_size,
             window_fp,
             resume_on_continue,
@@ -1380,6 +1429,8 @@ mod worker_cmd_tests {
                 .build()],
             type_id_code_deps: vec![],
             confirmation_depth: 1,
+            extra_scan_locks: vec![],
+            refund_policy: Default::default(),
             max_assembled_tx_bytes: 512 * 1024,
         }
     }

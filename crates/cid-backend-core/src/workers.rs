@@ -1,14 +1,15 @@
 //! One OS thread per configured Process. Batch submit work runs on that thread.
 
+use crate::fee::RefundPolicy;
 use crate::host_query::HostQueryRpc;
 use crate::process::ResolvedProcess;
 use crate::process::{ProcessEntry, ProcessResolver};
 use crate::process_batch::{run_process_batch, BatchOutcome, BatchReportDelta, ProcessBatchParams};
-use crate::rpc::Rpc;
+use crate::rpc::{LiveCell, Rpc};
 use crate::scan::ScannedIntention;
 use crate::ssri::SsriHost;
 use crate::submit::SubmitState;
-use ckb_types::packed::CellDep;
+use ckb_types::packed::{CellDep, OutPoint};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
@@ -35,6 +36,7 @@ pub struct ProcessWorkerState {
     /// `isolate_window` instead of re-deriving via `already`.
     pub isolate_pending: Vec<Vec<ScannedIntention>>,
     pub generation: u64,
+    last_process_code: Option<OutPoint>,
 }
 
 impl ProcessWorkerState {
@@ -52,7 +54,25 @@ impl ProcessWorkerState {
             isolate_expanded: HashSet::new(),
             isolate_pending: Vec::new(),
             generation,
+            last_process_code: None,
         }
+    }
+
+    pub(crate) fn refresh_process_code(&mut self, cell: Option<&LiveCell>) {
+        if let Some(cell) = cell {
+            if self.last_process_code.as_ref() != Some(&cell.out_point) {
+                self.last_process_code = Some(cell.out_point.clone());
+                self.clear_execution_rejections();
+            }
+        }
+        self.resolver.set_tick_process_code(cell);
+    }
+
+    pub(crate) fn clear_execution_rejections(&mut self) {
+        self.submit.rejected_combos.clear();
+        self.isolate_expanded.clear();
+        self.isolate_pending.clear();
+        self.isolate_resume = None;
     }
 
     pub fn process_type_hash(&self) -> [u8; 32] {
@@ -71,6 +91,7 @@ enum ProcessWorkerJob {
         batch: Vec<ScannedIntention>,
         execution_code_key: Vec<u8>,
         tick_cell_deps: Vec<CellDep>,
+        refund_policy: RefundPolicy,
         max_assembled_tx_bytes: usize,
         reply: SyncSender<(BatchOutcome, BatchReportDelta)>,
     },
@@ -195,6 +216,7 @@ impl ProcessWorker {
         batch: Vec<ScannedIntention>,
         execution_code_key: Vec<u8>,
         tick_cell_deps: Vec<CellDep>,
+        refund_policy: RefundPolicy,
         max_assembled_tx_bytes: usize,
         window_fp: Vec<u8>,
         resume_on_continue: Option<Vec<u8>>,
@@ -218,6 +240,7 @@ impl ProcessWorker {
                 batch: batch.clone(),
                 execution_code_key,
                 tick_cell_deps,
+                refund_policy,
                 max_assembled_tx_bytes,
                 reply: reply_tx,
             })
@@ -288,6 +311,7 @@ fn worker_thread_main<R, S>(
                 batch,
                 execution_code_key,
                 tick_cell_deps,
+                refund_policy,
                 max_assembled_tx_bytes,
                 reply,
             } => {
@@ -318,6 +342,7 @@ fn worker_thread_main<R, S>(
                         batch,
                         execution_code_key: &execution_code_key,
                         tick_cell_deps: &tick_cell_deps,
+                        refund_policy: &refund_policy,
                         max_assembled_tx_bytes,
                         job_epoch,
                         epoch: epoch.clone(),
@@ -466,10 +491,8 @@ where
                     state.entry = entry.clone();
                     state.resolver = ProcessResolver::for_entry(entry);
                     if code_changed {
-                        state.submit.rejected_combos.clear();
-                        state.isolate_expanded.clear();
-                        state.isolate_pending.clear();
-                        state.isolate_resume = None;
+                        state.last_process_code = None;
+                        state.clear_execution_rejections();
                     }
                 });
                 Ok(false)

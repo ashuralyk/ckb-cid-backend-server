@@ -8,7 +8,10 @@ use ckb_types::prelude::*;
 use std::fmt;
 use std::sync::Arc;
 
-/// Process guest exit: funding lock is not AlwaysSuccess(Data1) / is Process lock.
+/// Application-level incompatibility reported by the pinned Process protocol.
+pub const INCOMPATIBLE_BATCH: i8 = 21;
+
+/// The pinned example Process rejected additional funding inputs.
 pub const UNSUPPORTED_FUNDING_LOCK: i8 = 38;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

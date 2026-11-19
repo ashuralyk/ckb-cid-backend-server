@@ -1,4 +1,7 @@
-use crate::fee::FeeGuard;
+use crate::fee::{
+    allocate_refund_fee_cuts, cell_occupied_capacity, refund_fee_budget, required_fee,
+    tx_size_in_block, with_capacity, FeeGuard, RefundFeeMode,
+};
 use crate::process::ResolvedProcess;
 use crate::rpc::script_hash32;
 use crate::scan::ScannedIntention;
@@ -19,6 +22,7 @@ pub struct ExecutionSkeleton {
 pub enum AssembleError {
     CapacityShortfall { inputs: u64, outputs: u64 },
     RefundUnbuildable(String),
+    RefundFeeUnaffordable { fee: u64, budget: u64 },
     InvalidAssembled(String),
     SizeLimit { size: usize, max: usize },
 }
@@ -30,6 +34,9 @@ impl fmt::Display for AssembleError {
                 write!(f, "capacity shortfall in={inputs} out={outputs}")
             }
             AssembleError::RefundUnbuildable(m) => write!(f, "refund unbuildable: {m}"),
+            AssembleError::RefundFeeUnaffordable { fee, budget } => {
+                write!(f, "refund fee {fee} exceeds capacity budget {budget}")
+            }
             AssembleError::InvalidAssembled(m) => write!(f, "invalid assembled tx: {m}"),
             AssembleError::SizeLimit { size, max } => {
                 write!(f, "assembled tx size {size} exceeds max {max}")
@@ -231,6 +238,58 @@ pub fn assemble_digest_incompatible(
         outputs_data,
         extra_cell_deps,
     )
+}
+
+/// Build a refund for one lock identity. The caller partitions batches before fee selection.
+pub(crate) fn assemble_refund_with_policy(
+    intentions: &[ScannedIntention],
+    cell_deps: &[CellDep],
+    mode: RefundFeeMode,
+    fee_rate: u64,
+) -> Result<ExecutionSkeleton, AssembleError> {
+    let mut skeleton = assemble_digest_incompatible(intentions, cell_deps)?;
+    if mode == RefundFeeMode::Exact {
+        return Ok(skeleton);
+    }
+
+    let sized_size = tx_size_in_block(&skeleton.tx);
+    let fee = required_fee(&skeleton.tx, fee_rate);
+    let outputs: Vec<_> = skeleton.tx.outputs().into_iter().collect();
+    let budgets = outputs
+        .iter()
+        .zip(intentions)
+        .map(|(out, intent)| {
+            let occupied = cell_occupied_capacity(out, &intent.data)
+                .filter(|&occupied| occupied <= intent.capacity)
+                .ok_or_else(|| {
+                    AssembleError::RefundUnbuildable("output below occupied capacity".into())
+                })?;
+            Ok(refund_fee_budget(intent.capacity, occupied))
+        })
+        .collect::<Result<Vec<_>, AssembleError>>()?;
+    let cuts = allocate_refund_fee_cuts(&budgets, fee).map_err(|shortfall| {
+        AssembleError::RefundFeeUnaffordable {
+            fee,
+            budget: fee - shortfall,
+        }
+    })?;
+    let outputs = outputs
+        .iter()
+        .zip(intentions)
+        .zip(cuts)
+        .map(|((out, intent), cut)| with_capacity(out, intent.capacity - cut))
+        .collect();
+    skeleton.tx = skeleton
+        .tx
+        .as_advanced_builder()
+        .set_outputs(outputs)
+        .build();
+    skeleton.fee_guard = Some(FeeGuard {
+        sized_size,
+        fee_rate,
+        paid_fee: fee,
+    });
+    Ok(skeleton)
 }
 
 fn refund_output(intent: &ScannedIntention) -> Result<(CellOutput, Vec<u8>), AssembleError> {

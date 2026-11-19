@@ -47,8 +47,7 @@ pub struct DaemonConfig {
     pub registry_max_entries: usize,
     /// Confirmation depth for submitted execution txs. Default 24.
     pub confirmation_depth: u64,
-    /// Shannons per 1000 bytes (KW) for digest_ok fee from Process recreate.
-    /// Default [`cid_backend_core::DEFAULT_FEE_RATE`].
+    /// Fee rate for allowlisted bounded refunds. The guest sets DigestOk fees.
     pub fee_rate: u64,
     /// Audited CID lock identities that may use bounded refund fee mode.
     /// Empty (default) ⇒ legacy exact refunds. Each entry must already be a
@@ -151,6 +150,11 @@ impl DaemonConfig {
                 .cloned()
                 .collect(),
             confirmation_depth: self.confirmation_depth,
+            extra_scan_locks: self.extra_scan_locks.clone(),
+            refund_policy: cid_backend_core::fee::RefundPolicy {
+                fee_rate: self.fee_rate,
+                bounded_locks: self.bounded_refund_locks.clone(),
+            },
             max_assembled_tx_bytes: DEFAULT_MAX_ASSEMBLED_TX_BYTES,
         }
     }
@@ -1204,14 +1208,14 @@ log_format = "pretty"
         ));
         let cfg = DaemonConfig::from_file_and_vars(Some(&path), |_| None).unwrap();
         assert_eq!(cfg.fee_rate, 2500);
-        let _ = cfg.fee_rate; // fee_rate retained on DaemonConfig only
+        assert_eq!(cfg.to_loop_config().refund_policy.fee_rate, 2500);
 
         let cfg = DaemonConfig::from_file_and_vars(Some(&path), |k| match k {
             "CID_FEE_RATE" => Some("4000".into()),
             _ => None,
         })
         .unwrap();
-        assert_eq!(cfg.fee_rate, 4000);
+        assert_eq!(cfg.to_loop_config().refund_policy.fee_rate, 4000);
     }
 
     #[test]
@@ -1236,10 +1240,17 @@ log_format = "pretty"
         assert_eq!(cfg.extra_scan_locks[0].hash_type, ScriptHashType::Data1);
         assert_eq!(cfg.bounded_refund_locks.len(), 2);
         let scan = cfg.to_loop_config().scan_lock_identities();
-        // Primary-only scan: legacy_scan_locks stay on DaemonConfig but are not
-        // LoopConfig scan targets under Process-as-lock cutover.
-        assert_eq!(scan.len(), 1, "loop scans primary CID lock only");
-        assert!(!scan.iter().any(|id| id.code_hash == [0x11; 32]));
+        assert_eq!(
+            scan.len(),
+            2,
+            "scan must include the configured legacy lock"
+        );
+        let legacy = CidLockIdentity::new([0x22; 32], ScriptHashType::Data1);
+        assert!(scan.contains(&legacy));
+        assert_eq!(
+            cfg.to_loop_config().refund_policy.mode_for(&legacy),
+            cid_backend_core::RefundFeeMode::Bounded,
+        );
 
         // Env allowlist must still be a scanned identity (primary data1 here).
         let cfg = DaemonConfig::from_file_and_vars(Some(&path), |k| match k {
@@ -1313,7 +1324,7 @@ poll_interval_secs = 5
         assert_eq!(cfg.bounded_refund_locks.len(), 1);
         assert_eq!(cfg.bounded_refund_locks[0].hash_type, ScriptHashType::Data1);
         let loop_cfg = cfg.to_loop_config();
-        assert_eq!(loop_cfg.scan_lock_identities().len(), 1);
+        assert_eq!(loop_cfg.scan_lock_identities().len(), 2);
         assert_eq!(
             loop_cfg.scan_lock_identities()[0].hash_type,
             ScriptHashType::Type
@@ -1575,7 +1586,10 @@ fee_rate = 1000
         let ids = cfg.to_loop_config().scan_lock_identities();
         assert_eq!(
             ids,
-            vec![CidLockIdentity::new(derived, ScriptHashType::Type)]
+            vec![
+                CidLockIdentity::new(derived, ScriptHashType::Type),
+                CidLockIdentity::new([0xd1; 32], ScriptHashType::Data1),
+            ]
         );
     }
 

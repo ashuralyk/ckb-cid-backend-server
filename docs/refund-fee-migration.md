@@ -39,7 +39,7 @@ rejection for mixed CID identities in one DigestIncompatible tx.
 |------|---------|--------|
 | `cid_lock.bounded_refund_locks` / `CID_BOUNDED_REFUND_LOCKS` | **empty** | Exact User Lock capacity; fee 0 |
 | `cid_lock.legacy_scan_locks` / `CID_LEGACY_SCAN_LOCKS` | empty | No extra scan targets |
-| `loop.fee_rate` / `CID_FEE_RATE` | 1000 | Funds `digest_ok` via Process recreate; also used for allowlisted bounded refunds |
+| `loop.fee_rate` / `CID_FEE_RATE` | 1000 | Fee rate for allowlisted bounded refunds |
 
 Empty allowlist ⇒ legacy exact for every Intention. Listing a lock on the
 allowlist alone does **not** fix `-1104` against an old lock that still
@@ -72,7 +72,7 @@ allowlist entry is not a scanned identity.
    entry (do **not** label it `cid_lock` — that conflicts with Type-ID
    discovery for the current role). Without that dep, FakeRpc may still
    “accept” the tx, but a real node rejects it.
-6. Keep `digest_ok` Process fee path unchanged (`loop.fee_rate`).
+6. The Process guest controls the fee for `digest_ok`.
 
 ## Assembly rules (bounded mode)
 

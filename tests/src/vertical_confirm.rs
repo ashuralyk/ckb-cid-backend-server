@@ -20,6 +20,8 @@ mod tests {
             extra_cell_deps: vec![crate::helpers::placeholder_code_dep()],
             type_id_code_deps: vec![],
             confirmation_depth: depth,
+            extra_scan_locks: vec![],
+            refund_policy: Default::default(),
             max_assembled_tx_bytes: 512 * 1024,
         }
     }
@@ -166,5 +168,35 @@ mod tests {
             .pending
             .contains_key(&orig_key));
         assert_eq!(loop_.rpc().submitted().len(), 2);
+    }
+
+    #[test]
+    fn delete_drains_pending_without_starting_another_batch() {
+        use crate::helpers::{fixture_process_entry, register_fixture};
+        use cid_backend_core::digest_loop::{DigestLoop, NopClock, WorkerCommand};
+        use cid_backend_core::workers::WorkerPool;
+        use std::sync::{Arc, Mutex};
+
+        let rpc = Arc::new(FakeRpc::new());
+        let ssri = Arc::new(ScriptedSsri::mimic((1, 1)));
+        let cmds = Arc::new(Mutex::new(Vec::new()));
+        let workers = WorkerPool::new(rpc.clone(), ssri.clone());
+        let hash = fixture_process_entry(21).identity_type_hash;
+        rpc.insert_cell(process_cell(21, 400_0000_0000, vec![]));
+        rpc.insert_cell(intention_cell(1, hash, 100_0000_0000));
+        rpc.insert_cell(intention_cell(2, hash, 100_0000_0000));
+        let mut loop_ =
+            DigestLoop::with_workers(rpc, NopClock, ssri, cfg(1), workers, Some(cmds.clone()));
+        register_fixture(&mut loop_, 21);
+        assert_eq!(loop_.tick().submitted, 1);
+        cmds.lock().unwrap().push(WorkerCommand::delete(hash));
+        assert_eq!(
+            loop_.tick().submitted,
+            0,
+            "deleting worker must stop scheduling new work"
+        );
+        assert_eq!(loop_.tick().submitted, 0);
+        assert!(!loop_.workers().contains(&hash));
+        assert_eq!(loop_.rpc().submitted().len(), 1);
     }
 }

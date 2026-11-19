@@ -34,6 +34,8 @@ mod tests {
                 extra_cell_deps: vec![crate::helpers::placeholder_code_dep()],
                 type_id_code_deps: vec![],
                 confirmation_depth: 1,
+                extra_scan_locks: vec![],
+                refund_policy: Default::default(),
                 max_assembled_tx_bytes: 512 * 1024,
             },
             5,
