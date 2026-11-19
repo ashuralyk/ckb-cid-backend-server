@@ -151,7 +151,11 @@ impl FakeRpc {
     }
 
     pub fn has_cell(&self, op: &OutPoint) -> bool {
-        self.inner.lock().unwrap().cells.contains_key(&out_point_key(op))
+        self.inner
+            .lock()
+            .unwrap()
+            .cells
+            .contains_key(&out_point_key(op))
     }
 
     pub fn submitted(&self) -> Vec<TransactionView> {

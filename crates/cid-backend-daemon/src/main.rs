@@ -101,31 +101,6 @@ fn main() {
 
     let worker_cmds: Arc<Mutex<Vec<WorkerCommand>>> = Arc::new(Mutex::new(Vec::new()));
     let busy = ProcessBusyMap::new();
-    let registry = Arc::new(Mutex::new(registry));
-
-    if let Some(addr) = config.api_bind {
-        let state = RegistryApiState {
-            registry: registry.clone(),
-            worker_cmds: worker_cmds.clone(),
-            busy: busy.clone(),
-        };
-        match spawn_registry_api(addr, state) {
-            Ok(h) => tracing::info!(
-                target: "cid_backend",
-                event = "registry.api.listen",
-                bind = %h.local_addr,
-            ),
-            Err(e) => {
-                tracing::error!(
-                    target: "cid_backend",
-                    event = "config.load_failed",
-                    error = %e,
-                );
-                eprintln!("cid-backend-daemon registry API bind failed: {e}");
-                std::process::exit(1);
-            }
-        }
-    }
 
     let rpc = Arc::new(CkbRpc::from_config(&config));
     if config.validate_genesis {
@@ -163,18 +138,37 @@ fn main() {
             }
         }
     }
+    let registry = Arc::new(Mutex::new(registry));
+
+    if let Some(addr) = config.api_bind {
+        let state = RegistryApiState {
+            registry: registry.clone(),
+            worker_cmds: worker_cmds.clone(),
+            busy: busy.clone(),
+        };
+        match spawn_registry_api(addr, state) {
+            Ok(h) => tracing::info!(
+                target: "cid_backend",
+                event = "registry.api.listen",
+                bind = %h.local_addr,
+            ),
+            Err(e) => {
+                tracing::error!(
+                    target: "cid_backend",
+                    event = "config.load_failed",
+                    error = %e,
+                );
+                eprintln!("cid-backend-daemon registry API bind failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
 
     let loop_config = config.to_loop_config();
     let poll = config.poll_interval;
-    let mut digest = DigestLoop::with_workers(
-        rpc,
-        NopClock,
-        ssri,
-        loop_config,
-        workers,
-        Some(worker_cmds),
-    )
-    .with_busy_map(busy);
+    let mut digest =
+        DigestLoop::with_workers(rpc, NopClock, ssri, loop_config, workers, Some(worker_cmds))
+            .with_busy_map(busy);
     loop {
         let report = digest.tick();
         let pending = digest

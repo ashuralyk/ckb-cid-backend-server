@@ -161,10 +161,7 @@ macro_rules! impl_host_query_rpc_stubs {
                 Ok(None)
             }
 
-            fn get_block_hash(
-                &self,
-                _: u64,
-            ) -> Result<Option<[u8; 32]>, $crate::rpc::RpcError> {
+            fn get_block_hash(&self, _: u64) -> Result<Option<[u8; 32]>, $crate::rpc::RpcError> {
                 Ok(None)
             }
 

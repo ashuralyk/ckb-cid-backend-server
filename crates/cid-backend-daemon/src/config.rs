@@ -893,9 +893,7 @@ fn parse_health_bind(s: &str) -> Result<SocketAddr, ConfigError> {
 
 fn parse_socket_bind(s: &str, label: &str) -> Result<SocketAddr, ConfigError> {
     s.parse::<SocketAddr>().map_err(|_| {
-        ConfigError::Invalid(format!(
-            "{label}={s} (want host:port, e.g. 127.0.0.1:9101)"
-        ))
+        ConfigError::Invalid(format!("{label}={s} (want host:port, e.g. 127.0.0.1:9101)"))
     })
 }
 
