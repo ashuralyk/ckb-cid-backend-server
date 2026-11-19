@@ -121,6 +121,7 @@ dependencies = [
  "cid-backend-core",
  "cid-process-executor",
  "cid-protocol",
+ "ckb-hash 0.119.0",
  "ckb-types",
 ]
 

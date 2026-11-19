@@ -1,0 +1,52 @@
+# CKB testnet CID digest daemon config (read-only example).
+#
+# Values fetched read-only from https://testnet.ckb.dev/rpc (get_live_cell /
+# get_block_hash). Outpoints change after Type-ID upgrades; the daemon
+# rediscovers code cells each tick from type_id_args — do not pin CellDeps here.
+#
+# Primary Intention scan identity (Type-ID reference):
+#   code_hash = type_id (calc_script_hash of built-in TYPE_ID + type_id_args)
+#   hash_type = type
+# Binary data_hash Intentions are NOT scanned unless listed under
+# [[cid_lock.legacy_scan_locks]]. Local data1 fixtures use code_hash+hash_type
+# without type_id_args (see cid.network.toml.example / docs/local-dev-chain.md).
+#
+# Keyless: no .env, no private keys, no signing.
+
+[network]
+name = "ckb-testnet"
+genesis_hash = "0x10639e0895502b5688a6be8cf69460d76541bfa4821629d86d62ba0aae3f9606"
+validate_genesis = true
+
+[rpc]
+url = "https://testnet.ckb.dev/rpc"
+# indexer_url omitted — same endpoint serves indexer get_cells
+
+[cid_lock]
+# Live CID lock CODE cell (at fetch time):
+#   out_point = 0x5d9e44fca3beb712c9efe848c24f83fb8dba3ff35cfb23353a89631322a155fc:0
+#   data_hash = 0x110f6f793b0a22ccc3942791573933206c5d6b24a8f5ddfe9749ff04f8646dca
+#   (informational only — not used for scan identity when Type-ID is set)
+type_id_args = "0xdfe0a1416c7373e8aaae5257445e940b6ff08e9cbc62ebca8541d28997370f25"
+type_id = "0xf3f8a56c2594030f99f05b09ff1b6a1b07e6e07ed04309c1c4e246561faad326"
+# bounded_refund_locks empty = exact Incompatible refunds (safe default).
+# Allowlist entries must already be scanned (primary / legacy_scan_locks).
+# legacy_scan_locks empty = do not scan pre-Type-ID data1 Intentions.
+# If you later enable legacy_scan_locks for a data_hash drain, also keep that
+# old binary live and list it as an unlabeled [[cell_deps]] (not cid_lock).
+
+[process]
+# Live Process CODE cell (at fetch time):
+#   out_point = 0x2d8634134dea382d2361427dfcbce642b4092782ec4d6ab1b62acfd959f0c79f:0
+#   data_hash = 0xfab29bfe0b150e10c36bc64bfb08589100b07f8e27ddc5213d79429dc7965ed2
+type_id_args = "0x1666a7d877fcabcf28bbc0903df791742a4c83a85dfb666a6c5db7adde76ace7"
+type_id = "0x9efaaa094bdbdc463813d26c82021a2bcc2fc9cf886a3c2cfd04612e44c5f16d"
+
+[loop]
+poll_interval_secs = 5
+confirmation_depth = 24
+fee_rate = 1000
+
+[observe]
+# health_bind = "127.0.0.1:9100"
+log_format = "json"
