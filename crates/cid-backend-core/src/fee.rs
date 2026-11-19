@@ -65,7 +65,10 @@
 //! ## Fee sizing
 //!
 //! CKB tx-pool admission uses `serialized_size_in_block` (molecule bytes +
-//! 4-byte vector offset) and `floor(fee_rate * size / 1000)`. We charge
+//! 4-byte vector offset) and `floor(fee_rate * size / 1000)`. For
+//! `digest_ok`, the Process guest owns fee
+//! (`floor((len+4)*1000/1000)` at `FEE_RATE=1000`); this daemon never rewrites
+//! capacity or witnesses on that path. For Incompatible refunds we charge
 //! `ceil(size * fee_rate / 1000)`. Capacity is fixed-width so one
 //! measure-after-structure pass is stable. Submit must re-check the sized
 //! skeleton (see [`FeeGuard`]) — empty-witness sizing is only valid if later

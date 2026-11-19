@@ -5,7 +5,7 @@ use cid_backend_core::type_id::TYPE_ID_CODE_HASH;
 use cid_process_executor::{AssembledTx, HostCell, MockHost};
 use cid_protocol::CidArgs;
 use ckb_types::core::ScriptHashType;
-use ckb_types::packed::{CellInput, CellOutput, RawTransaction, Script, Transaction};
+use ckb_types::packed::{CellOutput, RawTransaction, Script, Transaction};
 use ckb_types::prelude::*;
 
 pub struct ScriptedSsri {
@@ -154,12 +154,8 @@ fn mimic_assemble(
         let cell = host
             .get_cell(op.as_slice())
             .ok_or_else(|| SsriError::Unusable("missing host cell".into()))?;
-        inputs.push(
-            CellInput::new_builder()
-                .previous_output(op)
-                .since(0u64.pack())
-                .build(),
-        );
+        // Preserve draft `since` (matches Process.assemble / WitnessEx::new_plain path).
+        inputs.push(input);
         if is_process_state(&cell) {
             process_out = Some((cell.output.clone(), cell.data.clone()));
         } else {

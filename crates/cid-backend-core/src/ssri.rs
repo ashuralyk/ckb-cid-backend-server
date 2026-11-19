@@ -258,14 +258,25 @@ mod tests {
         let err = EmbeddedSsri
             .assemble(&bin, &[], host.clone())
             .expect_err("empty draft");
-        assert!(matches!(err, SsriError::Incompatible(21)));
+        // Empty draft: guest rejects before batch bounds (Incompatible family).
+        assert!(
+            matches!(err, SsriError::Incompatible(_)),
+            "empty draft must be Incompatible, got {err:?}"
+        );
 
         let assembled = EmbeddedSsri
             .assemble(&bin, &draft, host)
             .expect("Process.assemble n=1 via ckb-vm");
-        assert_eq!(assembled.outputs.len(), 2, "beneficiary + process recreate");
-        let cap: u64 = assembled.outputs[0].capacity().unpack();
-        assert_eq!(cap, 100_0000_0000);
+        assert_eq!(assembled.outputs.len(), 2, "process recreate + beneficiary");
+        assert_eq!(assembled.witnesses.len(), assembled.inputs.len());
+        // Output 0 = Process recreate (fee deducted); output 1 = beneficiary.
+        let proc_cap: u64 = assembled.outputs[0].capacity().unpack();
+        assert!(
+            proc_cap < 500_0000_0000,
+            "Process fee deducted from recreate"
+        );
+        let ben_cap: u64 = assembled.outputs[1].capacity().unpack();
+        assert_eq!(ben_cap, 100_0000_0000);
 
         let _ = ProcessResolver::for_entry(entry);
         let _ = script_hash32;
@@ -339,10 +350,17 @@ mod tests {
             }
             fn find_live_cells_by_type_script(
                 &self,
-                _: &Script,
+                type_script: &Script,
                 _: usize,
             ) -> Result<Vec<LiveCell>, RpcError> {
-                Ok(vec![])
+                // Process-as-lock resolve discovers state by exact TYPE_ID type script.
+                if self.cell.type_script().as_ref().map(|t| t.as_slice())
+                    == Some(type_script.as_slice())
+                {
+                    Ok(vec![self.cell.clone()])
+                } else {
+                    Ok(vec![])
+                }
             }
             fn dry_run_transaction(&self, _: &TransactionView) -> Result<(), RpcError> {
                 Ok(())

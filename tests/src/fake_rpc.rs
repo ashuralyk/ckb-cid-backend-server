@@ -3,8 +3,9 @@ use std::sync::Mutex;
 
 use cid_backend_core::host_query::HostQueryRpc;
 use cid_backend_core::rpc::{out_point_key, script_hash32, LiveCell, Rpc, RpcError, TxStatus};
+use cid_process_executor::{HostQuery, MockHost, Pagination};
 use ckb_types::core::{ScriptHashType, TransactionView};
-use ckb_types::packed::{Byte32, OutPoint, Script};
+use ckb_types::packed::{Byte32, Header, OutPoint, Script};
 use ckb_types::prelude::*;
 
 #[derive(Default)]
@@ -27,6 +28,9 @@ struct Inner {
     consumed_by_tx: HashMap<Vec<u8>, Vec<LiveCell>>,
     tx_status: HashMap<Vec<u8>, TxStatus>,
     tip: u64,
+    headers_by_number: HashMap<u64, Vec<u8>>,
+    headers_by_hash: HashMap<[u8; 32], Vec<u8>>,
+    block_hashes: HashMap<u64, [u8; 32]>,
 }
 
 pub struct FakeRpc {
@@ -47,6 +51,45 @@ impl FakeRpc {
             inner.order.push(cell.out_point.clone());
         }
         inner.cells.insert(key, cell);
+    }
+
+    /// Store a packed molecule `Header` for host-query syscalls 2327/2337/2347.
+    pub fn insert_header(&self, number: u64, header: Header) {
+        let bytes = header.as_slice().to_vec();
+        let hash_b32 = header.calc_header_hash();
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(hash_b32.as_slice());
+        let mut inner = self.inner.lock().unwrap();
+        inner.block_hashes.insert(number, hash);
+        inner.headers_by_number.insert(number, bytes.clone());
+        inner.headers_by_hash.insert(hash, bytes);
+    }
+
+    /// Override the synthetic tip hash used when no header was inserted.
+    pub fn insert_block_hash(&self, number: u64, hash: [u8; 32]) {
+        self.inner.lock().unwrap().block_hashes.insert(number, hash);
+    }
+
+    fn index_host(inner: &Inner) -> MockHost {
+        let host = MockHost::new();
+        for cell in inner.cells.values() {
+            host.insert_cell(
+                cell.out_point.clone(),
+                cell.output.clone(),
+                cell.data.clone(),
+            );
+        }
+        for (&number, bytes) in &inner.headers_by_number {
+            if let Ok(header) = Header::from_slice(bytes) {
+                host.insert_header(number, header);
+            }
+        }
+        for (&number, hash) in &inner.block_hashes {
+            if !inner.headers_by_number.contains_key(&number) {
+                host.insert_block_hash(number, *hash);
+            }
+        }
+        host
     }
 
     pub fn consume(&self, op: &OutPoint) {
@@ -430,26 +473,48 @@ impl HostQueryRpc for FakeRpc {
         if inner.fail_tip_queries {
             return Err(RpcError::Unavailable("injected tip unavailable".into()));
         }
+        if let Some(h) = inner.block_hashes.get(&number) {
+            return Ok(Some(*h));
+        }
+        // Deterministic synthetic tip hash when callers only set_tip.
         let mut h = [0u8; 32];
         h[..8].copy_from_slice(&number.to_le_bytes());
         Ok(Some(h))
     }
 
-    fn get_header_by_number(&self, _number: u64) -> Result<Option<Vec<u8>>, RpcError> {
-        Ok(None)
+    fn get_header_by_number(&self, number: u64) -> Result<Option<Vec<u8>>, RpcError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner.headers_by_number.get(&number).cloned())
     }
 
-    fn get_header(&self, _hash: &[u8; 32]) -> Result<Option<Vec<u8>>, RpcError> {
-        Ok(None)
+    fn get_header(&self, hash: &[u8; 32]) -> Result<Option<Vec<u8>>, RpcError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner.headers_by_hash.get(hash).cloned())
     }
 
     fn get_cells_page(
         &self,
-        _search_key_molecule: &[u8],
-        _limit: u32,
-        _after: &[u8],
+        search_key_molecule: &[u8],
+        limit: u32,
+        after: &[u8],
     ) -> Result<(Vec<LiveCell>, Vec<u8>), RpcError> {
-        Ok((Vec::new(), Vec::new()))
+        let inner = self.inner.lock().unwrap();
+        let host = Self::index_host(&inner);
+        let page = HostQuery::get_cells(&host, search_key_molecule, 0, u64::from(limit), after)
+            .map_err(|_| RpcError::Unavailable("get_cells_page: invalid SearchKey".into()))?;
+        let pag: Pagination = serde_molecule::from_slice(&page, false)
+            .map_err(|e| RpcError::Unavailable(format!("get_cells_page pagination: {e}")))?;
+        let mut cells = Vec::with_capacity(pag.objects.len());
+        for obj in &pag.objects {
+            let op = OutPoint::new_builder()
+                .tx_hash(Byte32::from_slice(&obj.out_point.tx_hash).unwrap())
+                .index(obj.out_point.index.pack())
+                .build();
+            if let Some(live) = inner.cells.get(&out_point_key(&op)) {
+                cells.push(live.clone());
+            }
+        }
+        Ok((cells, pag.last_cursor))
     }
 }
 

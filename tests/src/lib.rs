@@ -1,10 +1,12 @@
 pub mod fake_rpc;
 pub mod helpers;
+pub mod host_query_syscalls;
 pub mod process_resolver;
 pub mod scripted_ssri;
 pub mod submit_inflight;
 pub mod vertical_batch_bounds;
 pub mod vertical_confirm;
+pub mod vertical_embedded_ssri;
 pub mod vertical_failure;
 pub mod vertical_fee;
 pub mod vertical_incompatible;

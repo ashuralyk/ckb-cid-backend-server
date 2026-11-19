@@ -34,11 +34,11 @@ pub use fee::{
     RefundFeeMode, DEFAULT_FEE_RATE, MAX_FEE_RATE, MAX_REFUND_FEE,
 };
 pub use host_query::{
-    encode_block_hash, encode_cell_data, encode_cell_output, seed_host_for_batch,
-    seed_mock_host_for_draft, seed_mock_host_from_live_cells, HostQueryError, HostQueryRpc,
-    DEFAULT_HOST_QUERY_PAGE_LIMIT, DEFAULT_HOST_QUERY_TIMEOUT_SECS, FIND_CELL_BY_OUT_POINT,
-    FIND_CELL_DATA_BY_OUT_POINT, GET_BLOCK_HASH, GET_CELLS, GET_HEADER, GET_HEADER_BY_NUMBER,
-    GET_LIVE_CELL,
+    encode_block_hash, encode_cell_data, encode_cell_output, search_key_molecule_to_json,
+    seed_host_for_batch, seed_mock_host_for_draft, seed_mock_host_from_live_cells, HostQueryError,
+    HostQueryRpc, RpcHostQuery, DEFAULT_HOST_QUERY_PAGE_LIMIT, DEFAULT_HOST_QUERY_TIMEOUT_SECS,
+    FIND_CELL_BY_OUT_POINT, FIND_CELL_DATA_BY_OUT_POINT, GET_BLOCK_HASH, GET_CELLS, GET_HEADER,
+    GET_HEADER_BY_NUMBER, GET_LIVE_CELL,
 };
 pub use process::{ProcessEntry, ProcessResolver, ResolvedProcess};
 pub use process_busy::ProcessBusyMap;
