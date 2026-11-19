@@ -221,12 +221,7 @@ fn apply_commit(inner: &mut Inner, tx_hash: &Byte32) {
     else {
         return;
     };
-    for (i, (output, data)) in tx
-        .outputs()
-        .into_iter()
-        .zip(tx.outputs_data().into_iter())
-        .enumerate()
-    {
+    for (i, (output, data)) in tx.outputs().into_iter().zip(tx.outputs_data()).enumerate() {
         let op = OutPoint::new_builder()
             .tx_hash(tx_hash.clone())
             .index((i as u32).pack())

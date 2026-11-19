@@ -6,7 +6,6 @@ mod tests {
     use cid_backend_core::process::ProcessResolver;
     use cid_backend_core::rpc::{out_point_key, script_hash32};
     use ckb_types::core::ScriptHashType;
-    use ckb_types::prelude::*;
 
     use crate::fake_rpc::FakeRpc;
     use crate::helpers::{intention_cell, process_cell, process_type_script, CID_CODE};

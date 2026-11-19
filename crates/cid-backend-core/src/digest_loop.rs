@@ -26,6 +26,8 @@ fn hex_pref(bytes: &[u8]) -> String {
 }
 
 pub struct LoopConfig {
+    /// Primary CID lock scan `code_hash`. From daemon Type-ID config this is
+    /// the derived TYPE_ID type-script hash paired with [`ScriptHashType::Type`].
     pub cid_code_hash: [u8; 32],
     pub hash_type: ScriptHashType,
     pub poll_interval: Duration,
@@ -195,6 +197,14 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
 
     pub fn state(&self) -> &LoopState {
         &self.state
+    }
+
+    pub fn config(&self) -> &LoopConfig {
+        &self.config
+    }
+
+    pub fn config_mut(&mut self) -> &mut LoopConfig {
+        &mut self.config
     }
 
     pub fn run(&mut self) {
