@@ -157,6 +157,7 @@ where
             tick_cell_deps,
             refund_policy,
             &mut report,
+            true,
         );
     }
 
@@ -308,6 +309,7 @@ where
                 tick_cell_deps,
                 refund_policy,
                 &mut report,
+                false,
             );
         }
         Err(SsriError::Incompatible(code)) => {
@@ -450,6 +452,7 @@ fn handle_incompatible_refunds<R: Rpc + HostQueryRpc>(
     tick_cell_deps: &[CellDep],
     refund_policy: &RefundPolicy,
     report: &mut BatchReportDelta,
+    refund_only: bool,
 ) -> (BatchOutcome, BatchReportDelta) {
     let mut by_identity: Vec<(CidLockIdentity, Vec<ScannedIntention>)> = Vec::new();
     for item in batch {
@@ -487,6 +490,7 @@ fn handle_incompatible_refunds<R: Rpc + HostQueryRpc>(
             tick_cell_deps,
             refund_policy,
             report,
+            refund_only,
         );
         match outcome {
             BatchOutcome::Submitted => submitted = true,
@@ -501,8 +505,8 @@ fn handle_incompatible_refunds<R: Rpc + HostQueryRpc>(
 
     // Each group was authorized by the same guest result. Finish independent
     // refunds even when another identity has to be split and retried.
-    // Fee-unaffordable groups must not become Rejected (no isolate shrink) and
-    // stay marked for below-min refund retries on later ticks (P2/P3).
+    // Fee-unaffordable groups stay marked pending; digest_loop strips them from
+    // drop_first/shrink when a sibling identity is Rejected (P3).
     let outcome = rejection.unwrap_or(if retry_later {
         BatchOutcome::RetryLater
     } else if submitted {
@@ -524,6 +528,7 @@ fn assemble_and_submit_refund<R: Rpc + HostQueryRpc>(
     tick_cell_deps: &[CellDep],
     refund_policy: &RefundPolicy,
     report: &mut BatchReportDelta,
+    refund_only: bool,
 ) -> BatchOutcome {
     let mode = refund_policy.mode_for(&group[0].lock_identity());
     let skeleton =
@@ -583,7 +588,13 @@ fn assemble_and_submit_refund<R: Rpc + HostQueryRpc>(
     {
         let worker = state.lock().expect("process worker state");
         if worker.submit.rejected_combos.contains(&fp) {
-            return BatchOutcome::CachedRejected;
+            // refund_only: cached permanent failure — soft skip, no isolate.
+            return if refund_only {
+                report.skipped += group.len();
+                BatchOutcome::Continue
+            } else {
+                BatchOutcome::CachedRejected
+            };
         }
     }
     let consumed: Vec<_> = skeleton
@@ -604,7 +615,13 @@ fn assemble_and_submit_refund<R: Rpc + HostQueryRpc>(
                 n = group.len(),
             );
             report.last_error = Some(format!("dry-run rejected: {m}"));
-            return BatchOutcome::Rejected;
+            // refund_only leftovers: cache combo, do not isolate-split (P3).
+            return if refund_only {
+                report.skipped += group.len();
+                BatchOutcome::Continue
+            } else {
+                BatchOutcome::Rejected
+            };
         }
         DryRunGate::Skip(m) => {
             tracing::warn!(
@@ -627,11 +644,8 @@ fn assemble_and_submit_refund<R: Rpc + HostQueryRpc>(
                 event = "submit.ok",
                 tx_hash = %hex_pref(tx_hash.as_slice()),
             );
-            for item in group {
-                worker
-                    .pending_incompatible_refund
-                    .remove(&out_point_key(&item.out_point));
-            }
+            // Keep pending_incompatible_refund until the out-point leaves
+            // live_keys / pending occupancy (Drop/reorg must still retry).
             report.submitted += 1;
             BatchOutcome::Submitted
         }
@@ -654,7 +668,13 @@ fn assemble_and_submit_refund<R: Rpc + HostQueryRpc>(
                 n = group.len(),
             );
             report.last_error = Some(format!("submit rejected: {m}"));
-            BatchOutcome::Rejected
+            // refund_only: cache the combo but do not isolate-split (P3).
+            if refund_only {
+                report.skipped += group.len();
+                BatchOutcome::Continue
+            } else {
+                BatchOutcome::Rejected
+            }
         }
         Err(e) => {
             tracing::warn!(
