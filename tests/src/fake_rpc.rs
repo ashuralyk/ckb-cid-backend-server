@@ -514,12 +514,13 @@ impl HostQueryRpc for FakeRpc {
     fn get_cells_page(
         &self,
         search_key_molecule: &[u8],
+        order: u64,
         limit: u32,
         after: &[u8],
     ) -> Result<(Vec<IndexedLiveCell>, Vec<u8>), RpcError> {
         let inner = self.inner.lock().unwrap();
         let host = Self::index_host(&inner);
-        let page = HostQuery::get_cells(&host, search_key_molecule, 0, u64::from(limit), after)
+        let page = HostQuery::get_cells(&host, search_key_molecule, order, u64::from(limit), after)
             .map_err(|_| RpcError::Unavailable("get_cells_page: invalid SearchKey".into()))?;
         let pag: Pagination = serde_molecule::from_slice(&page, false)
             .map_err(|e| RpcError::Unavailable(format!("get_cells_page pagination: {e}")))?;

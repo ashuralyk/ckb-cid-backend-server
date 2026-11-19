@@ -18,6 +18,7 @@ mod tests {
     use ckb_types::core::ScriptHashType;
     use ckb_types::packed::{Byte32, Header, OutPoint, RawHeader, Script};
     use ckb_types::prelude::*;
+    use std::sync::Arc;
 
     use crate::fake_rpc::FakeRpc;
     use crate::helpers::{live_cell, lock_script, out_point, FIXTURE_ELF};
@@ -58,7 +59,7 @@ mod tests {
 
     #[test]
     fn fakerpc_find_cell_by_out_point_via_host_query_and_mock_host() {
-        let rpc = FakeRpc::new();
+        let rpc = Arc::new(FakeRpc::new());
         let cell = live_cell(
             out_point(1, 0),
             lock_script([0x11; 32], ScriptHashType::Type, vec![]),
@@ -67,7 +68,7 @@ mod tests {
             vec![0xAA],
         );
         rpc.insert_cell(cell.clone());
-        let hq = RpcHostQuery::new(&rpc);
+        let hq = RpcHostQuery::new(rpc.clone());
         let via_rpc = HostQuery::find_cell_by_out_point(&hq, cell.out_point.as_slice()).unwrap();
         assert_eq!(via_rpc, cell.output.as_slice());
 
@@ -77,14 +78,14 @@ mod tests {
             data: cell.data.clone(),
         };
         rpc.set_tip(0);
-        let host = seed_host_for_batch(&rpc, &[draft], 0).unwrap();
+        let host = seed_host_for_batch(rpc.as_ref(), &[draft], 0).unwrap();
         let via_mock = HostQuery::find_cell_by_out_point(&host, cell.out_point.as_slice()).unwrap();
         assert_eq!(via_mock, via_rpc);
     }
 
     #[test]
     fn fakerpc_find_cell_data_by_out_point_via_host_query_and_mock_host() {
-        let rpc = FakeRpc::new();
+        let rpc = Arc::new(FakeRpc::new());
         let cell = live_cell(
             out_point(2, 0),
             lock_script([0x22; 32], ScriptHashType::Type, vec![]),
@@ -93,7 +94,7 @@ mod tests {
             vec![0xDE, 0xAD],
         );
         rpc.insert_cell(cell.clone());
-        let hq = RpcHostQuery::new(&rpc);
+        let hq = RpcHostQuery::new(rpc.clone());
         let via_rpc =
             HostQuery::find_cell_data_by_out_point(&hq, cell.out_point.as_slice()).unwrap();
         assert_eq!(via_rpc, cell.data);
@@ -104,7 +105,7 @@ mod tests {
             data: cell.data.clone(),
         };
         rpc.set_tip(0);
-        let host = seed_host_for_batch(&rpc, &[draft], 0).unwrap();
+        let host = seed_host_for_batch(rpc.as_ref(), &[draft], 0).unwrap();
         let via_mock =
             HostQuery::find_cell_data_by_out_point(&host, cell.out_point.as_slice()).unwrap();
         assert_eq!(via_mock, via_rpc);
@@ -112,7 +113,7 @@ mod tests {
 
     #[test]
     fn fakerpc_get_live_cell_via_host_query_and_mock_host() {
-        let rpc = FakeRpc::new();
+        let rpc = Arc::new(FakeRpc::new());
         let cell = live_cell(
             out_point(3, 0),
             lock_script([0x33; 32], ScriptHashType::Type, vec![]),
@@ -121,7 +122,7 @@ mod tests {
             vec![0x01],
         );
         rpc.insert_cell(cell.clone());
-        let hq = RpcHostQuery::new(&rpc);
+        let hq = RpcHostQuery::new(rpc.clone());
         let via_rpc = HostQuery::get_live_cell(&hq, cell.out_point.as_slice(), true).unwrap();
         let decoded: ExecLiveCell = serde_molecule::from_slice(&via_rpc, false).unwrap();
         assert!(decoded.output.is_some());
@@ -133,7 +134,7 @@ mod tests {
             data: cell.data.clone(),
         };
         rpc.set_tip(0);
-        let host = seed_host_for_batch(&rpc, &[draft], 0).unwrap();
+        let host = seed_host_for_batch(rpc.as_ref(), &[draft], 0).unwrap();
         let via_mock = HostQuery::get_live_cell(&host, cell.out_point.as_slice(), true).unwrap();
         let decoded_mock: ExecLiveCell = serde_molecule::from_slice(&via_mock, false).unwrap();
         assert_eq!(decoded_mock.output, decoded.output);
@@ -142,10 +143,10 @@ mod tests {
 
     #[test]
     fn fakerpc_get_header_via_host_query_and_mock_host() {
-        let rpc = FakeRpc::new();
+        let rpc = Arc::new(FakeRpc::new());
         let header = sample_header(9);
         rpc.insert_header(9, header.clone());
-        let hq = RpcHostQuery::new(&rpc);
+        let hq = RpcHostQuery::new(rpc.clone());
         let by_number = HostQuery::get_header_by_number(&hq, 9).unwrap();
         assert_eq!(by_number, header.as_slice());
         let hash = header.calc_header_hash();
@@ -166,7 +167,7 @@ mod tests {
             output: cell.output.clone(),
             data: cell.data.clone(),
         };
-        let host = seed_host_for_batch(&rpc, &[draft], 9).unwrap();
+        let host = seed_host_for_batch(rpc.as_ref(), &[draft], 9).unwrap();
         assert_eq!(
             HostQuery::get_header_by_number(&host, 9).as_deref(),
             Some(header.as_slice())
@@ -179,9 +180,9 @@ mod tests {
 
     #[test]
     fn fakerpc_get_block_hash_via_host_query_and_mock_host() {
-        let rpc = FakeRpc::new();
+        let rpc = Arc::new(FakeRpc::new());
         rpc.insert_block_hash(4, [0x44; 32]);
-        let hq = RpcHostQuery::new(&rpc);
+        let hq = RpcHostQuery::new(rpc.clone());
         assert_eq!(HostQuery::get_block_hash(&hq, 4), Some([0x44; 32]));
 
         let cell = live_cell(
@@ -197,13 +198,13 @@ mod tests {
             output: cell.output,
             data: cell.data,
         };
-        let host = seed_host_for_batch(&rpc, &[draft], 4).unwrap();
+        let host = seed_host_for_batch(rpc.as_ref(), &[draft], 4).unwrap();
         assert_eq!(HostQuery::get_block_hash(&host, 4), Some([0x44; 32]));
     }
 
     #[test]
     fn fakerpc_get_cells_pagination_and_script_len_range_via_host_query() {
-        let rpc = FakeRpc::new();
+        let rpc = Arc::new(FakeRpc::new());
         let lock_code = [0xBBu8; 32];
         let with_type = {
             live_cell(
@@ -251,7 +252,7 @@ mod tests {
             group_by_transaction: None,
         };
         let key_bytes = serde_molecule::to_vec(&key, false).unwrap();
-        let hq = RpcHostQuery::new(&rpc);
+        let hq = RpcHostQuery::new(rpc.clone());
         let page = HostQuery::get_cells(&hq, &key_bytes, 0, 10, &[]).unwrap();
         let pag: Pagination = serde_molecule::from_slice(&page, false).unwrap();
         assert_eq!(pag.objects.len(), 1);
@@ -272,7 +273,7 @@ mod tests {
     /// FakeRpc + RpcHostQuery must emit the same order and `tx_index` metadata.
     #[test]
     fn fakerpc_get_cells_orders_by_block_tx_output_index_and_emits_tx_index() {
-        let rpc = FakeRpc::new();
+        let rpc = Arc::new(FakeRpc::new());
         let lock_code = [0xCCu8; 32];
         let lock = lock_script(lock_code, ScriptHashType::Type, vec![]);
         // Insert out of order: later block first, then earlier block with higher
@@ -303,7 +304,7 @@ mod tests {
             group_by_transaction: None,
         };
         let key_bytes = serde_molecule::to_vec(&key, false).unwrap();
-        let hq = RpcHostQuery::new(&rpc);
+        let hq = RpcHostQuery::new(rpc.clone());
         let page = HostQuery::get_cells(&hq, &key_bytes, 0, 10, &[]).unwrap();
         let pag: Pagination = serde_molecule::from_slice(&page, false).unwrap();
         assert_eq!(pag.objects.len(), 4);
@@ -339,7 +340,7 @@ mod tests {
         use cid_backend_core::type_id::{type_id_script, type_id_script_hash};
         use cid_protocol::{CidArgs, Payload, Script as CidScript};
 
-        let rpc = FakeRpc::new();
+        let rpc = Arc::new(FakeRpc::new());
         let state_args = [0xCDu8; 32];
         let type_hash = type_id_script_hash(&state_args);
         let code_hash = type_id_script_hash(&[0xABu8; 32]);
@@ -398,7 +399,7 @@ mod tests {
                 data: state.data.clone(),
             },
         ];
-        let host = seed_host_for_batch(&rpc, &cells, 0).expect("seed from FakeRpc");
+        let host = seed_host_for_batch(rpc.as_ref(), &cells, 0).expect("seed from FakeRpc");
         // Probe HostQuery surface before VM (same MockHost the executor uses).
         assert!(HostQuery::find_cell_by_out_point(&host, intent_op.as_slice()).is_some());
         assert!(HostQuery::find_cell_data_by_out_point(&host, intent_op.as_slice()).is_some());

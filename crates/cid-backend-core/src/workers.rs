@@ -10,10 +10,11 @@ use crate::ssri::SsriHost;
 use crate::submit::SubmitState;
 use ckb_types::packed::CellDep;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 fn process_thread_name(hash: &[u8; 32]) -> String {
     format!(
@@ -59,6 +60,8 @@ enum ProcessWorkerJob {
     Ping(Sender<()>),
     Shutdown,
     RunBatch {
+        /// Epoch when the job was enqueued; worker ignores late replies after cancel.
+        job_epoch: u64,
         process: ResolvedProcess,
         batch: Vec<ScannedIntention>,
         execution_code_key: Vec<u8>,
@@ -74,6 +77,10 @@ pub struct ProcessWorker {
     job_tx: Sender<ProcessWorkerJob>,
     join: Option<JoinHandle<()>>,
     thread_name: String,
+    /// Shared cancel/epoch: bump to invalidate in-flight RunBatch before submit.
+    epoch: Arc<AtomicU64>,
+    /// True while a RunBatch is outstanding (sent, reply not yet consumed).
+    batch_outstanding: Arc<AtomicBool>,
 }
 
 impl ProcessWorker {
@@ -89,6 +96,10 @@ impl ProcessWorker {
 
     pub fn thread_name(&self) -> &str {
         &self.thread_name
+    }
+
+    pub fn batch_outstanding(&self) -> bool {
+        self.batch_outstanding.load(Ordering::SeqCst)
     }
 
     pub fn ping(&self) -> bool {
@@ -107,10 +118,27 @@ impl ProcessWorker {
         tick_cell_deps: Vec<CellDep>,
         max_assembled_tx_bytes: usize,
     ) -> (BatchOutcome, BatchReportDelta) {
+        let skipped = batch.len();
+        if self
+            .batch_outstanding
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return (
+                BatchOutcome::Continue,
+                BatchReportDelta {
+                    skipped,
+                    last_error: Some("worker: RunBatch already outstanding".into()),
+                    ..BatchReportDelta::default()
+                },
+            );
+        }
+        let job_epoch = self.epoch.load(Ordering::SeqCst);
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         if self
             .job_tx
             .send(ProcessWorkerJob::RunBatch {
+                job_epoch,
                 process,
                 batch,
                 execution_code_key,
@@ -120,17 +148,45 @@ impl ProcessWorker {
             })
             .is_err()
         {
-            return (BatchOutcome::Continue, BatchReportDelta::default());
+            self.batch_outstanding.store(false, Ordering::SeqCst);
+            return (
+                BatchOutcome::Continue,
+                BatchReportDelta {
+                    skipped,
+                    last_error: Some("worker dead: RunBatch send failed".into()),
+                    ..BatchReportDelta::default()
+                },
+            );
         }
-        reply_rx
-            .recv_timeout(Duration::from_secs(600))
-            .unwrap_or((BatchOutcome::Continue, BatchReportDelta::default()))
+        // Block for the real reply — never synthesize Continue while the worker
+        // may still be assembling/submitting (P0-1).
+        let result = match reply_rx.recv() {
+            Ok(r) => r,
+            Err(_) => (
+                BatchOutcome::Continue,
+                BatchReportDelta {
+                    skipped,
+                    last_error: Some("worker dead: RunBatch reply channel closed".into()),
+                    ..BatchReportDelta::default()
+                },
+            ),
+        };
+        self.batch_outstanding.store(false, Ordering::SeqCst);
+        result
+    }
+
+    /// Bump epoch so an in-flight job fails closed before submit; late replies
+    /// for the old epoch are ignored by the worker thread.
+    fn cancel_inflight(&self) {
+        self.epoch.fetch_add(1, Ordering::SeqCst);
     }
 
     fn shutdown(mut self) {
+        self.cancel_inflight();
         let _ = self.job_tx.send(ProcessWorkerJob::Shutdown);
         if let Some(handle) = self.join.take() {
-            join_with_timeout(handle, Duration::from_secs(5));
+            // Keep JoinHandle until join completes — never detach/abandon (P0-2).
+            let _ = handle.join();
         }
     }
 }
@@ -138,6 +194,7 @@ impl ProcessWorker {
 fn worker_thread_main<R, S>(
     job_rx: Receiver<ProcessWorkerJob>,
     state: Arc<Mutex<ProcessWorkerState>>,
+    epoch: Arc<AtomicU64>,
     rpc: Arc<R>,
     ssri: Arc<S>,
 ) where
@@ -151,6 +208,7 @@ fn worker_thread_main<R, S>(
             }
             ProcessWorkerJob::Shutdown => break,
             ProcessWorkerJob::RunBatch {
+                job_epoch,
                 process,
                 batch,
                 execution_code_key,
@@ -158,42 +216,53 @@ fn worker_thread_main<R, S>(
                 max_assembled_tx_bytes,
                 reply,
             } => {
+                if epoch.load(Ordering::SeqCst) != job_epoch {
+                    // Cancelled before start — fail closed; do not synthesize success.
+                    let skipped = batch.len();
+                    let _ = reply.send((
+                        BatchOutcome::Continue,
+                        BatchReportDelta {
+                            skipped,
+                            last_error: Some("worker: RunBatch cancelled (stale epoch)".into()),
+                            ..BatchReportDelta::default()
+                        },
+                    ));
+                    continue;
+                }
                 let hash = {
                     let g = state.lock().expect("state");
                     g.process_type_hash()
                 };
-                let result = {
-                    let mut g = state.lock().expect("state");
-                    run_process_batch(
-                        rpc.as_ref(),
-                        ssri.as_ref(),
-                        ProcessBatchParams {
-                            hash,
-                            worker: &mut g,
-                            process: &process,
-                            batch,
-                            execution_code_key: &execution_code_key,
-                            tick_cell_deps: &tick_cell_deps,
-                            max_assembled_tx_bytes,
+                let result = run_process_batch(
+                    rpc.clone(),
+                    ssri.as_ref(),
+                    ProcessBatchParams {
+                        hash,
+                        state: state.clone(),
+                        process: &process,
+                        batch,
+                        execution_code_key: &execution_code_key,
+                        tick_cell_deps: &tick_cell_deps,
+                        max_assembled_tx_bytes,
+                        job_epoch,
+                        epoch: epoch.clone(),
+                    },
+                );
+                // Ignore late replies after cancel/epoch bump (P0-1).
+                if epoch.load(Ordering::SeqCst) != job_epoch {
+                    let _ = reply.send((
+                        BatchOutcome::Continue,
+                        BatchReportDelta {
+                            last_error: Some("worker: RunBatch cancelled before reply".into()),
+                            ..BatchReportDelta::default()
                         },
-                    )
-                };
+                    ));
+                    continue;
+                }
                 let _ = reply.send(result);
             }
         }
     }
-}
-
-fn join_with_timeout(handle: JoinHandle<()>, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    while !handle.is_finished() {
-        if Instant::now() >= deadline {
-            log::warn!("process worker join timed out after {:?}", timeout);
-            return;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    let _ = handle.join();
 }
 
 fn spawn_process_worker<R, S>(
@@ -210,23 +279,36 @@ where
     let name = process_thread_name(&hash);
     let thread_name = name.clone();
     let state_thread = state.clone();
+    let epoch = Arc::new(AtomicU64::new(0));
+    let epoch_thread = epoch.clone();
+    let batch_outstanding = Arc::new(AtomicBool::new(false));
     let rpc_c = rpc.clone();
     let ssri_c = ssri.clone();
     let join = thread::Builder::new()
         .name(name)
-        .spawn(move || worker_thread_main(job_rx, state_thread, rpc_c, ssri_c))
+        .spawn(move || worker_thread_main(job_rx, state_thread, epoch_thread, rpc_c, ssri_c))
         .expect("spawn process worker thread");
     ProcessWorker {
         state,
         job_tx,
         join: Some(join),
         thread_name,
+        epoch,
+        batch_outstanding,
     }
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum WorkerRemoveError {
     InFlight,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum WorkerRegisterError {
+    /// A RunBatch is outstanding on this Process thread.
+    BatchInFlight,
+    /// Code identity change refused while submit.pending is non-empty.
+    PendingCodeChange,
 }
 
 pub struct WorkerPool<R, S> {
@@ -289,18 +371,29 @@ where
         }
     }
 
-    pub fn register(&mut self, entry: ProcessEntry) -> bool {
+    /// Register or update a Process worker.
+    ///
+    /// Refuses while a RunBatch is outstanding. Refuses a code-identity change
+    /// while `submit.pending` is non-empty (P0-2 / P1-5).
+    pub fn register(&mut self, entry: ProcessEntry) -> Result<bool, WorkerRegisterError> {
         let key = entry.identity_type_hash;
         match self.workers.get(&key) {
             None => {
                 let inner = Arc::new(Mutex::new(ProcessWorkerState::with_generation(entry, 1)));
                 let worker = spawn_process_worker(key, inner, self.rpc.clone(), self.ssri.clone());
                 self.workers.insert(key, worker);
-                true
+                Ok(true)
             }
             Some(worker) => {
+                if worker.batch_outstanding() {
+                    return Err(WorkerRegisterError::BatchInFlight);
+                }
+                let code_changed = worker.with_state(|s| s.entry.code != entry.code);
+                let pending = worker.with_state(|s| !s.submit.pending.is_empty());
+                if code_changed && pending {
+                    return Err(WorkerRegisterError::PendingCodeChange);
+                }
                 worker.with_state_mut(|state| {
-                    let code_changed = state.entry.code != entry.code;
                     state.generation = state.generation.saturating_add(1);
                     state.entry = entry.clone();
                     state.resolver = ProcessResolver::for_entry(entry);
@@ -309,7 +402,7 @@ where
                         state.isolate_expanded.clear();
                     }
                 });
-                false
+                Ok(false)
             }
         }
     }
@@ -338,7 +431,7 @@ where
         let Some(worker) = self.workers.get(hash) else {
             return Ok(false);
         };
-        if worker.with_state(|s| !s.submit.pending.is_empty()) {
+        if worker.batch_outstanding() || worker.with_state(|s| !s.submit.pending.is_empty()) {
             return Err(WorkerRemoveError::InFlight);
         }
         let worker = self.workers.remove(hash).expect("exists");
@@ -444,7 +537,7 @@ mod tests {
         let mut pool = pool();
         let e = entry([0x01; 32], [0x02; 32]);
         let hash = e.identity_type_hash;
-        assert!(pool.register(e));
+        assert!(pool.register(e).unwrap());
         let w = pool.get(&hash).unwrap();
         assert!(w.thread_name().starts_with("cid-proc-"));
         assert!(w.ping(), "worker thread must respond to ping");
@@ -455,7 +548,7 @@ mod tests {
         let mut pool = pool();
         let e1 = entry([0x01; 32], [0x02; 32]);
         let hash = e1.identity_type_hash;
-        assert!(pool.register(e1.clone()));
+        assert!(pool.register(e1.clone()).unwrap());
         pool.get(&hash).unwrap().with_state_mut(|w| {
             w.submit.in_flight.insert(vec![0xaa]);
             w.isolate_resume = Some(vec![0xbb]);
@@ -463,7 +556,7 @@ mod tests {
 
         let mut e1b = e1.clone();
         e1b.ssri_elf_path = None;
-        assert!(!pool.register(e1b));
+        assert!(!pool.register(e1b).unwrap());
         pool.get(&hash).unwrap().with_state(|w| {
             assert!(w.submit.in_flight.contains(&vec![0xaa]));
             assert_eq!(w.isolate_resume.as_deref(), Some(&[0xbb][..]));
@@ -482,11 +575,36 @@ mod tests {
             w.submit.rejected_combos.insert(vec![0x01]);
             w.isolate_expanded.insert(vec![0x02]);
         });
-        assert!(!pool.register(entry([0x10; 32], [0x21; 32])));
+        assert!(!pool.register(entry([0x10; 32], [0x21; 32])).unwrap());
         pool.get(&hash).unwrap().with_state(|w| {
             assert!(w.submit.rejected_combos.is_empty());
             assert!(w.isolate_expanded.is_empty());
         });
+    }
+
+    #[test]
+    fn register_refuses_code_change_when_pending_nonempty() {
+        let mut pool = WorkerPool::from_entries(
+            vec![entry([0x10; 32], [0x20; 32])],
+            Arc::new(EmptyRpc),
+            Arc::new(NopSsri),
+        );
+        let hash = type_id_script_hash(&[0x10; 32]);
+        pool.get(&hash).unwrap().with_state_mut(|w| {
+            w.submit.pending.insert(
+                vec![0x01],
+                crate::submit::PendingTx {
+                    consumed: vec![],
+                    created: vec![],
+                    seen_committed: false,
+                },
+            );
+        });
+        assert!(matches!(
+            pool.register(entry([0x10; 32], [0x21; 32])),
+            Err(WorkerRegisterError::PendingCodeChange)
+        ));
+        assert!(pool.contains(&hash));
     }
 
     #[test]
@@ -538,5 +656,41 @@ mod tests {
         assert_eq!(pool.len(), 2);
         assert!(!pool.is_empty());
         assert_eq!(pool.hashes().len(), 2);
+    }
+
+    /// P0-2: while RunBatch is outstanding, refuse remove and re-register so a
+    /// second worker thread cannot be spawned against the same Process.
+    #[test]
+    fn refuse_remove_and_register_while_run_batch_outstanding() {
+        let mut pool = pool();
+        let e = entry([0x60; 32], [0x61; 32]);
+        let hash = e.identity_type_hash;
+        assert!(pool.register(e.clone()).unwrap());
+
+        let worker = pool.get(&hash).unwrap();
+        assert!(!worker.batch_outstanding());
+        worker.batch_outstanding.store(true, Ordering::SeqCst);
+
+        assert!(matches!(
+            pool.try_remove(&hash),
+            Err(WorkerRemoveError::InFlight)
+        ));
+        assert!(matches!(
+            pool.register(entry([0x60; 32], [0x62; 32])),
+            Err(WorkerRegisterError::BatchInFlight)
+        ));
+        assert!(matches!(
+            pool.register(e.clone()),
+            Err(WorkerRegisterError::BatchInFlight)
+        ));
+        assert!(pool.contains(&hash));
+        assert_eq!(pool.len(), 1);
+
+        pool.get(&hash)
+            .unwrap()
+            .batch_outstanding
+            .store(false, Ordering::SeqCst);
+        // JoinHandle still live after refused remove — thread responds to ping.
+        assert!(pool.get(&hash).unwrap().ping());
     }
 }
