@@ -7,6 +7,9 @@
 //! process_type_hash` from CID args.
 
 use crate::config::{ConfigError, DaemonConfig};
+use cid_backend_core::host_query::{
+    HostQueryRpc, DEFAULT_HOST_QUERY_PAGE_LIMIT, DEFAULT_HOST_QUERY_TIMEOUT_SECS,
+};
 use cid_backend_core::rpc::{script_hash32, LiveCell, Rpc, RpcError, TxStatus};
 use ckb_types::core::{DepType, ScriptHashType, TransactionView};
 use ckb_types::packed::{Byte32, CellInput, CellOutput, OutPoint, Script};
@@ -356,6 +359,127 @@ impl Rpc for CkbRpc {
     fn tip_block_number(&self) -> Result<u64, RpcError> {
         let result = self.rpc_call(&self.node_url, "get_tip_block_number", json!([]))?;
         parse_uint(&result)
+    }
+}
+
+impl HostQueryRpc for CkbRpc {
+    fn get_live_cell(&self, out_point: &OutPoint) -> Result<Option<LiveCell>, RpcError> {
+        let result = self.rpc_call(
+            &self.node_url,
+            "get_live_cell",
+            json!([out_point_json(out_point), true]),
+        )?;
+        let status = result
+            .get("status")
+            .and_then(|s| s.as_str())
+            .unwrap_or("unknown");
+        if status != "live" {
+            return Ok(None);
+        }
+        let Some(cell) = result.get("cell") else {
+            return Ok(None);
+        };
+        let data = match result.get("data") {
+            Some(Value::String(s)) => decode_hex(s)?,
+            _ => Vec::new(),
+        };
+        Ok(Some(LiveCell {
+            out_point: out_point.clone(),
+            output: json_to_output(cell)?,
+            data,
+        }))
+    }
+
+    fn get_block_hash(&self, number: u64) -> Result<Option<[u8; 32]>, RpcError> {
+        let result = self.rpc_call(
+            &self.node_url,
+            "get_block_hash",
+            json!([hex_u64(number)]),
+        )?;
+        if result.is_null() {
+            return Ok(None);
+        }
+        let hex = result.as_str().ok_or_else(|| {
+            RpcError::Unavailable("get_block_hash: result not hex".into())
+        })?;
+        let bytes = decode_hex(hex)?;
+        <[u8; 32]>::try_from(bytes.as_slice())
+            .map(Some)
+            .map_err(|_| RpcError::Unavailable("get_block_hash: not 32 bytes".into()))
+    }
+
+    fn get_header_by_number(&self, number: u64) -> Result<Option<Vec<u8>>, RpcError> {
+        let result = self.rpc_call(
+            &self.node_url,
+            "get_header_by_number",
+            json!([hex_u64(number)]),
+        )?;
+        if result.is_null() {
+            return Ok(None);
+        }
+        serde_json::to_vec(&result)
+            .map(Some)
+            .map_err(|e| RpcError::Unavailable(format!("get_header_by_number encode: {e}")))
+    }
+
+    fn get_header(&self, hash: &[u8; 32]) -> Result<Option<Vec<u8>>, RpcError> {
+        let result = self.rpc_call(&self.node_url, "get_header", json!([hex_bytes(hash)]))?;
+        if result.is_null() {
+            return Ok(None);
+        }
+        serde_json::to_vec(&result)
+            .map(Some)
+            .map_err(|e| RpcError::Unavailable(format!("get_header encode: {e}")))
+    }
+
+    fn get_cells_page(
+        &self,
+        search_key_molecule: &[u8],
+        limit: u32,
+        after: &[u8],
+    ) -> Result<(Vec<LiveCell>, Vec<u8>), RpcError> {
+        let _ = DEFAULT_HOST_QUERY_TIMEOUT_SECS;
+        let search_key = search_key_json_from_molecule(search_key_molecule)?;
+        let page_limit = u64::from(limit.min(DEFAULT_HOST_QUERY_PAGE_LIMIT).max(1));
+        let after_val = json_after_cursor(after);
+        let result = self.rpc_call(
+            &self.indexer_url,
+            "get_cells",
+            json!([search_key, "asc", hex_u64(page_limit), after_val]),
+        )?;
+        let objects = result
+            .get("objects")
+            .and_then(|o| o.as_array())
+            .ok_or_else(|| RpcError::Unavailable("get_cells: missing objects".into()))?;
+        let mut cells = Vec::with_capacity(objects.len());
+        for obj in objects {
+            cells.push(live_cell_from_indexer(obj)?);
+        }
+        let next = result
+            .get("last_cursor")
+            .and_then(|c| c.as_str())
+            .unwrap_or("");
+        Ok((cells, next.as_bytes().to_vec()))
+    }
+}
+
+fn search_key_json_from_molecule(bytes: &[u8]) -> Result<Value, RpcError> {
+    serde_json::from_slice(bytes).map_err(|_| {
+        RpcError::Unavailable(
+            "get_cells_page: search_key must be JSON bytes (molecule decode pending catalog)"
+                .into(),
+        )
+    })
+}
+
+fn json_after_cursor(after: &[u8]) -> Value {
+    if after.is_empty() {
+        return Value::Null;
+    }
+    if let Ok(s) = std::str::from_utf8(after) {
+        Value::String(s.to_string())
+    } else {
+        Value::String(hex_bytes(after))
     }
 }
 
@@ -849,7 +973,7 @@ mod tests {
 
     const PROC_CODE_ARGS: [u8; 32] = [0xCDu8; 32];
 
-    fn register_fixture_process<R: Rpc, C: Clock, S: SsriHost>(
+    fn register_fixture_process<R: Rpc + HostQueryRpc, C: Clock, S: SsriHost>(
         loop_: &mut DigestLoop<R, C, S>,
         unique: u8,
     ) {
@@ -1395,6 +1519,36 @@ mod tests {
         }
     }
 
+    fn indexer_cell_rpc_live(obj: &Value) -> Value {
+        json!({
+            "status": "live",
+            "cell": obj["output"].clone(),
+            "data": obj.get("output_data").cloned().unwrap_or(Value::String("0x".into())),
+        })
+    }
+
+    fn out_point_matches_indexer(obj: &Value, op: &Value) -> bool {
+        obj.get("out_point")
+            .map(|oop| oop["tx_hash"] == op["tx_hash"] && oop["index"] == op["index"])
+            .unwrap_or(false)
+    }
+
+    fn host_query_for_indexer_cells(
+        method: &str,
+        params: &Value,
+        cells: &[Value],
+    ) -> Option<Result<Value, (i64, String)>> {
+        match method {
+            "get_block_hash" => Some(Ok(Value::String(format!("0x{}", "ee".repeat(32))))),
+            "get_live_cell" => {
+                let op = &params[0];
+                let found = cells.iter().find(|c| out_point_matches_indexer(c, op));
+                found.map(|c| Ok(indexer_cell_rpc_live(c)))
+            }
+            _ => None,
+        }
+    }
+
     fn live_intent_and_process() -> (Value, Value, [u8; 32]) {
         let ts = process_type_script(1);
         let hash = script_hash32(&ts);
@@ -1437,7 +1591,8 @@ mod tests {
             }
             "get_transaction" => Ok(json!({"tx_status":{"status":"pending"}})),
             "get_tip_block_number" => Ok(json!("0x0")),
-            other => Err((-1, format!("unexpected {other}"))),
+            other => host_query_for_indexer_cells(other, &params, &[intent.clone(), proc.clone()])
+                .unwrap_or_else(|| Err((-1, format!("unexpected {other}")))),
         }));
         let mut loop_ = DigestLoop::new(
             CkbRpc::with_process_code_hashes(&url, &url, vec![PROC_CODE]),
@@ -1505,7 +1660,8 @@ mod tests {
                 }
             }
             "get_tip_block_number" => Ok(json!(format!("0x{:x}", tip2.load(Ordering::SeqCst)))),
-            other => Err((-1, format!("unexpected {other} params={params}"))),
+            other => host_query_for_indexer_cells(other, &params, &[intent.clone(), proc.clone()])
+                .unwrap_or_else(|| Err((-1, format!("unexpected {other} params={params}")))),
         }));
         let mut loop_ = DigestLoop::new(
             CkbRpc::with_process_code_hashes(&url, &url, vec![PROC_CODE]),
@@ -1656,7 +1812,8 @@ mod tests {
             }
             "get_transaction" => Ok(json!({"tx_status":{"status":"pending"}})),
             "get_tip_block_number" => Ok(json!("0x0")),
-            other => Err((-1, format!("unexpected {other}"))),
+            other => host_query_for_indexer_cells(other, &params, &[intent.clone(), proc.clone()])
+                .unwrap_or_else(|| Err((-1, format!("unexpected {other}")))),
         }));
 
         // The handler above always returns both cells for every get_cells, including
@@ -1859,6 +2016,8 @@ mod tests {
             &[0x7f, b'E', b'L', b'F', 1],
         );
         const STICKY: usize = 6400;
+        let valid_intent =
+            indexer_cell(2, STICKY as u32, lock_json(CID_CODE, &args), None, 100_0000_0000, &[]);
         let submitted = Arc::new(Mutex::new(0usize));
         let submitted2 = submitted.clone();
         let url = spawn_mock(Arc::new(move |method, params| match method {
@@ -1890,7 +2049,12 @@ mod tests {
             }
             "get_transaction" => Ok(json!({"tx_status": {"status": "pending"}})),
             "get_tip_block_number" => Ok(json!("0x0")),
-            other => Err((-1, format!("unexpected {other}"))),
+            other => host_query_for_indexer_cells(
+                other,
+                &params,
+                &[valid_intent.clone(), proc.clone()],
+            )
+            .unwrap_or_else(|| Err((-1, format!("unexpected {other}")))),
         }));
         let cfg = LoopConfig {
             cid_code_hash: CID_CODE,
@@ -1925,6 +2089,65 @@ mod tests {
             r2.submitted, 0,
             "pending occupancy holds; sticky cells must not hide it from scan"
         );
+    }
+
+    #[test]
+    fn host_query_get_live_cell_block_hash_and_cells_page() {
+        let url = spawn_mock(Arc::new(|method, params| match method {
+            "get_live_cell" => {
+                let op = &params[0];
+                assert_eq!(
+                    op.get("index").and_then(|v| v.as_str()),
+                    Some("0x0")
+                );
+                Ok(json!({
+                    "cell": {
+                        "capacity": "0x64",
+                        "lock": lock_json(CID_CODE, &[]),
+                        "type": null,
+                    },
+                    "data": "0xab",
+                    "status": "live",
+                }))
+            }
+            "get_block_hash" => Ok(Value::String(format!("0x{}", "cd".repeat(32)))),
+            "get_cells" => {
+                assert_eq!(params[2].as_str(), Some("0x32"));
+                Ok(cells_result(vec![indexer_cell(
+                    1,
+                    0,
+                    lock_json(CID_CODE, &[]),
+                    None,
+                    100,
+                    &[0x01],
+                )]))
+            }
+            other => Err((-1, format!("unexpected {other}"))),
+        }));
+        let rpc = CkbRpc::new(&url, &url);
+        let op = OutPoint::new_builder()
+            .tx_hash(Byte32::from_slice(&[0x11; 32]).unwrap())
+            .index(0u32.pack())
+            .build();
+        let live = HostQueryRpc::get_live_cell(&rpc, &op).unwrap().expect("cell");
+        assert_eq!(live.data, vec![0xab]);
+        let hash = HostQueryRpc::get_block_hash(&rpc, 9).unwrap().expect("hash");
+        assert_eq!(hash, [0xcd; 32]);
+        let key = json!({
+            "script": json_script(&CID_CODE, ScriptHashType::Type, &[]),
+            "script_type": "lock",
+            "script_search_mode": "prefix",
+            "with_data": true,
+        });
+        let (page, cursor) = HostQueryRpc::get_cells_page(
+            &rpc,
+            &serde_json::to_vec(&key).unwrap(),
+            DEFAULT_HOST_QUERY_PAGE_LIMIT,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(cursor, b"0x");
     }
 
     #[test]

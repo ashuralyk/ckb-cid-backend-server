@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
+use cid_backend_core::host_query::HostQueryRpc;
 use cid_backend_core::rpc::{out_point_key, script_hash32, LiveCell, Rpc, RpcError, TxStatus};
 use ckb_types::core::{ScriptHashType, TransactionView};
 use ckb_types::packed::{Byte32, OutPoint, Script};
@@ -392,6 +393,40 @@ impl Rpc for FakeRpc {
     }
 }
 
+impl HostQueryRpc for FakeRpc {
+    fn get_live_cell(&self, out_point: &OutPoint) -> Result<Option<LiveCell>, RpcError> {
+        let inner = self.inner.borrow();
+        Ok(inner.cells.get(&out_point_key(out_point)).cloned())
+    }
+
+    fn get_block_hash(&self, number: u64) -> Result<Option<[u8; 32]>, RpcError> {
+        let inner = self.inner.borrow();
+        if inner.fail_tip_queries {
+            return Err(RpcError::Unavailable("injected tip unavailable".into()));
+        }
+        let mut h = [0u8; 32];
+        h[..8].copy_from_slice(&number.to_le_bytes());
+        Ok(Some(h))
+    }
+
+    fn get_header_by_number(&self, _number: u64) -> Result<Option<Vec<u8>>, RpcError> {
+        Ok(None)
+    }
+
+    fn get_header(&self, _hash: &[u8; 32]) -> Result<Option<Vec<u8>>, RpcError> {
+        Ok(None)
+    }
+
+    fn get_cells_page(
+        &self,
+        _search_key_molecule: &[u8],
+        _limit: u32,
+        _after: &[u8],
+    ) -> Result<(Vec<LiveCell>, Vec<u8>), RpcError> {
+        Ok((Vec::new(), Vec::new()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,6 +435,30 @@ mod tests {
 
     const CID_CODE: [u8; 32] = [0xC1; 32];
     const OTHER_CODE: [u8; 32] = [0x99; 32];
+
+    #[test]
+    fn fakerpc_host_query_resolves_inserted_cells_and_tip() {
+        let rpc = FakeRpc::new();
+        rpc.set_tip(12);
+        let cell = live_cell(
+            out_point(9, 0),
+            lock_script(CID_CODE, ScriptHashType::Type, vec![]),
+            None,
+            100,
+            vec![0xAA],
+        );
+        rpc.insert_cell(cell.clone());
+        let got = HostQueryRpc::get_live_cell(&rpc, &cell.out_point)
+            .unwrap()
+            .expect("live");
+        assert_eq!(got.data, cell.data);
+        let mut tip_hash = [0u8; 32];
+        tip_hash[..8].copy_from_slice(&12u64.to_le_bytes());
+        assert_eq!(
+            HostQueryRpc::get_block_hash(&rpc, 12).unwrap(),
+            Some(tip_hash)
+        );
+    }
 
     #[test]
     fn fakerpc_stores_and_lists_intention_cells_in_insert_order() {
