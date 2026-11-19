@@ -1,6 +1,7 @@
 use crate::logging::LogFormat;
 use cid_backend_core::digest_loop::{LoopConfig, DEFAULT_CONFIRMATION_DEPTH};
 use cid_backend_core::type_id::{TypeIdCodeDep, TypeIdIdentity};
+use cid_backend_core::{CidLockIdentity, DEFAULT_FEE_RATE, MAX_FEE_RATE};
 use ckb_types::core::{DepType, ScriptHashType};
 use ckb_types::packed::{Byte32, CellDep, OutPoint};
 use ckb_types::prelude::*;
@@ -29,6 +30,15 @@ pub struct DaemonConfig {
     pub health_bind: Option<SocketAddr>,
     /// Confirmation depth for submitted execution txs. Default 24.
     pub confirmation_depth: u64,
+    /// Shannons per 1000 bytes (KW) for digest_ok fee from Process recreate.
+    /// Default [`cid_backend_core::DEFAULT_FEE_RATE`].
+    pub fee_rate: u64,
+    /// Audited CID lock identities that may use bounded refund fee mode.
+    /// Empty (default) ⇒ legacy exact refunds. Never insert undeployed
+    /// candidate hashes.
+    pub bounded_refund_locks: Vec<CidLockIdentity>,
+    /// Extra CID lock identities to scan (e.g. legacy locks after redeploy).
+    pub extra_scan_locks: Vec<CidLockIdentity>,
     /// Human label for logs only. Never used to select RPC or contracts.
     pub network_name: Option<String>,
     /// Declared genesis block hash. File mode requires it. Not verified unless
@@ -116,6 +126,9 @@ impl DaemonConfig {
             extra_cell_deps: self.extra_cell_deps.clone(),
             type_id_code_deps: self.type_id_code_deps.clone(),
             confirmation_depth: self.confirmation_depth,
+            fee_rate: self.fee_rate,
+            bounded_refund_locks: self.bounded_refund_locks.clone(),
+            extra_scan_locks: self.extra_scan_locks.clone(),
         }
     }
 }
@@ -236,6 +249,21 @@ struct CidLockSection {
     /// Optional full type-script hash for fail-closed check. Not args.
     #[serde(default)]
     type_id: Option<String>,
+    /// Audited `(code_hash, hash_type)` pairs that may use bounded refunds.
+    /// Empty (default) ⇒ legacy exact for all scanned Intentions.
+    #[serde(default)]
+    bounded_refund_locks: Vec<LockIdentityFile>,
+    /// Extra locks to scan besides the primary `code_hash` / Type-ID.
+    #[serde(default)]
+    legacy_scan_locks: Vec<LockIdentityFile>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LockIdentityFile {
+    code_hash: String,
+    #[serde(default)]
+    hash_type: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -279,6 +307,8 @@ struct LoopSection {
     poll_interval_secs: Option<u64>,
     #[serde(default)]
     confirmation_depth: Option<u64>,
+    #[serde(default)]
+    fee_rate: Option<u64>,
 }
 
 #[derive(Default, Deserialize)]
@@ -601,6 +631,28 @@ fn merge<F: Fn(&str) -> Option<String>>(
         },
     };
 
+    let fee_rate = match nonempty(&get, "CID_FEE_RATE") {
+        Some(s) => parse_fee_rate(&s, "CID_FEE_RATE")?,
+        None => match digest.fee_rate {
+            Some(n) => validate_fee_rate(n, "loop.fee_rate")?,
+            None => DEFAULT_FEE_RATE,
+        },
+    };
+    // Capability allowlist: empty ⇒ legacy exact. Env overrides TOML lists.
+    let bounded_refund_locks = match nonempty(&get, "CID_BOUNDED_REFUND_LOCKS") {
+        Some(s) => parse_lock_identity_list(&s, "CID_BOUNDED_REFUND_LOCKS")?,
+        None => parse_lock_identity_files(
+            &cid_lock.bounded_refund_locks,
+            "cid_lock.bounded_refund_locks",
+        )?,
+    };
+    let extra_scan_locks = match nonempty(&get, "CID_LEGACY_SCAN_LOCKS") {
+        Some(s) => parse_lock_identity_list(&s, "CID_LEGACY_SCAN_LOCKS")?,
+        None => {
+            parse_lock_identity_files(&cid_lock.legacy_scan_locks, "cid_lock.legacy_scan_locks")?
+        }
+    };
+
     let network_name = network.name.filter(|s| !s.trim().is_empty());
 
     let genesis_hash = match nonempty(&get, "CID_GENESIS_HASH") {
@@ -643,6 +695,9 @@ fn merge<F: Fn(&str) -> Option<String>>(
         process_type_code_hashes,
         health_bind,
         confirmation_depth,
+        fee_rate,
+        bounded_refund_locks,
+        extra_scan_locks,
         network_name,
         genesis_hash,
         validate_genesis,
@@ -759,6 +814,75 @@ fn parse_poll_secs(raw: &str) -> Result<u64, ConfigError> {
         ));
     }
     Ok(secs)
+}
+
+fn parse_lock_identity_files(
+    rows: &[LockIdentityFile],
+    label: &str,
+) -> Result<Vec<CidLockIdentity>, ConfigError> {
+    let mut out = Vec::with_capacity(rows.len());
+    for (i, row) in rows.iter().enumerate() {
+        let code_hash = parse_hex32(&row.code_hash).map_err(|_| {
+            ConfigError::Invalid(format!("{label}[{i}].code_hash must be 32 bytes hex"))
+        })?;
+        let hash_type = match row.hash_type.as_deref() {
+            None | Some("") => ScriptHashType::Type,
+            Some(s) => parse_hash_type(s)?,
+        };
+        out.push(CidLockIdentity::new(code_hash, hash_type));
+    }
+    Ok(out)
+}
+
+/// `0xhash:hash_type,0xhash2:data1` (hash_type optional, default `type`).
+fn parse_lock_identity_list(s: &str, label: &str) -> Result<Vec<CidLockIdentity>, ConfigError> {
+    let mut out = Vec::new();
+    for (i, part) in s.split(',').enumerate() {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (hash_s, ht_s) = match part.rsplit_once(':') {
+            Some((h, t)) if looks_like_hash_type(t) => (h, Some(t)),
+            _ => (part, None),
+        };
+        let code_hash = parse_hex32(hash_s).map_err(|_| {
+            ConfigError::Invalid(format!("{label}[{i}] code_hash must be 32 bytes hex"))
+        })?;
+        let hash_type = match ht_s {
+            None => ScriptHashType::Type,
+            Some(t) => parse_hash_type(t)?,
+        };
+        out.push(CidLockIdentity::new(code_hash, hash_type));
+    }
+    Ok(out)
+}
+
+fn looks_like_hash_type(s: &str) -> bool {
+    matches!(
+        s.trim().to_ascii_lowercase().as_str(),
+        "type" | "data" | "data1" | "data2"
+    )
+}
+
+fn parse_fee_rate(s: &str, label: &str) -> Result<u64, ConfigError> {
+    let n = s
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| ConfigError::Invalid(format!("{label} not u64")))?;
+    validate_fee_rate(n, label)
+}
+
+fn validate_fee_rate(n: u64, label: &str) -> Result<u64, ConfigError> {
+    if n == 0 {
+        return Err(ConfigError::Invalid(format!("{label} must be > 0")));
+    }
+    if n > MAX_FEE_RATE {
+        return Err(ConfigError::Invalid(format!(
+            "{label} must be <= {MAX_FEE_RATE}"
+        )));
+    }
+    Ok(n)
 }
 
 fn parse_confirmation_depth(s: &str) -> Result<u64, ConfigError> {
@@ -929,9 +1053,87 @@ log_format = "pretty"
         assert!(cfg.process_type_code_hashes.is_empty());
         assert!(cfg.health_bind.is_none());
         assert_eq!(cfg.confirmation_depth, DEFAULT_CONFIRMATION_DEPTH);
+        assert_eq!(cfg.fee_rate, DEFAULT_FEE_RATE);
+        assert!(
+            cfg.bounded_refund_locks.is_empty(),
+            "legacy exact refund must remain the default (empty allowlist)"
+        );
+        assert!(cfg.to_loop_config().bounded_refund_locks.is_empty());
+        assert!(cfg.extra_scan_locks.is_empty());
         assert!(cfg.genesis_hash.is_none());
         assert!(!cfg.validate_genesis);
         assert_eq!(cfg.log_format, LogFormat::Json);
+    }
+
+    #[test]
+    fn fee_rate_defaults_and_toml_env_override() {
+        let path = write_toml(&minimal_toml().replace(
+            "confirmation_depth = 8",
+            "confirmation_depth = 8\nfee_rate = 2500",
+        ));
+        let cfg = DaemonConfig::from_file_and_vars(Some(&path), |_| None).unwrap();
+        assert_eq!(cfg.fee_rate, 2500);
+        assert_eq!(cfg.to_loop_config().fee_rate, 2500);
+
+        let cfg = DaemonConfig::from_file_and_vars(Some(&path), |k| match k {
+            "CID_FEE_RATE" => Some("4000".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(cfg.fee_rate, 4000);
+    }
+
+    #[test]
+    fn bounded_refund_allowlist_toml_and_env() {
+        let path = write_toml(&minimal_toml());
+        let cfg = DaemonConfig::from_file_and_vars(Some(&path), |_| None).unwrap();
+        assert!(cfg.bounded_refund_locks.is_empty());
+
+        let path = write_toml(&format!(
+            "{base}\n[[cid_lock.bounded_refund_locks]]\ncode_hash = \"0x{lock}\"\nhash_type = \"type\"\n[[cid_lock.legacy_scan_locks]]\ncode_hash = \"0x{legacy}\"\nhash_type = \"data1\"\n",
+            base = minimal_toml(),
+            lock = "11".repeat(32),
+            legacy = "22".repeat(32),
+        ));
+        let cfg = DaemonConfig::from_file_and_vars(Some(&path), |_| None).unwrap();
+        assert_eq!(cfg.bounded_refund_locks.len(), 1);
+        assert_eq!(cfg.bounded_refund_locks[0].code_hash, [0x11; 32]);
+        assert_eq!(cfg.extra_scan_locks.len(), 1);
+        assert_eq!(cfg.extra_scan_locks[0].hash_type, ScriptHashType::Data1);
+        assert_eq!(cfg.to_loop_config().bounded_refund_locks.len(), 1);
+
+        let cfg = DaemonConfig::from_file_and_vars(Some(&path), |k| match k {
+            "CID_BOUNDED_REFUND_LOCKS" => Some(format!("0x{}:data1", "33".repeat(32))),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(cfg.bounded_refund_locks.len(), 1);
+        assert_eq!(cfg.bounded_refund_locks[0].code_hash, [0x33; 32]);
+        assert_eq!(cfg.bounded_refund_locks[0].hash_type, ScriptHashType::Data1);
+    }
+
+    #[test]
+    fn fee_rate_zero_and_too_large_rejected() {
+        let err = DaemonConfig::from_vars(|k| match k {
+            "CID_FEE_RATE" => Some("0".into()),
+            other => required_env(other),
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("must be > 0"), "{err}");
+
+        let err = DaemonConfig::from_vars(|k| match k {
+            "CID_FEE_RATE" => Some((MAX_FEE_RATE + 1).to_string()),
+            other => required_env(other),
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("must be <="), "{err}");
+
+        let path = write_toml(&minimal_toml().replace(
+            "confirmation_depth = 8",
+            "confirmation_depth = 8\nfee_rate = 0",
+        ));
+        let err = DaemonConfig::from_file_and_vars(Some(&path), |_| None).unwrap_err();
+        assert!(err.to_string().contains("must be > 0"), "{err}");
     }
 
     #[test]
@@ -1256,9 +1458,7 @@ poll_interval_secs = 1
 
     #[test]
     fn unknown_key_rejected() {
-        let p = write_toml(
-            "[network]\ngenesis_hash = \"aa\"\nprivate_key = \"SECRET_MARKER\"\n",
-        );
+        let p = write_toml("[network]\ngenesis_hash = \"aa\"\nprivate_key = \"SECRET_MARKER\"\n");
         let err = DaemonConfig::from_file_and_vars(Some(&p), |_| None).unwrap_err();
         let msg = err.to_string();
         assert_toml_diag_safe(&msg, "SECRET_MARKER");

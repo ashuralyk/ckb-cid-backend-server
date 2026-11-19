@@ -34,6 +34,9 @@ mod tests {
                 extra_cell_deps: vec![],
                 type_id_code_deps: vec![],
                 confirmation_depth: 1,
+                fee_rate: 1000,
+                bounded_refund_locks: vec![],
+                extra_scan_locks: vec![],
             },
             ProcessResolver::new(),
         );
@@ -105,6 +108,9 @@ mod tests {
             extra_cell_deps: vec![],
             type_id_code_deps: vec![],
             confirmation_depth: 1,
+            fee_rate: 1000,
+            bounded_refund_locks: vec![],
+            extra_scan_locks: vec![],
         }
     }
 

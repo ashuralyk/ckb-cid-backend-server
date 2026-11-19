@@ -26,8 +26,13 @@ The daemon continuously digests CID Intentions:
 3. Resolve the matching live Process cell. SSRI binary source: **Type-ID Process code** (when `process.type_id_args` is set) uses that code-cell ELF for the tick; otherwise legacy **state-cell data** ELF (local data1). The daemon does **not** install a Process-binary fallback.
 4. In-process SSRI: `Process.batch` yields `[min, max]`; `Process.assemble` yields a partial tx.
 5. Assemble an Execution Tx and `send_transaction`:
-   - **`digest_ok`**: destroy this batch of Intentions; Process **1 in / 1 out** recreate. No extra fee / sponsor input; User Lock is not placed in inputs (no signature after Intention creation). Skip on capacity shortfall.
-   - **`digest_incompatible`**: when SSRI returns `Incompatible(code)`, refund to the **User Lock** in args (does not spend Process). Exact **capacity** is copied, and original cell **data** is kept. Supported assets: pure CKB (no type script), or **standard xUDT** (official Data1 `XUDT_CODE_HASH` + 16-byte amount) which also keeps the type script. Any other type script, or xUDT data that is not 16 bytes, is `RefundUnbuildable`: log and skip. See `assemble.rs::refund_output`.
+   - **`digest_ok`**: destroy this batch of Intentions; Process **1 in / 1 out** recreate. No extra fee / sponsor input; fee is `ceil(serialized_size_in_block * loop.fee_rate / 1000)` deducted from the Process recreate (default rate 1000). User Lock is not placed in inputs (no signature after Intention creation). Skip on capacity shortfall; on fee-unaffordable, isolate/shrink the batch window (non-permanent).
+   - **`digest_incompatible`**: when SSRI returns `Incompatible(code)`, refund to the **User Lock** in args (**does not spend Process**; never co-bundles DigestOk / Process I/O — Process example `verify.rs` requires exact capacity when mixed with DigestOk). Original cell **data** / type / lock are kept. Supported assets: pure CKB (no type script), or **standard xUDT** (official Data1 `XUDT_CODE_HASH` + 16-byte amount). Any other type script, or xUDT data that is not 16 bytes, is `RefundUnbuildable`: log and skip. See `assemble.rs::refund_output`.
+   - **Refund fee modes** (explicit **allowlist** of audited CID lock identities; default **legacy exact**):
+     - Default (empty `cid_lock.bounded_refund_locks`): exact Intention capacity → paid fee **0**. Required for currently deployed CID locks. Public nodes with `min_fee_rate > 0` reject these (`-1104`); daemon logs `refund.zero_fee`; local-dev uses `min_fee_rate = 0`.
+     - Opt-in: list redeployed lock `(code_hash, hash_type)` under `[[cid_lock.bounded_refund_locks]]` / `CID_BOUNDED_REFUND_LOCKS` after OWNER deploy of a lock enforcing contract PR #12 head `9bc8193` or newer (`F >= S`, ≤ `MAX_REFUND_FEE` per Intention, on-chain `MixedCidLock` for mixed CID identities). Deduct `ceil(size * fee_rate / 1000)` from refund outputs only; sum of cuts == miner fee; isolate/shrink if unaffordable. Intentions whose lock is not allowlisted stay exact. Mixed batches are **partitioned by lock identity** (never haircut a legacy lock inside a bounded tx; never co-bundle two different bounded-capable identities — on-chain `MixedCidLock` is the real protocol defense; assembler partition is defense-in-depth). Allowlist may hold multiple verified deployed hashes after migration; operators fill in the deployed identity after redeploy — do not list undeployed / unpublished candidates (e.g. `0x2edb827f…`, `0x9897167b…`).
+   - **TimeoutBurn** remains exact and out of this keyless loop (no refund fee window).
+   - Submit re-checks assemble `FeeGuard` (size unchanged / paid ≥ required). Real-node `min_fee_rate` acceptance is a **release gate** — see `docs/refund-fee-migration.md`.
 6. After a successful submit, occupy spent inputs (and the `digest_ok` Process recreate) until confirmation depth is met.
 
 Out of scope: timeout-burn proxy, multi-sig fee sponsor, official ssri-server, multi-instance coordination, testnet/mainnet ops scripts.
@@ -129,7 +134,7 @@ Do not use public RPC. The supported entry is:
 ./scripts/local-dev-chain.sh
 ```
 
-That script: auto-downloads pinned `ckb` v0.119.0 **only** as `x86_64-unknown-linux-gnu` (skip download if `$CKB_DIR/ckb` is already executable; default `CKB_DIR=.local-ckb`); inits `dev` with genesis miner lock; sets `min_fee_rate` to **0** (digest tx has no fee input); enables the Indexer module; builds RISC-V guests (`clang-18` / `CLANG`, `git`, `make`, `python3`); starts `ckb run` + `ckb miner` on `127.0.0.1:8114`; exports `CID_CKB_RPC_URL`, `CID_PROCESS_EXAMPLE_PATH`, `CID_LOCK_ELF_PATH`, `CID_ALWAYS_SUCCESS_PATH`, `CID_LOCAL_CHAIN_E2E=1`; then runs:
+That script: auto-downloads pinned `ckb` v0.119.0 **only** as `x86_64-unknown-linux-gnu` (skip download if `$CKB_DIR/ckb` is already executable; default `CKB_DIR=.local-ckb`); inits `dev` with genesis miner lock; sets `min_fee_rate` to **0** (no fee input; `digest_ok` fees come from Process recreate); enables the Indexer module; builds RISC-V guests (`clang-18` / `CLANG`, `git`, `make`, `python3`); starts `ckb run` + `ckb miner` on `127.0.0.1:8114`; exports `CID_CKB_RPC_URL`, `CID_PROCESS_EXAMPLE_PATH`, `CID_LOCK_ELF_PATH`, `CID_ALWAYS_SUCCESS_PATH`, `CID_LOCAL_CHAIN_E2E=1`; then runs:
 
 ```bash
 cargo test -p cid-backend-daemon --test local_chain_e2e -- --ignored --nocapture
@@ -213,7 +218,7 @@ flowchart TD
   peek -->|cache hit| split["CachedRejected: split window, no send"]
   peek --> assemble["SSRI Process.assemble"]
   assemble -->|ok| dok["assemble_digest_ok<br/>Intention + Process 1in/1out"]
-  assemble -->|Incompatible| dinc["assemble_digest_incompatible<br/>User Lock refund, do not spend Process"]
+  assemble -->|Incompatible| dinc["assemble_digest_incompatible<br/>User Lock refund; no Process; exact by default"]
   assemble -->|Unusable| skip["log + skip"]
   dok --> send["send_transaction"]
   dinc --> send

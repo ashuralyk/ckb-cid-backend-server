@@ -37,6 +37,17 @@ type_id = "<CID_LOCK_TYPE_ID_FULL_HASH_32>"   # optional verify; must match deri
 # Legacy / local data1 fixtures (no Type-ID discovery for this role):
 # code_hash = "<CID_LOCK_CODE_HASH_32>"
 # hash_type = "data1"
+# Bounded Incompatible refund fee allowlist (≤ 0.01 CKB / Intention).
+# Empty (default) = exact refund for all locks. List ONLY audited deployed
+# identities that enforce contract PR #12 (F>=S). Never undeployed candidates.
+# See docs/refund-fee-migration.md.
+# [[cid_lock.bounded_refund_locks]]
+# code_hash = "<AUDITED_DEPLOYED_CID_LOCK_HASH_32>"
+# hash_type = "data1"
+# Optional: keep scanning legacy exact-refund locks after redeploy.
+# [[cid_lock.legacy_scan_locks]]
+# code_hash = "<LEGACY_CID_LOCK_HASH_32>"
+# hash_type = "data1"
 
 [process]
 # Process CODE cell Type ID (not the live Process state cell).
@@ -65,6 +76,9 @@ type_id = "<PROCESS_CODE_TYPE_ID_FULL_HASH_32>"  # optional verify
 [loop]
 poll_interval_secs = 5
 confirmation_depth = 24
+# Shannons per 1000 bytes (KW). digest_ok pays by reducing Process recreate
+# capacity (no fee input). Default 1000. Must be > 0 and <= 10000000.
+# fee_rate = 1000
 
 [observe]
 # health_bind = "127.0.0.1:9100"           # omit/empty disables HTTP

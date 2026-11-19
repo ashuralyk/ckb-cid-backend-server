@@ -1,8 +1,9 @@
 use crate::assemble::{assemble_digest_incompatible, assemble_digest_ok, AssembleError};
 use crate::code_deps::{resolve_execution_cell_deps, CodeDepError};
+use crate::fee::{lock_allows_bounded_refund, CidLockIdentity, RefundFeeMode};
 use crate::process::{ProcessResolver, ResolvedProcess};
 use crate::rpc::{out_point_key, Rpc, RpcError, TxStatus};
-use crate::scan::{bucket_by_process_type_hash, scan_intentions, ScannedIntention};
+use crate::scan::{bucket_by_process_type_hash, scan_intentions_multi, ScannedIntention};
 use crate::ssri::{to_intention_input, SsriError, SsriHost};
 use crate::submit::{combo_fingerprint, execution_code_key, submit_execution, SubmitState};
 use crate::type_id::TypeIdCodeDep;
@@ -38,6 +39,47 @@ pub struct LoopConfig {
     /// occupancy is released. `1` settles on first sight of Committed at the
     /// tip. Daemon default is [`DEFAULT_CONFIRMATION_DEPTH`].
     pub confirmation_depth: u64,
+    /// Shannons per 1000 bytes (KW) charged on `digest_ok` by reducing the
+    /// Process recreate capacity, and on bounded Incompatible refunds for
+    /// allowlisted locks. Default [`crate::fee::DEFAULT_FEE_RATE`].
+    pub fee_rate: u64,
+    /// Audited CID lock identities that may use bounded refund fee mode.
+    /// Empty (default) ⇒ legacy exact refunds for every Intention. May list
+    /// multiple verified deployed identities after migration; the digest
+    /// loop never co-bundles distinct identities in one refund tx. Never
+    /// put an undeployed candidate hash here.
+    pub bounded_refund_locks: Vec<CidLockIdentity>,
+    /// Extra CID lock identities to scan in addition to
+    /// [`Self::cid_code_hash`] / [`Self::hash_type`] (e.g. legacy locks still
+    /// draining after a redeploy). Deduped with the primary and allowlist.
+    pub extra_scan_locks: Vec<CidLockIdentity>,
+}
+
+impl LoopConfig {
+    /// Unique scan targets: primary + allowlist + extras.
+    pub fn scan_lock_identities(&self) -> Vec<CidLockIdentity> {
+        let mut out = Vec::new();
+        let primary = CidLockIdentity::new(self.cid_code_hash, self.hash_type);
+        out.push(primary);
+        for id in self
+            .bounded_refund_locks
+            .iter()
+            .chain(self.extra_scan_locks.iter())
+        {
+            if !out.iter().any(|x| x == id) {
+                out.push(*id);
+            }
+        }
+        out
+    }
+
+    pub fn refund_mode_for(&self, intention: &ScannedIntention) -> RefundFeeMode {
+        if lock_allows_bounded_refund(&self.bounded_refund_locks, &intention.lock_identity()) {
+            RefundFeeMode::Bounded
+        } else {
+            RefundFeeMode::Exact
+        }
+    }
 }
 
 /// Conservative default: 24 CKB blocks (~3 minutes at ~8s). Overridable via
@@ -88,6 +130,10 @@ enum BatchOutcome {
     Rejected,
     /// Combo already in `rejected_combos`; isolate without a new submit.
     CachedRejected,
+    /// Process recreate or bounded-refund budgets cannot fund fee for this
+    /// window. Isolate/shrink like `Rejected` (smaller batch → lower fee /
+    /// more headroom) but do **not** combo-reject — non-permanent.
+    FeeUnaffordable,
     /// Conflict / Unavailable / assemble skip: remaining items may continue.
     Continue,
     /// Process recreate already occupied; stop digest_ok this tick.
@@ -214,32 +260,37 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
             .resolver
             .set_tick_process_code(resolved.process_code.as_ref().map(|c| &c.cell));
 
-        let scanned =
-            match scan_intentions(&self.rpc, &self.config.cid_code_hash, self.config.hash_type) {
-                Ok(v) => v,
-                Err(RpcError::Unavailable(m)) => {
-                    tracing::warn!(
-                        target: LOG_TARGET,
-                        event = "scan.unavailable",
-                        error = %m,
-                    );
-                    report.last_error = Some(format!("scan unavailable: {m}"));
-                    self.state.tick_cell_deps.clear();
-                    self.state.resolver.set_tick_process_code(None);
-                    return report;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        target: LOG_TARGET,
-                        event = "scan.unavailable",
-                        error = %e,
-                    );
-                    report.last_error = Some(format!("scan error: {e}"));
-                    self.state.tick_cell_deps.clear();
-                    self.state.resolver.set_tick_process_code(None);
-                    return report;
-                }
-            };
+        let scan_ids: Vec<([u8; 32], ScriptHashType)> = self
+            .config
+            .scan_lock_identities()
+            .into_iter()
+            .map(|id| (id.code_hash, id.hash_type))
+            .collect();
+        let scanned = match scan_intentions_multi(&self.rpc, &scan_ids) {
+            Ok(v) => v,
+            Err(RpcError::Unavailable(m)) => {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    event = "scan.unavailable",
+                    error = %m,
+                );
+                report.last_error = Some(format!("scan unavailable: {m}"));
+                self.state.tick_cell_deps.clear();
+                self.state.resolver.set_tick_process_code(None);
+                return report;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    event = "scan.unavailable",
+                    error = %e,
+                );
+                report.last_error = Some(format!("scan error: {e}"));
+                self.state.tick_cell_deps.clear();
+                self.state.resolver.set_tick_process_code(None);
+                return report;
+            }
+        };
         report.scan_ok = true;
         report.scanned = scanned.len();
 
@@ -504,15 +555,19 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
         }
     }
 
-    /// Split a `SubmitRejected` window into legal `[min, max]` sub-batches.
-    /// Returns a resume `out_point_key` when leftover work should start there
-    /// next tick (budget cut or Process occupied/consumed with remainder).
+    /// Split a `SubmitRejected` / `FeeUnaffordable` window into legal
+    /// `[min, max]` sub-batches. Returns a resume `out_point_key` when leftover
+    /// work should start there next tick (budget cut or Process
+    /// occupied/consumed with remainder).
     ///
     /// Iterative so a long poison prefix cannot grow the stack. Cached combos
     /// are isolated without charging `attempts` (new `send_transaction` only).
     /// Each window fingerprint is expanded at most once per sweep; a separate
     /// cached-split budget stops diamond explosion. Progress persists in
     /// `isolate_expanded` until the sweep completes.
+    ///
+    /// `FeeUnaffordable` uses the same shrink (fee scales with tx size) but is
+    /// never written to `rejected_combos`.
     #[allow(clippy::too_many_arguments)]
     fn isolate_window(
         &mut self,
@@ -628,7 +683,9 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                         stack.push(rest);
                     }
                 }
-                BatchOutcome::Rejected | BatchOutcome::CachedRejected => {
+                BatchOutcome::Rejected
+                | BatchOutcome::CachedRejected
+                | BatchOutcome::FeeUnaffordable => {
                     self.state
                         .isolate_expanded
                         .entry(hash)
@@ -697,6 +754,216 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
             ))
     }
 
+    /// Partition DigestIncompatible refunds by lock identity
+    /// (`code_hash` + `hash_type`), keeping Exact vs Bounded separation.
+    /// Never co-bundle two different bounded-capable locks in one Execution
+    /// tx (defense-in-depth; on-chain `MixedCidLock` at contract head
+    /// `9bc8193`+ is the real protocol defense).
+    /// `RefundFeeUnaffordable` → [`BatchOutcome::FeeUnaffordable`] so
+    /// isolate_window shrinks.
+    fn handle_incompatible_refunds(
+        &mut self,
+        batch: &[ScannedIntention],
+        code: i8,
+        report: &mut TickReport,
+    ) -> BatchOutcome {
+        // Group by lock identity (first-seen order), then Exact groups before
+        // Bounded so unaffordable Bounded can still surface after Exact submit.
+        let mut by_identity: Vec<(CidLockIdentity, Vec<ScannedIntention>)> = Vec::new();
+        for item in batch {
+            let id = item.lock_identity();
+            if let Some((_, group)) = by_identity.iter_mut().find(|(existing, _)| *existing == id) {
+                group.push(item.clone());
+            } else {
+                by_identity.push((id, vec![item.clone()]));
+            }
+        }
+
+        let mut exact_groups = Vec::new();
+        let mut bounded_groups = Vec::new();
+        for (id, group) in by_identity {
+            match self.config.refund_mode_for(&group[0]) {
+                RefundFeeMode::Bounded => bounded_groups.push((RefundFeeMode::Bounded, id, group)),
+                RefundFeeMode::Exact => exact_groups.push((RefundFeeMode::Exact, id, group)),
+            }
+        }
+
+        if exact_groups.len() + bounded_groups.len() > 1 {
+            tracing::info!(
+                target: LOG_TARGET,
+                event = "refund.partition",
+                code,
+                exact_groups = exact_groups.len(),
+                bounded_groups = bounded_groups.len(),
+            );
+        }
+
+        let mut submitted = false;
+        let mut unaffordable = false;
+
+        for (mode, _id, group) in exact_groups.into_iter().chain(bounded_groups) {
+            if group.is_empty() {
+                continue;
+            }
+            match self.assemble_and_submit_refund(&group, mode, code, report) {
+                BatchOutcome::Submitted => submitted = true,
+                BatchOutcome::FeeUnaffordable => unaffordable = true,
+                BatchOutcome::Rejected => return BatchOutcome::Rejected,
+                BatchOutcome::CachedRejected => return BatchOutcome::CachedRejected,
+                _ => {}
+            }
+        }
+
+        // Prefer FeeUnaffordable even if Exact already submitted: isolate_window
+        // must shrink the Bounded group. Submitted Exact inputs are in_flight
+        // and filtered out of subsequent windows (no double-spend). Returning
+        // Submitted here would only push `rest` and leave unaffordable
+        // allowlisted Intentions stranded while legacy Exact keeps arriving.
+        if unaffordable {
+            return BatchOutcome::FeeUnaffordable;
+        }
+        if submitted {
+            BatchOutcome::Submitted
+        } else {
+            BatchOutcome::Continue
+        }
+    }
+
+    fn assemble_and_submit_refund(
+        &mut self,
+        group: &[ScannedIntention],
+        mode: RefundFeeMode,
+        code: i8,
+        report: &mut TickReport,
+    ) -> BatchOutcome {
+        let skeleton = match assemble_digest_incompatible(
+            group,
+            &self.state.tick_cell_deps,
+            mode,
+            self.config.fee_rate,
+        ) {
+            Ok(s) => {
+                let out_sum: u64 =
+                    s.tx.outputs()
+                        .into_iter()
+                        .map(|o| {
+                            let c: u64 = o.capacity().unpack();
+                            c
+                        })
+                        .sum();
+                let in_sum: u64 = group.iter().map(|i| i.capacity).sum();
+                let fee = in_sum.saturating_sub(out_sum);
+                let bounded = matches!(mode, RefundFeeMode::Bounded);
+                tracing::info!(
+                    target: LOG_TARGET,
+                    event = "refund.path",
+                    code,
+                    path = "user_lock",
+                    fee,
+                    bounded,
+                    n = group.len(),
+                );
+                if fee == 0 && !bounded {
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        event = "refund.zero_fee",
+                        code,
+                        fee,
+                        fee_rate = self.config.fee_rate,
+                        n = group.len(),
+                    );
+                }
+                s
+            }
+            Err(AssembleError::RefundFeeUnaffordable {
+                fee,
+                budget,
+                tx_size,
+                fee_rate,
+                n,
+            }) => {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    event = "tick.skip",
+                    reason = "refund_fee_unaffordable",
+                    fee,
+                    budget,
+                    tx_size,
+                    fee_rate,
+                    n,
+                );
+                // Non-permanent; isolate_window shrinks like digest_ok fee.
+                return BatchOutcome::FeeUnaffordable;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    event = "refund.path",
+                    code,
+                    path = "unbuildable",
+                    error = %e,
+                );
+                report.skipped += group.len();
+                return BatchOutcome::Continue;
+            }
+        };
+
+        let intent_ops: Vec<_> = group.iter().map(|i| i.out_point.clone()).collect();
+        let fp = combo_fingerprint(&intent_ops, None, &self.state.execution_code_key);
+        if self.state.submit.rejected_combos.contains(&fp) {
+            return BatchOutcome::CachedRejected;
+        }
+        let consumed: Vec<_> = skeleton
+            .tx
+            .inputs()
+            .into_iter()
+            .map(|i| i.previous_output())
+            .collect();
+        match submit_execution(&self.rpc, &skeleton, &mut self.state.submit, &consumed) {
+            Ok(hash) => {
+                tracing::info!(
+                    target: LOG_TARGET,
+                    event = "submit.ok",
+                    tx_hash = %hex_pref(hash.as_slice()),
+                );
+                report.submitted += 1;
+                BatchOutcome::Submitted
+            }
+            Err(RpcError::Conflict(m)) => {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    event = "submit.conflict",
+                    error = %m,
+                );
+                report.conflicts += 1;
+                report.last_error = Some(format!("submit conflict: {m}"));
+                BatchOutcome::Continue
+            }
+            Err(RpcError::SubmitRejected(m)) => {
+                self.state.submit.rejected_combos.insert(fp);
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    event = "submit.rejected",
+                    error = %m,
+                    n = group.len(),
+                );
+                report.last_error = Some(format!("submit rejected: {m}"));
+                BatchOutcome::Rejected
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    event = "tick.skip",
+                    reason = "submit_failed",
+                    error = %e,
+                );
+                report.last_error = Some(format!("submit failed: {e}"));
+                report.skipped += group.len();
+                BatchOutcome::Continue
+            }
+        }
+    }
+
     fn process_batch(
         &mut self,
         process: &ResolvedProcess,
@@ -728,7 +995,13 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                     report.skipped += batch.len();
                     return BatchOutcome::ProcessOccupied;
                 }
-                match assemble_digest_ok(&batch, process, &partial, &self.state.tick_cell_deps) {
+                match assemble_digest_ok(
+                    &batch,
+                    process,
+                    &partial,
+                    &self.state.tick_cell_deps,
+                    self.config.fee_rate,
+                ) {
                     Ok(s) => s,
                     Err(AssembleError::CapacityShortfall { inputs, outputs }) => {
                         tracing::warn!(
@@ -740,6 +1013,28 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                         );
                         report.skipped += batch.len();
                         return BatchOutcome::Continue;
+                    }
+                    Err(AssembleError::FeeUnaffordable {
+                        process_capacity,
+                        min_capacity,
+                        fee,
+                        tx_size,
+                        fee_rate,
+                    }) => {
+                        // Non-permanent: isolate/shrink the window (smaller
+                        // batch → smaller tx → lower fee). Do not combo-reject.
+                        tracing::warn!(
+                            target: LOG_TARGET,
+                            event = "tick.skip",
+                            reason = "fee_unaffordable",
+                            process_capacity,
+                            min_capacity,
+                            fee,
+                            tx_size,
+                            fee_rate,
+                            n = batch.len(),
+                        );
+                        return BatchOutcome::FeeUnaffordable;
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -759,28 +1054,8 @@ impl<R: Rpc, C: Clock, S: SsriHost> DigestLoop<R, C, S> {
                     event = "ssri.incompatible",
                     code,
                 );
-                match assemble_digest_incompatible(&batch, &self.state.tick_cell_deps) {
-                    Ok(s) => {
-                        tracing::info!(
-                            target: LOG_TARGET,
-                            event = "refund.path",
-                            code,
-                            path = "user_lock",
-                        );
-                        s
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            target: LOG_TARGET,
-                            event = "refund.path",
-                            code,
-                            path = "unbuildable",
-                            error = %e,
-                        );
-                        report.skipped += batch.len();
-                        return BatchOutcome::Continue;
-                    }
-                }
+                // Partition allowlisted vs legacy locks; never mix in one tx.
+                return self.handle_incompatible_refunds(&batch, code, report);
             }
             Err(SsriError::Unusable(m)) => {
                 tracing::warn!(

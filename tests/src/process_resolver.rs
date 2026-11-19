@@ -1,8 +1,8 @@
 #[cfg(test)]
 mod tests {
-    use ckb_types::core::ScriptHashType;
     use cid_backend_core::process::ProcessResolver;
     use cid_backend_core::rpc::{script_hash32, Rpc};
+    use ckb_types::core::ScriptHashType;
 
     use crate::fake_rpc::FakeRpc;
     use crate::helpers::{live_cell, lock_script, out_point};
@@ -15,10 +15,7 @@ mod tests {
     fn fakerpc_resolve_skips_missing_process() {
         let rpc = FakeRpc::new();
         let mut resolver = ProcessResolver::new();
-        assert!(resolver
-            .resolve(&rpc, &[0xAB; 32])
-            .unwrap()
-            .is_none());
+        assert!(resolver.resolve(&rpc, &[0xAB; 32]).unwrap().is_none());
     }
 
     #[test]
