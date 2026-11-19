@@ -247,6 +247,113 @@ mod tests {
             .pending_occupies(&good.out_point));
     }
 
+    /// Async Rejected must queue sync drop_first+shrink frames (isolate_pending),
+    /// not rely on `already`. min=1, [A,B,C], C poison → shrink [A,B] submits.
+    #[test]
+    fn async_rejected_min1_shrinks_abc_to_ab() {
+        let rpc = FakeRpc::new();
+        let ts = process_type_script(36);
+        let hash = script_hash32(&ts);
+        let a = intention_cell(1, hash, 100_0000_0000);
+        let b = intention_cell(2, hash, 110_0000_0000);
+        let c = intention_cell(3, hash, 120_0000_0000);
+        let proc = process_cell(36, 200_0000_0000, vec![0x7f, b'E', b'L', b'F', 36]);
+        rpc.insert_cell(a.clone());
+        rpc.insert_cell(b.clone());
+        rpc.insert_cell(c.clone());
+        rpc.insert_cell(proc.clone());
+        rpc.reject_when_consuming(&c.out_point);
+        let mut loop_ = loop_with_resolver(rpc, ScriptedSsri::mimic((1, 3)), cfg(), 36);
+
+        let first = loop_.tick();
+        assert_eq!(
+            first.submitted, 1,
+            "after [A,B,C] reject, shrink [A,B] must submit via isolate_pending"
+        );
+        let submitted = &loop_.rpc().submitted()[0];
+        let inputs: Vec<_> = submitted
+            .inputs()
+            .into_iter()
+            .map(|i| i.previous_output())
+            .collect();
+        assert!(inputs.contains(&a.out_point), "submitted tx must spend A");
+        assert!(inputs.contains(&b.out_point), "submitted tx must spend B");
+        assert!(
+            !inputs.contains(&c.out_point),
+            "poison C must not be in the successful tx"
+        );
+        assert!(
+            loop_.rpc().submit_attempts() >= 2,
+            "must have attempted the rejected [A,B,C] window plus shrink"
+        );
+        assert!(loop_
+            .state()
+            .submit
+            .as_ref()
+            .unwrap()
+            .pending_occupies(&a.out_point));
+        assert!(loop_
+            .state()
+            .submit
+            .as_ref()
+            .unwrap()
+            .pending_occupies(&b.out_point));
+        assert!(!loop_
+            .state()
+            .submit
+            .as_ref()
+            .unwrap()
+            .pending_occupies(&c.out_point));
+    }
+
+    /// Stronger P0 case: min=2, max=3, [A,B,C,D], C poison. Sync rejects [A,B,C]
+    /// (rest=[D]) and pushes shrink [A,B] + drop_first [B,C,D]. Async that only
+    /// marks expanded then `already` with rest=[D] would push only [D] (<min).
+    #[test]
+    fn async_rejected_min2_abcd_shrinks_to_ab() {
+        let rpc = FakeRpc::new();
+        let ts = process_type_script(37);
+        let hash = script_hash32(&ts);
+        let a = intention_cell(1, hash, 100_0000_0000);
+        let b = intention_cell(2, hash, 110_0000_0000);
+        let c = intention_cell(3, hash, 120_0000_0000);
+        let d = intention_cell(4, hash, 130_0000_0000);
+        let proc = process_cell(37, 200_0000_0000, vec![0x7f, b'E', b'L', b'F', 37]);
+        rpc.insert_cell(a.clone());
+        rpc.insert_cell(b.clone());
+        rpc.insert_cell(c.clone());
+        rpc.insert_cell(d.clone());
+        rpc.insert_cell(proc.clone());
+        rpc.reject_when_consuming(&c.out_point);
+        let mut loop_ = loop_with_resolver(rpc, ScriptedSsri::mimic((2, 3)), cfg(), 37);
+
+        let first = loop_.tick();
+        assert_eq!(
+            first.submitted, 1,
+            "after [A,B,C] reject (rest D), shrink [A,B] must submit (not stall on D)"
+        );
+        let submitted = &loop_.rpc().submitted()[0];
+        let inputs: Vec<_> = submitted
+            .inputs()
+            .into_iter()
+            .map(|i| i.previous_output())
+            .collect();
+        assert!(inputs.contains(&a.out_point), "submitted tx must spend A");
+        assert!(inputs.contains(&b.out_point), "submitted tx must spend B");
+        assert!(
+            !inputs.contains(&c.out_point),
+            "poison C must not be in the successful tx"
+        );
+        assert!(
+            !inputs.contains(&d.out_point),
+            "D is rest, not part of shrink [A,B]"
+        );
+        assert!(
+            loop_.rpc().submit_attempts() >= 2,
+            "must attempt rejected [A,B,C] plus shrink [A,B]"
+        );
+    }
+
     #[test]
     fn rejected_min_gt_1_window_does_not_blacklist_members() {
         let rpc = FakeRpc::new();

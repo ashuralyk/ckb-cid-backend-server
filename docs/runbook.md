@@ -78,7 +78,13 @@ Every host-query syscall (`find_cell_by_out_point` 2287, `find_cell_data`
 `get_block_hash` 2347, `get_cells` 2367) uses a **10s per-request** timeout
 against node or indexer JSON-RPC. `get_cells` uses opaque variable-length
 indexer cursors and honors `asc`/`desc` order. Offline/`MockHost` seeding
-remains for unit tests only. See contract `docs/ssri-backend-interface.md`.
+remains for unit tests only; MockHost Prefix/Exact order is by matching
+script raw bytes then block/tx/output index (see contract
+`docs/ssri-backend-interface.md`).
+
+Pinned `cid_process_example` pays fee from Process state and **rejects extra
+funding inputs** with `UnsupportedFundingLock` (38). Do not pass funding cells
+to the example guest / calculator submit helper.
 
 ## Ops checklist
 
