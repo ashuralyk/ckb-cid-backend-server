@@ -87,7 +87,10 @@ mod tests {
             .any(|c| c.out_point == intent.out_point));
 
         let second = loop_.tick();
-        assert_eq!(second.submitted, 0, "combo blacklisted after dry-run reject");
+        assert_eq!(
+            second.submitted, 0,
+            "combo blacklisted after dry-run reject"
+        );
         assert_eq!(loop_.rpc().submit_attempts(), 0);
     }
 
@@ -672,16 +675,10 @@ mod tests {
         assert!(good_worker.with_state(|s| s.submit.pending_occupies(&good.out_point)));
         let poison_worker = loop_.workers().get(&poison_hash).expect("poison worker");
         assert!(poison_worker.with_state(|s| s.submit.pending_occupies(&later.out_point)));
-        assert!(!good_worker.with_state(|s| {
-            s.submit
-                .rejected
-                .contains(&out_point_key(&good.out_point))
-        }));
-        assert!(!poison_worker.with_state(|s| {
-            s.submit
-                .rejected
-                .contains(&out_point_key(&later.out_point))
-        }));
+        assert!(!good_worker
+            .with_state(|s| { s.submit.rejected.contains(&out_point_key(&good.out_point)) }));
+        assert!(!poison_worker
+            .with_state(|s| { s.submit.rejected.contains(&out_point_key(&later.out_point)) }));
     }
 
     #[test]

@@ -677,19 +677,29 @@ mod tests {
         fn get_live_cell(
             &self,
             _: &ckb_types::packed::OutPoint,
-        ) -> Result<Option<cid_backend_core::rpc::LiveCell>, cid_backend_core::rpc::RpcError> {
+        ) -> Result<Option<cid_backend_core::rpc::LiveCell>, cid_backend_core::rpc::RpcError>
+        {
             Err(RpcError::Unavailable("indexer down".into()))
         }
 
-        fn get_block_hash(&self, _: u64) -> Result<Option<[u8; 32]>, cid_backend_core::rpc::RpcError> {
+        fn get_block_hash(
+            &self,
+            _: u64,
+        ) -> Result<Option<[u8; 32]>, cid_backend_core::rpc::RpcError> {
             Err(RpcError::Unavailable("indexer down".into()))
         }
 
-        fn get_header_by_number(&self, _: u64) -> Result<Option<Vec<u8>>, cid_backend_core::rpc::RpcError> {
+        fn get_header_by_number(
+            &self,
+            _: u64,
+        ) -> Result<Option<Vec<u8>>, cid_backend_core::rpc::RpcError> {
             Err(RpcError::Unavailable("indexer down".into()))
         }
 
-        fn get_header(&self, _: &[u8; 32]) -> Result<Option<Vec<u8>>, cid_backend_core::rpc::RpcError> {
+        fn get_header(
+            &self,
+            _: &[u8; 32],
+        ) -> Result<Option<Vec<u8>>, cid_backend_core::rpc::RpcError> {
             Err(RpcError::Unavailable("indexer down".into()))
         }
 

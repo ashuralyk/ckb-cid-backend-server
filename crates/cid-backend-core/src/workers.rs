@@ -1,9 +1,9 @@
 //! One OS thread per configured Process. Batch submit work runs on that thread.
 
 use crate::host_query::HostQueryRpc;
+use crate::process::ResolvedProcess;
 use crate::process::{ProcessEntry, ProcessResolver};
 use crate::process_batch::{run_process_batch, BatchOutcome, BatchReportDelta, ProcessBatchParams};
-use crate::process::ResolvedProcess;
 use crate::rpc::Rpc;
 use crate::scan::ScannedIntention;
 use crate::ssri::SsriHost;
@@ -54,6 +54,7 @@ impl ProcessWorkerState {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum ProcessWorkerJob {
     Ping(Sender<()>),
     Shutdown,
@@ -292,9 +293,7 @@ where
         let key = entry.identity_type_hash;
         match self.workers.get(&key) {
             None => {
-                let inner = Arc::new(Mutex::new(ProcessWorkerState::with_generation(
-                    entry, 1,
-                )));
+                let inner = Arc::new(Mutex::new(ProcessWorkerState::with_generation(entry, 1)));
                 let worker = spawn_process_worker(key, inner, self.rpc.clone(), self.ssri.clone());
                 self.workers.insert(key, worker);
                 true
@@ -322,9 +321,9 @@ where
     }
 
     pub fn is_pending(&self, hash: &[u8; 32]) -> bool {
-        self.workers.get(hash).map_or(false, |w| {
-            w.with_state(|s| !s.submit.pending.is_empty())
-        })
+        self.workers
+            .get(hash)
+            .is_some_and(|w| w.with_state(|s| !s.submit.pending.is_empty()))
     }
 
     pub fn pending_hashes(&self) -> Vec<[u8; 32]> {
@@ -335,10 +334,7 @@ where
             .collect()
     }
 
-    pub fn try_remove(
-        &mut self,
-        hash: &[u8; 32],
-    ) -> Result<bool, WorkerRemoveError> {
+    pub fn try_remove(&mut self, hash: &[u8; 32]) -> Result<bool, WorkerRemoveError> {
         let Some(worker) = self.workers.get(hash) else {
             return Ok(false);
         };
@@ -535,10 +531,7 @@ mod tests {
     #[test]
     fn len_hashes_is_empty() {
         let pool = WorkerPool::from_entries(
-            vec![
-                entry([0x50; 32], [0x51; 32]),
-                entry([0x52; 32], [0x53; 32]),
-            ],
+            vec![entry([0x50; 32], [0x51; 32]), entry([0x52; 32], [0x53; 32])],
             Arc::new(EmptyRpc),
             Arc::new(NopSsri),
         );

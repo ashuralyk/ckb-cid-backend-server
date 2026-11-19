@@ -289,10 +289,7 @@ impl Rpc for CkbRpc {
     ) -> Result<Option<LiveCell>, RpcError> {
         let mut candidates = Vec::new();
         for ht in HASH_TYPES {
-            candidates.extend(self.cells_by_type_prefix(
-                &cid_backend_core::TYPE_ID_CODE_HASH,
-                ht,
-            )?);
+            candidates.extend(self.cells_by_type_prefix(&cid_backend_core::TYPE_ID_CODE_HASH, ht)?);
         }
         Ok(candidates.into_iter().find(|cell| {
             cell.type_script()
@@ -303,12 +300,14 @@ impl Rpc for CkbRpc {
 
     fn dry_run_transaction(&self, tx: &TransactionView) -> Result<(), RpcError> {
         let tx_json = tx_view_to_json(tx)?;
-        match self.dry_run_rpc_call("test_tx_pool_accept", json!([tx_json.clone(), "passthrough"])) {
+        match self.dry_run_rpc_call(
+            "test_tx_pool_accept",
+            json!([tx_json.clone(), "passthrough"]),
+        ) {
             Ok(()) => Ok(()),
-            Err((code, msg)) if dry_run_should_fallback(code, &msg) => {
-                self.dry_run_rpc_call("estimate_cycles", json!([tx_json]))
-                    .map_err(|(c, m)| map_verify_rpc_error("estimate_cycles", c, &m))
-            }
+            Err((code, msg)) if dry_run_should_fallback(code, &msg) => self
+                .dry_run_rpc_call("estimate_cycles", json!([tx_json]))
+                .map_err(|(c, m)| map_verify_rpc_error("estimate_cycles", c, &m)),
             Err((code, msg)) => Err(map_verify_rpc_error("test_tx_pool_accept", code, &msg)),
         }
     }
@@ -395,17 +394,13 @@ impl HostQueryRpc for CkbRpc {
     }
 
     fn get_block_hash(&self, number: u64) -> Result<Option<[u8; 32]>, RpcError> {
-        let result = self.rpc_call(
-            &self.node_url,
-            "get_block_hash",
-            json!([hex_u64(number)]),
-        )?;
+        let result = self.rpc_call(&self.node_url, "get_block_hash", json!([hex_u64(number)]))?;
         if result.is_null() {
             return Ok(None);
         }
-        let hex = result.as_str().ok_or_else(|| {
-            RpcError::Unavailable("get_block_hash: result not hex".into())
-        })?;
+        let hex = result
+            .as_str()
+            .ok_or_else(|| RpcError::Unavailable("get_block_hash: result not hex".into()))?;
         let bytes = decode_hex(hex)?;
         <[u8; 32]>::try_from(bytes.as_slice())
             .map(Some)
@@ -444,7 +439,7 @@ impl HostQueryRpc for CkbRpc {
     ) -> Result<(Vec<LiveCell>, Vec<u8>), RpcError> {
         let _ = DEFAULT_HOST_QUERY_TIMEOUT_SECS;
         let search_key = search_key_json_from_molecule(search_key_molecule)?;
-        let page_limit = u64::from(limit.min(DEFAULT_HOST_QUERY_PAGE_LIMIT).max(1));
+        let page_limit = u64::from(limit.clamp(1, DEFAULT_HOST_QUERY_PAGE_LIMIT));
         let after_val = json_after_cursor(after);
         let result = self.rpc_call(
             &self.indexer_url,
@@ -561,7 +556,9 @@ fn map_verify_rpc_error(method: &str, code: Option<i64>, msg: &str) -> RpcError 
         | Some(POOL_REJECTED_MALFORMED) => RpcError::SubmitRejected(msg.into()),
         Some(POOL_IS_FULL)
         | Some(POOL_REJECTED_BY_MAX_ANCESTORS)
-        | Some(POOL_REJECTED_BY_MIN_FEE_RATE) => RpcError::Unavailable(format!("{method} {code:?}: {msg}")),
+        | Some(POOL_REJECTED_BY_MIN_FEE_RATE) => {
+            RpcError::Unavailable(format!("{method} {code:?}: {msg}"))
+        }
         _ => RpcError::Unavailable(format!("{method} {code:?}: {msg}")),
     }
 }
@@ -584,11 +581,7 @@ fn dry_run_should_fallback(code: Option<i64>, msg: &str) -> bool {
 }
 
 impl CkbRpc {
-    fn dry_run_rpc_call(
-        &self,
-        method: &str,
-        params: Value,
-    ) -> Result<(), (Option<i64>, String)> {
+    fn dry_run_rpc_call(&self, method: &str, params: Value) -> Result<(), (Option<i64>, String)> {
         let body = json!({
             "id": 1,
             "jsonrpc": "2.0",
@@ -1330,7 +1323,7 @@ mod tests {
             let s = Script::new_builder()
                 .code_hash(Byte32::from_slice(&[ht as u8; 32]).unwrap())
                 .hash_type(ht.into())
-                .args(vec![0xab, 0xcd].pack())
+                .args([0xabu8, 0xcd].pack())
                 .build();
             let j = script_json(&s).unwrap();
             let back = json_to_script(&j).unwrap();
@@ -2175,8 +2168,14 @@ mod tests {
             &[0x7f, b'E', b'L', b'F', 1],
         );
         const STICKY: usize = 6400;
-        let valid_intent =
-            indexer_cell(2, STICKY as u32, lock_json(CID_CODE, &args), None, 100_0000_0000, &[]);
+        let valid_intent = indexer_cell(
+            2,
+            STICKY as u32,
+            lock_json(CID_CODE, &args),
+            None,
+            100_0000_0000,
+            &[],
+        );
         let submitted = Arc::new(Mutex::new(0usize));
         let submitted2 = submitted.clone();
         let url = spawn_mock(Arc::new(move |method, params| match method {
@@ -2250,10 +2249,7 @@ mod tests {
         let url = spawn_mock(Arc::new(|method, params| match method {
             "get_live_cell" => {
                 let op = &params[0];
-                assert_eq!(
-                    op.get("index").and_then(|v| v.as_str()),
-                    Some("0x0")
-                );
+                assert_eq!(op.get("index").and_then(|v| v.as_str()), Some("0x0"));
                 Ok(json!({
                     "cell": {
                         "capacity": "0x64",
@@ -2283,9 +2279,13 @@ mod tests {
             .tx_hash(Byte32::from_slice(&[0x11; 32]).unwrap())
             .index(0u32.pack())
             .build();
-        let live = HostQueryRpc::get_live_cell(&rpc, &op).unwrap().expect("cell");
+        let live = HostQueryRpc::get_live_cell(&rpc, &op)
+            .unwrap()
+            .expect("cell");
         assert_eq!(live.data, vec![0xab]);
-        let hash = HostQueryRpc::get_block_hash(&rpc, 9).unwrap().expect("hash");
+        let hash = HostQueryRpc::get_block_hash(&rpc, 9)
+            .unwrap()
+            .expect("hash");
         assert_eq!(hash, [0xcd; 32]);
         let key = json!({
             "script": json_script(&CID_CODE, ScriptHashType::Type, &[]),

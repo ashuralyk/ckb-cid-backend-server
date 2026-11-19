@@ -3,12 +3,12 @@ use crate::fee::CidLockIdentity;
 use crate::host_query::HostQueryRpc;
 use crate::process::{ProcessEntry, ProcessResolver, ResolvedProcess};
 use crate::process_batch::{self, BatchOutcome, BatchReportDelta};
+use crate::process_busy::ProcessBusyMap;
 use crate::rpc::{out_point_key, Rpc, RpcError, TxStatus};
 use crate::scan::{bucket_by_process_type_hash, scan_intentions_multi, ScannedIntention};
-use crate::ssri::{SsriError, SsriHost};
+use crate::ssri::SsriHost;
 use crate::submit::{combo_fingerprint, execution_code_key, SubmitState};
 use crate::type_id::TypeIdCodeDep;
-use crate::process_busy::ProcessBusyMap;
 use crate::workers::{WorkerPool, WorkerRemoveError};
 use ckb_types::core::ScriptHashType;
 use ckb_types::packed::{Byte32, CellDep};
@@ -212,7 +212,7 @@ where
         let hash = entry.identity_type_hash;
         let rpc = Arc::new(rpc);
         let ssri = Arc::new(ssri);
-        let mut pool = WorkerPool::from_entries(vec![entry], rpc.clone(), ssri.clone());
+        let pool = WorkerPool::from_entries(vec![entry], rpc.clone(), ssri.clone());
         if let Some(w) = pool.get(&hash) {
             w.with_state_mut(|state| state.resolver = resolver);
         }
@@ -254,10 +254,7 @@ where
     }
 
     /// Remove a Process worker when idle.
-    pub fn unregister_process(
-        &mut self,
-        hash: &[u8; 32],
-    ) -> Result<bool, WorkerRemoveError> {
+    pub fn unregister_process(&mut self, hash: &[u8; 32]) -> Result<bool, WorkerRemoveError> {
         let removed = self.workers.try_remove(hash)?;
         if removed {
             tracing::info!(
@@ -287,9 +284,9 @@ where
                 WorkerCommand::Register(entry) => {
                     let hash = entry.identity_type_hash;
                     let _ = self.register_process(entry);
-                    requeue.retain(|c| {
-                        !matches!(c, WorkerCommand::Delete { hash: h, .. } if *h == hash)
-                    });
+                    requeue.retain(
+                        |c| !matches!(c, WorkerCommand::Delete { hash: h, .. } if *h == hash),
+                    );
                 }
                 WorkerCommand::Delete { hash, generation } => {
                     if let Some(want) = generation {
@@ -580,9 +577,7 @@ where
             let hashes: Vec<Vec<u8>> = self
                 .workers
                 .get(&process_hash)
-                .map(|w| {
-                    w.with_state(|s| s.submit.pending.keys().cloned().collect())
-                })
+                .map(|w| w.with_state(|s| s.submit.pending.keys().cloned().collect()))
                 .unwrap_or_default();
             for hash_bytes in hashes {
                 let tx_hash = match Byte32::from_slice(&hash_bytes) {
@@ -865,7 +860,9 @@ where
                     self.workers
                         .get(&hash)
                         .map(|w| {
-                            w.with_state(|s| !s.submit.in_flight.contains(&out_point_key(&i.out_point)))
+                            w.with_state(|s| {
+                                !s.submit.in_flight.contains(&out_point_key(&i.out_point))
+                            })
                         })
                         .unwrap_or(true)
                 })
@@ -914,8 +911,7 @@ where
                     }
                     return items.first().map(|i| out_point_key(&i.out_point));
                 }
-                let outcome =
-                    self.dispatch_process_batch(hash, process, window.clone(), report);
+                let outcome = self.dispatch_process_batch(hash, process, window.clone(), report);
                 if !matches!(outcome, BatchOutcome::CachedRejected) {
                     *attempts += 1;
                 }
@@ -1012,14 +1008,9 @@ where
         batch: &[ScannedIntention],
         process: &ResolvedProcess,
     ) -> bool {
-        self.workers.get(hash).map_or(false, |w| {
+        self.workers.get(hash).is_some_and(|w| {
             w.with_state(|state| {
-                process_batch::window_combo_cached(
-                    state,
-                    batch,
-                    process,
-                    &self.execution_code_key,
-                )
+                process_batch::window_combo_cached(state, batch, process, &self.execution_code_key)
             })
         })
     }
@@ -1059,7 +1050,6 @@ where
         Self::apply_batch_report(report, &delta);
         outcome
     }
-
 }
 
 pub(crate) fn confirmation_count(tip: u64, commit_block: u64) -> u64 {
@@ -1086,7 +1076,8 @@ mod worker_cmd_tests {
     use super::*;
     use crate::process::ProcessEntry;
     use crate::rpc::{LiveCell, Rpc, RpcError, TxStatus};
-    use crate::ssri::{SsriError, SsriHost};
+    use crate::ssri::SsriError;
+    use crate::ssri::SsriHost;
     use crate::type_id::{type_id_script_hash, TypeIdIdentity};
     use cid_process_executor::{AssembledTx, MockHost};
     use ckb_types::core::{ScriptHashType, TransactionView};
@@ -1200,7 +1191,7 @@ mod worker_cmd_tests {
         let hash = e.identity_type_hash;
         let rpc = Arc::new(EmptyRpc);
         let ssri = Arc::new(NopSsri);
-        let mut pool = WorkerPool::from_entries(vec![e], rpc.clone(), ssri.clone());
+        let pool = WorkerPool::from_entries(vec![e], rpc.clone(), ssri.clone());
         pool.get(&hash).unwrap().with_state_mut(|w| {
             w.submit.pending.insert(
                 vec![0x01],
@@ -1211,7 +1202,8 @@ mod worker_cmd_tests {
                 },
             );
         });
-        let mut loop_ = DigestLoop::with_workers(rpc, NopClock, ssri, cfg(), pool, Some(cmds.clone()));
+        let mut loop_ =
+            DigestLoop::with_workers(rpc, NopClock, ssri, cfg(), pool, Some(cmds.clone()));
         cmds.lock().unwrap().push(WorkerCommand::delete(hash));
         let _ = loop_.tick();
         assert!(
@@ -1233,9 +1225,10 @@ mod worker_cmd_tests {
             "re-register must keep worker; stale delete must not apply"
         );
         assert!(
-            cmds.lock().unwrap().iter().all(|c| {
-                !matches!(c, WorkerCommand::Delete { hash: h, .. } if *h == hash)
-            }),
+            cmds.lock()
+                .unwrap()
+                .iter()
+                .all(|c| { !matches!(c, WorkerCommand::Delete { hash: h, .. } if *h == hash) }),
             "no stale Delete may remain after re-register"
         );
     }

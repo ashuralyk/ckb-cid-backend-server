@@ -62,11 +62,7 @@ pub fn window_combo_cached(
     execution_code_key: &[u8],
 ) -> bool {
     let ops: Vec<_> = batch.iter().map(|i| i.out_point.clone()).collect();
-    let fp = combo_fingerprint(
-        &ops,
-        Some(&process.live_cell.out_point),
-        execution_code_key,
-    );
+    let fp = combo_fingerprint(&ops, Some(&process.live_cell.out_point), execution_code_key);
     worker.submit.rejected_combos.contains(&fp)
 }
 
@@ -352,6 +348,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_incompatible_refunds<R: Rpc + HostQueryRpc>(
     rpc: &R,
     hash: [u8; 32],
@@ -412,6 +409,7 @@ fn handle_incompatible_refunds<R: Rpc + HostQueryRpc>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn assemble_and_submit_refund<R: Rpc + HostQueryRpc>(
     rpc: &R,
     _hash: [u8; 32],
@@ -424,15 +422,14 @@ fn assemble_and_submit_refund<R: Rpc + HostQueryRpc>(
 ) -> BatchOutcome {
     let skeleton = match assemble_digest_incompatible(group, tick_cell_deps) {
         Ok(s) => {
-            let out_sum: u64 = s
-                .tx
-                .outputs()
-                .into_iter()
-                .map(|o| {
-                    let c: u64 = o.capacity().unpack();
-                    c
-                })
-                .sum();
+            let out_sum: u64 =
+                s.tx.outputs()
+                    .into_iter()
+                    .map(|o| {
+                        let c: u64 = o.capacity().unpack();
+                        c
+                    })
+                    .sum();
             let in_sum: u64 = group.iter().map(|i| i.capacity).sum();
             let fee = in_sum.saturating_sub(out_sum);
             tracing::info!(
