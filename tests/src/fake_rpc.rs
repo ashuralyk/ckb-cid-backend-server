@@ -13,8 +13,10 @@ struct Inner {
     order: Vec<OutPoint>,
     fail_next_submit: bool,
     reject_next_submit: bool,
+    reject_next_dry_run: bool,
     reject_inputs: HashSet<Vec<u8>>,
     submit_attempts: usize,
+    dry_run_attempts: usize,
     unavailable_next_submit: bool,
     defer_commit: bool,
     fail_status_queries: bool,
@@ -76,6 +78,11 @@ impl FakeRpc {
         self.inner.borrow_mut().reject_next_submit = true;
     }
 
+    /// Next `dry_run_transaction` returns `SubmitRejected` (combo blacklist path).
+    pub fn inject_dry_run_reject_once(&self) {
+        self.inner.borrow_mut().reject_next_dry_run = true;
+    }
+
     /// Every submit that spends `op` returns `SubmitRejected` (A-fails / B-succeeds).
     pub fn reject_when_consuming(&self, op: &OutPoint) {
         self.inner
@@ -87,6 +94,10 @@ impl FakeRpc {
     /// Count of `submit_transaction` calls, including injected failures.
     pub fn submit_attempts(&self) -> usize {
         self.inner.borrow().submit_attempts
+    }
+
+    pub fn dry_run_attempts(&self) -> usize {
+        self.inner.borrow().dry_run_attempts
     }
 
     /// Next `submit_transaction` returns `Unavailable` (transient).
@@ -311,6 +322,16 @@ impl Rpc for FakeRpc {
             }
         }
         Ok(out)
+    }
+
+    fn dry_run_transaction(&self, _tx: &TransactionView) -> Result<(), RpcError> {
+        let mut inner = self.inner.borrow_mut();
+        inner.dry_run_attempts += 1;
+        if inner.reject_next_dry_run {
+            inner.reject_next_dry_run = false;
+            return Err(RpcError::SubmitRejected("injected dry-run reject".into()));
+        }
+        Ok(())
     }
 
     fn submit_transaction(&self, tx: &TransactionView) -> Result<Byte32, RpcError> {

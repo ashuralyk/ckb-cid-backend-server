@@ -1,5 +1,6 @@
 use crate::assemble::ExecutionSkeleton;
 use crate::rpc::{out_point_key, Rpc, RpcError};
+use ckb_types::core::TransactionView;
 use ckb_types::packed::{Byte32, OutPoint};
 use ckb_types::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -46,6 +47,21 @@ impl SubmitState {
             .values()
             .flat_map(|p| p.consumed.iter().chain(p.created.iter()).cloned())
             .collect()
+    }
+}
+
+/// Result of a pre-submit dry-run gate.
+pub enum DryRunGate {
+    Proceed,
+    Rejected(String),
+    Skip(String),
+}
+
+pub fn dry_run_gate<R: Rpc>(rpc: &R, tx: &TransactionView) -> DryRunGate {
+    match rpc.dry_run_transaction(tx) {
+        Ok(()) => DryRunGate::Proceed,
+        Err(RpcError::SubmitRejected(m)) => DryRunGate::Rejected(m),
+        Err(e) => DryRunGate::Skip(e.to_string()),
     }
 }
 

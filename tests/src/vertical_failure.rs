@@ -65,6 +65,33 @@ mod tests {
     }
 
     #[test]
+    fn dry_run_reject_prevents_send_transaction() {
+        let rpc = FakeRpc::new();
+        let ts = process_type_script(28);
+        let hash = script_hash32(&ts);
+        let intent = intention_cell(1, hash, 100_0000_0000);
+        let proc = process_cell(28, 200_0000_0000, vec![0x7f, b'E', b'L', b'F', 28]);
+        rpc.insert_cell(intent.clone());
+        rpc.insert_cell(proc.clone());
+        rpc.inject_dry_run_reject_once();
+        let mut loop_ = loop_with_resolver(rpc, ScriptedSsri::mimic((1, 4)), cfg(), 28);
+
+        let first = loop_.tick();
+        assert_eq!(first.submitted, 0);
+        assert_eq!(loop_.rpc().submit_attempts(), 0);
+        assert_eq!(loop_.rpc().dry_run_attempts(), 1);
+        assert!(loop_
+            .rpc()
+            .live_cells()
+            .iter()
+            .any(|c| c.out_point == intent.out_point));
+
+        let second = loop_.tick();
+        assert_eq!(second.submitted, 0, "combo blacklisted after dry-run reject");
+        assert_eq!(loop_.rpc().submit_attempts(), 0);
+    }
+
+    #[test]
     fn permanent_reject_does_not_retry_or_leak_occupancy() {
         let rpc = FakeRpc::new();
         let ts = process_type_script(27);

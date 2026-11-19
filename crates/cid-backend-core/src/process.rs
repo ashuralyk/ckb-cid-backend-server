@@ -93,13 +93,22 @@ impl ProcessResolver {
         // Process-as-lock: state cell type is built-in TYPE_ID; discover by exact
         // type script (args), not by treating process_type_hash as a type code_hash.
         let matches = rpc.find_live_cells_by_type_script(&self.entry.identity.type_script(), 2)?;
-        let Some(cell) = matches.into_iter().next() else {
+        if matches.is_empty() {
             log::warn!(
                 "no live Process cell for type hash {:02x?}",
                 process_type_hash
             );
             return Ok(None);
-        };
+        }
+        if matches.len() > 1 {
+            log::warn!(
+                "ambiguous Process state cells for type hash {:02x?} (count={})",
+                process_type_hash,
+                matches.len()
+            );
+            return Ok(None);
+        }
+        let cell = matches.into_iter().next().expect("len==1");
         if !state_is_process_lock(&self.entry, &cell) {
             log::warn!("live Process cell failed Process-as-lock validation");
             return Ok(None);
@@ -264,6 +273,9 @@ mod tests {
             out.truncate(max_results);
             Ok(out)
         }
+        fn dry_run_transaction(&self, _tx: &TransactionView) -> Result<(), RpcError> {
+            Ok(())
+        }
         fn submit_transaction(&self, _tx: &TransactionView) -> Result<Byte32, RpcError> {
             Err(RpcError::Unavailable("no".into()))
         }
@@ -342,6 +354,72 @@ mod tests {
         assert_eq!(got.binary, vec![0x7f, b'E', b'L', b'F', 0xBB]);
         assert_eq!(got.type_hash, hash);
         assert!(got.code_cell.is_some());
+    }
+
+    #[test]
+    fn resolve_skips_ambiguous_process_state_cells() {
+        let entry = test_entry([0xab; 32], [0xcd; 32]);
+        let (hash, cell_a) = process_state_cell(&entry, vec![]);
+        let mut cell_b = cell_a.clone();
+        cell_b.out_point = OutPoint::new_builder()
+            .tx_hash(Byte32::from_slice(&[0x78; 32]).unwrap())
+            .index(1u32.pack())
+            .build();
+        struct AmbiguousRpc {
+            cells: Vec<LiveCell>,
+        }
+        impl Rpc for AmbiguousRpc {
+            fn list_live_intentions(
+                &self,
+                _: &[u8; 32],
+                _: ScriptHashType,
+            ) -> Result<Vec<LiveCell>, RpcError> {
+                Ok(vec![])
+            }
+            fn get_live_process_by_type_hash(
+                &self,
+                _: &[u8; 32],
+            ) -> Result<Option<LiveCell>, RpcError> {
+                Ok(None)
+            }
+            fn find_live_cells_by_type_script(
+                &self,
+                type_script: &Script,
+                max_results: usize,
+            ) -> Result<Vec<LiveCell>, RpcError> {
+                let want = script_hash32(type_script);
+                Ok(self
+                    .cells
+                    .iter()
+                    .filter(|c| {
+                        c.type_script()
+                            .map(|ts| script_hash32(&ts) == want)
+                            .unwrap_or(false)
+                    })
+                    .take(max_results)
+                    .cloned()
+                    .collect())
+            }
+            fn dry_run_transaction(&self, _: &TransactionView) -> Result<(), RpcError> {
+                Ok(())
+            }
+            fn submit_transaction(&self, _: &TransactionView) -> Result<Byte32, RpcError> {
+                Err(RpcError::Unavailable("no".into()))
+            }
+            fn get_transaction_status(&self, _: &Byte32) -> Result<TxStatus, RpcError> {
+                Err(RpcError::Unavailable("no".into()))
+            }
+            fn tip_block_number(&self) -> Result<u64, RpcError> {
+                Ok(0)
+            }
+        }
+        let code = code_live(0x10, vec![0x7f, b'E', b'L', b'F']);
+        let rpc = AmbiguousRpc {
+            cells: vec![cell_a, cell_b],
+        };
+        let mut resolver = ProcessResolver::for_entry(entry);
+        resolver.set_tick_process_code(Some(&code));
+        assert!(resolver.resolve(&rpc, &hash).unwrap().is_none());
     }
 
     #[test]

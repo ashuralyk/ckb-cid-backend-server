@@ -96,7 +96,7 @@ Static `[[cell_deps]]` / `CID_*_CELL_DEP` remain for **unrelated** extras (secp,
 | `CID_PROCESS_CODE_CELL_DEP` | optional static | Process type code cell outpoint (static mode) |
 | `CID_PROCESS_LOCK_CELL_DEP` | optional static | Process lock code cell (local-chain: always-success) |
 | `CID_EXTRA_CELL_DEPS` | optional | Extra `<tx_hash>:<index>` list, comma-separated |
-| `CID_PROCESS_CODE_HASH` | optional | Indexer type-script **code_hash prefix** for live Process cells; with Process Type-ID only the derived `type_id` is allowed (auto-set) |
+| `CID_PROCESS_CODE_HASH` | deprecated | Ignored at runtime; register Processes via the registry API instead |
 | `CID_HEALTH_BIND` | optional | `host:port` (e.g. `127.0.0.1:9100`); unset or empty **disables** HTTP |
 | `CID_CONFIRMATION_DEPTH` | optional | Blocks after a committed Execution Tx before settle; default **24**, must be **≥ 1** |
 | `CID_LOG_FORMAT` | optional | `json` (default) or `pretty` (`text` is an alias for pretty) |
@@ -107,7 +107,9 @@ Static `[[cell_deps]]` / `CID_*_CELL_DEP` remain for **unrelated** extras (secp,
 
 Cell-dep format: `<tx_hash>:<index>`; index may be decimal or `0x` hex. Static cell-dep variables merge into `LoopConfig.extra_cell_deps`. Type-ID deps are resolved each tick and merged first (deduped by outpoint).
 
-`CID_PROCESS_CODE_HASH` is not a local-chain-only switch. `CkbRpc::get_live_process_by_type_hash` always searches indexer type prefixes from that list (plus a prefix search on the args `process_type_hash` itself), then filters `calc_script_hash`. The args hash is a full script hash, so using it as a type `code_hash` prefix usually finds nothing — set the Process type's actual `code_hash` (or use Process `type_id_args` so it is derived).
+Process state cells are resolved per registered `ProcessEntry` (exact TYPE_ID type script). `CID_PROCESS_CODE_HASH` is deprecated and cleared at config load.
+
+The registry API (`CID_API_BIND`) is **unauthenticated** — keep it on loopback unless you explicitly opt in to non-loopback binding (`allow_non_loopback_api` / `CID_ALLOW_NON_LOOPBACK_API`).
 
 The daemon does **not** read `CID_PROCESS_EXAMPLE_PATH` / `CID_LOCAL_CHAIN_E2E` (test fixture / local-chain E2E switch). Production Process binaries come only from live Process cell data. `CkbRpc` talks JSON-RPC to `CID_CKB_RPC_URL` / `CID_INDEXER_URL`; tests use in-memory `FakeRpc`.
 
@@ -118,7 +120,7 @@ export CID_CKB_RPC_URL=http://127.0.0.1:8114
 export CID_POLL_INTERVAL_SECS=5
 # Type-ID (preferred on hash_type=type networks):
 #   CID_LOCK_TYPE_ID_ARGS / CID_PROCESS_TYPE_ID_ARGS (+ optional *_TYPE_ID)
-# Or legacy static: CID_LOCK_CODE_HASH + CID_*_CELL_DEP + CID_PROCESS_CODE_HASH
+# Or legacy static: CID_LOCK_CODE_HASH + CID_*_CELL_DEP (then POST /v1/processes)
 # See docs/local-dev-chain.md for the local data1 fixture path.
 cargo run -p cid-backend-daemon
 # same settings in TOML: cargo run -p cid-backend-daemon -- --config path/to/cid.toml

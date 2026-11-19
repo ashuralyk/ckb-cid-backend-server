@@ -30,9 +30,9 @@ pub struct DaemonConfig {
     pub extra_cell_deps: Vec<CellDep>,
     /// Type-ID identities for code cells (CID lock / Process code / Process lock).
     pub type_id_code_deps: Vec<TypeIdCodeDep>,
-    /// Indexer type-script `code_hash` prefixes used to find Process cells by
-    /// `calc_script_hash` (the 32-byte value in CID args is a script hash, not
-    /// a code hash). Auto-includes derived Process code `type_id` when set.
+    /// **Deprecated / ignored at runtime.** Process workers discover state via
+    /// on-disk registry + exact TYPE_ID args (`find_live_cells_by_type_script`).
+    /// Parsed only for backward-compatible config; not passed to `CkbRpc`.
     pub process_type_code_hashes: Vec<[u8; 32]>,
     /// Optional health/stats bind. Unset/empty disables the listener.
     pub health_bind: Option<SocketAddr>,
@@ -612,23 +612,12 @@ fn merge<F: Fn(&str) -> Option<String>>(
             out
         }
     };
-    if let Some(ref id) = process_code_identity {
-        let derived = id.type_script_hash();
-        // Type-ID Process mode: only the derived TYPE_ID script hash is a valid
-        // Process state type code_hash. Extra prefixes could surface unbound
-        // state cells; reject them at config (runtime still validates identity).
-        for h in &process_type_code_hashes {
-            if h != &derived {
-                return Err(ConfigError::Invalid(
-                    "CID_PROCESS_CODE_HASH / process.type_code_hashes must not list hashes \
-                     other than the derived process.type_id when process.type_id_args is set"
-                        .into(),
-                ));
-            }
-        }
-        if process_type_code_hashes.is_empty() {
-            process_type_code_hashes.push(derived);
-        }
+    if !process_type_code_hashes.is_empty() {
+        log::warn!(
+            "CID_PROCESS_CODE_HASH / process.type_code_hashes is deprecated: \
+             Process discovery uses the registry; indexer prefixes are ignored"
+        );
+        process_type_code_hashes.clear();
     }
 
     let mut type_id_code_deps = Vec::new();
@@ -1382,8 +1371,7 @@ poll_interval_secs = 5
         assert_eq!(cfg.type_id_code_deps.len(), 2);
         assert_eq!(cfg.type_id_code_deps[0].label, "cid_lock");
         assert_eq!(cfg.type_id_code_deps[1].label, "process_code");
-        let proc_derived = type_id_script_hash(&[0xbbu8; 32]);
-        assert!(cfg.process_type_code_hashes.contains(&proc_derived));
+        assert!(cfg.process_type_code_hashes.is_empty());
         let loop_cfg = cfg.to_loop_config();
         // Loop only carries CID lock Type-ID; Process code deps come from registry.
         assert_eq!(loop_cfg.type_id_code_deps.len(), 1);
@@ -1407,8 +1395,8 @@ poll_interval_secs = 5
     }
 
     #[test]
-    fn type_id_process_rejects_extra_process_code_hash_prefixes() {
-        let err = DaemonConfig::from_vars(|k| match k {
+    fn type_id_process_clears_deprecated_process_code_hash() {
+        let cfg = DaemonConfig::from_vars(|k| match k {
             "CID_CKB_RPC_URL" => Some("http://127.0.0.1:8114".into()),
             "CID_POLL_INTERVAL_SECS" => Some("5".into()),
             "CID_LOCK_TYPE_ID_ARGS" => Some("aa".repeat(32)),
@@ -1416,13 +1404,8 @@ poll_interval_secs = 5
             "CID_PROCESS_CODE_HASH" => Some("51".repeat(32)),
             _ => None,
         })
-        .unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("CID_PROCESS_CODE_HASH") || msg.contains("type_code_hashes"),
-            "{msg}"
-        );
-        assert!(msg.contains("derived") || msg.contains("type_id"), "{msg}");
+        .unwrap();
+        assert!(cfg.process_type_code_hashes.is_empty());
     }
 
     #[test]
@@ -1605,7 +1588,7 @@ fee_rate = 1000
         })
         .unwrap();
         assert_eq!(cfg.extra_cell_deps.len(), 2);
-        assert_eq!(cfg.process_type_code_hashes, vec![[0xccu8; 32]]);
+        assert!(cfg.process_type_code_hashes.is_empty());
         let loop_cfg = cfg.to_loop_config();
         assert_eq!(loop_cfg.extra_cell_deps.len(), 2);
         assert_eq!(cfg.extra_cell_deps[0].dep_type(), DepType::Code.into());
@@ -1678,7 +1661,7 @@ fee_rate = 1000
         assert_eq!(cfg.node_url, "http://127.0.0.1:8114");
         assert_eq!(cfg.cid_lock_code_hash, [0xbbu8; 32]);
         assert_eq!(cfg.hash_type, ScriptHashType::Data1);
-        assert_eq!(cfg.process_type_code_hashes, vec![[0xccu8; 32]]);
+        assert!(cfg.process_type_code_hashes.is_empty());
         assert_eq!(cfg.extra_cell_deps.len(), 1);
         assert_eq!(cfg.poll_interval, Duration::from_secs(5));
         assert_eq!(cfg.confirmation_depth, 8);
@@ -1730,7 +1713,7 @@ dep_type = "dep_group"
         assert_eq!(cfg.poll_interval, Duration::from_secs(9));
         assert_eq!(cfg.confirmation_depth, 3);
         assert_eq!(cfg.log_format, LogFormat::Json);
-        assert_eq!(cfg.process_type_code_hashes, vec![[0xeeu8; 32]]);
+        assert!(cfg.process_type_code_hashes.is_empty());
         // file cell deps kept: no env cell-dep vars
         assert_eq!(cfg.extra_cell_deps.len(), 1);
     }
