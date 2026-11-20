@@ -267,7 +267,8 @@ Default is 24 blocks (~3 minutes at ~8s). FakeRpc and the local-chain E2E use `1
 | `send_transaction` returns `Unavailable` (including duplicate `-1107`) | after a known drop or expiry of initial admission grace | track the local transaction hash and hold occupancy through reconciliation |
 | `PoolUnavailable` (`-1105`, `-1106`) | next tick | no new occupancy |
 | `Conflict` (`-301`, unknown-input, etc.) | yes | not taken |
-| `SubmitRejected` (`-302` / `-1102` / `-1108`) | isolate that **combo**; do not send it again this process lifetime | not taken; Process is not written to `rejected` |
+| `PoolPolicyRejected` (including maturity, minimum fee, and transaction size limits) | try another combination now and reconsider this combination on a later tick | no new occupancy |
+| `SubmitRejected` (permanent `-302`, `-1102`, `-1103`, `-1108`, or invalid local serialization) | isolate that combination while the Process state and code stay the same | no new occupancy |
 | `Process.assemble` error | Log and try smaller or shifted batches. Exit 41 quarantines the state/code pair. | Affected Intentions stay live |
 | `Process.filter` reasons 4–7 | User Lock refund after matching node snapshots | Refund occupies the Intention input and depends on the live Process state and code |
 

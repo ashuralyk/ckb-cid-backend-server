@@ -431,7 +431,8 @@ impl Rpc for CkbRpc {
 
     fn tip_block_number(&self) -> Result<u64, RpcError> {
         let result = self.rpc_call(&self.node_url, "get_tip_block_number", json!([]))?;
-        parse_uint(&result)
+        parse_rpc_quantity(&result)
+            .ok_or_else(|| RpcError::Unavailable("get_tip_block_number: invalid height".into()))
     }
 }
 
@@ -647,10 +648,11 @@ fn committed_block_number(
     tx: &Value,
     block_hash: &[u8; 32],
 ) -> Result<u64, RpcError> {
-    if let Some(n) = tx.pointer("/tx_status/block_number") {
-        if let Ok(v) = parse_uint(n) {
-            return Ok(v);
-        }
+    if let Some(number) = tx
+        .pointer("/tx_status/block_number")
+        .and_then(parse_rpc_quantity)
+    {
+        return Ok(number);
     }
     let header = rpc.rpc_call(&rpc.node_url, "get_header", json!([hex_bytes(block_hash)]))?;
     if header.is_null() {
@@ -660,9 +662,8 @@ fn committed_block_number(
     }
     header
         .get("number")
-        .map(parse_uint)
-        .transpose()?
-        .ok_or_else(|| RpcError::Unavailable("get_header: missing number".into()))
+        .and_then(parse_rpc_quantity)
+        .ok_or_else(|| RpcError::Unavailable("get_header: missing or invalid number".into()))
 }
 
 /// CKB `send_transaction` JSON-RPC codes (rpc/README.md). Only positively
@@ -764,17 +765,7 @@ impl CkbRpc {
             return Err((code, msg));
         }
         let result = &v["result"];
-        let has_uint = |key: &str| {
-            result
-                .get(key)
-                .and_then(Value::as_str)
-                .and_then(|value| value.strip_prefix("0x"))
-                .is_some_and(|digits| {
-                    (digits.len() == 1 || !digits.starts_with('0'))
-                        && digits.bytes().all(|byte| byte.is_ascii_hexdigit())
-                        && u64::from_str_radix(digits, 16).is_ok()
-                })
-        };
+        let has_uint = |key: &str| result.get(key).and_then(parse_rpc_quantity).is_some();
         if has_uint("cycles") && (method != "test_tx_pool_accept" || has_uint("fee")) {
             Ok(())
         } else {
@@ -935,10 +926,9 @@ fn tx_view_to_json(tx: &TransactionView) -> Result<Value, RpcError> {
         .cell_deps()
         .into_iter()
         .map(|d| {
-            let dt: DepType = d
-                .dep_type()
-                .try_into()
-                .map_err(|_| RpcError::Unavailable("cell_dep.dep_type".into()))?;
+            let dt: DepType = d.dep_type().try_into().map_err(|_| {
+                RpcError::SubmitRejected("invalid transaction cell_dep.dep_type".into())
+            })?;
             Ok(json!({
                 "out_point": out_point_json(&d.out_point()),
                 "dep_type": dep_type_str(dt),
@@ -1018,7 +1008,7 @@ fn script_json(s: &Script) -> Result<Value, RpcError> {
     let ht: ScriptHashType = s
         .hash_type()
         .try_into()
-        .map_err(|_| RpcError::Unavailable("script hash_type".into()))?;
+        .map_err(|_| RpcError::SubmitRejected("invalid transaction script hash_type".into()))?;
     let args: Vec<u8> = s.args().unpack();
     Ok(json!({
         "code_hash": hex_bytes(s.code_hash().as_slice()),
@@ -1053,6 +1043,16 @@ fn decode_hex(s: &str) -> Result<Vec<u8>, RpcError> {
         return Ok(Vec::new());
     }
     hex::decode(t).map_err(|e| RpcError::Unavailable(format!("hex: {e}")))
+}
+
+fn parse_rpc_quantity(value: &Value) -> Option<u64> {
+    let digits = value.as_str()?.strip_prefix("0x")?;
+    if (digits.len() > 1 && digits.starts_with('0'))
+        || !digits.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    u64::from_str_radix(digits, 16).ok()
 }
 
 fn parse_uint(v: &Value) -> Result<u64, RpcError> {
@@ -1467,6 +1467,32 @@ mod tests {
             .expect("found");
         assert_eq!(cell.data, vec![0x7f, b'E', b'L', b'F']);
         assert_eq!(script_hash32(&cell.type_script().unwrap()), hash);
+    }
+
+    #[test]
+    fn rejects_malformed_outbound_transactions_before_rpc() {
+        let rpc = CkbRpc::new("http://127.0.0.1:1", "http://127.0.0.1:1");
+        let invalid_lock = Script::new_builder().hash_type(3u8.into()).build();
+        let invalid_dep = CellDep::new_builder().dep_type(2u8.into()).build();
+        let malformed = [
+            ckb_types::core::TransactionBuilder::default()
+                .output(CellOutput::new_builder().lock(invalid_lock).build())
+                .output_data(Default::default())
+                .build(),
+            ckb_types::core::TransactionBuilder::default()
+                .cell_dep(invalid_dep)
+                .build(),
+        ];
+        for tx in malformed {
+            assert!(matches!(
+                rpc.dry_run_transaction(&tx),
+                Err(RpcError::SubmitRejected(_))
+            ));
+            assert!(matches!(
+                rpc.submit_transaction(&tx),
+                Err(RpcError::SubmitRejected(_))
+            ));
+        }
     }
 
     #[test]
@@ -2240,6 +2266,7 @@ mod tests {
             "get_transaction" => Ok(json!({
                 "tx_status": {
                     "status": "committed",
+                    "block_number": "0x",
                     "block_hash": format!("0x{}", "cd".repeat(32))
                 }
             })),

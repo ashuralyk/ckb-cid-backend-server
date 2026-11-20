@@ -88,6 +88,7 @@ written to `rejected`.
 | `Dropped` (pool eviction / reorg) | yes, next tick if cells live | released |
 | RPC/indexer `Unavailable` | yes | existing occupancy stays held |
 | `PoolUnavailable` | yes, on the next tick | no new occupancy |
+| `PoolPolicyRejected` | try another combination now and reconsider this combination on a later tick | no new occupancy |
 | `send_transaction` returns `Unavailable` | after a known drop or expiry of the initial admission grace period | held under the local transaction hash through reconciliation |
 | `Conflict` | yes. During assembly isolation, try later subsets and reconsider conflicts on the next search. | not taken (`failed` is informational) |
 | `SubmitRejected` (positively identified permanent send failure of this tx) | isolate / skip that **combo** this process lifetime | not taken; Process outpoint is not blacklisted |
