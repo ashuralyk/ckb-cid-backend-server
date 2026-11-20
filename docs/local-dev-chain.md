@@ -28,7 +28,7 @@ Default auto-download is **Linux x86_64** (`ckb_${version}_x86_64-unknown-linux-
 
 The script inits `dev` with genesis miner lock, sets **`min_fee_rate = 0`** (D8: no fee input; `digest_ok` pays from Process recreate; Incompatible refunds default to exact/zero-fee under an empty bounded-refund allowlist — required here so local refunds clear against the pinned lock), enables the Indexer RPC module, builds RISC-V guests, starts `ckb run` + `ckb miner` on `127.0.0.1:8114`, exports `CID_CKB_RPC_URL`, `CID_PROCESS_EXAMPLE_PATH`, `CID_LOCK_ELF_PATH`, `CID_ALWAYS_SUCCESS_PATH`, `CID_LOCAL_CHAIN_E2E=1`, then runs the ignored E2E. Setting only `CID_LOCAL_CHAIN_E2E=1` and invoking `cargo test` on a clean machine is **not** equivalent.
 
-Success prints `local-chain execution tx committed:` and `local-chain closure ok:`.
+Before signing setup, the ignored fixture requires a numeric loopback HTTP RPC URL and checks that the node reports `ckb_dev`. The fixture disables HTTP redirects and proxies. Success confirms that the committed transaction spends the original Intention and produces the expected beneficiary output.
 
 ## Daemon env (production / local)
 
@@ -37,7 +37,7 @@ Success prints `local-chain execution tx committed:` and `local-chain closure ok
 | `CID_CKB_RPC_URL` | required | Node JSON-RPC |
 | `CID_INDEXER_URL` | optional | Indexer JSON-RPC (default: node URL) |
 | `CID_LOCK_CODE_HASH` | required | CID lock `code_hash` |
-| `CID_LOCK_HASH_TYPE` | optional | `type` (default) / `data` / `data1` / `data2` |
+| `CID_LOCK_HASH_TYPE` | optional | `type` (default), required for the primary CID lock |
 | `CID_POLL_INTERVAL_SECS` | required | ≥ 1 |
 | `CID_LOCK_CELL_DEP` | optional; needed at run | `<tx_hash>:<index>` CID lock code cell (`DepType::Code`) |
 | `CID_PROCESS_CODE_CELL_DEP` | optional; needed at run | Process type code cell |
@@ -48,7 +48,7 @@ Success prints `local-chain execution tx committed:` and `local-chain closure ok
 | `CID_CONFIRMATION_DEPTH` | optional | Blocks before a committed execution tx is settled (default 24; see `docs/confirmation.md`) |
 | `CID_FEE_RATE` | optional | Shannons/KW for bounded refunds (default 1000) |
 | `CID_BOUNDED_REFUND_LOCKS` | optional | Comma list `0xhash:hash_type` of audited locks allowed to use ≤ `MAX_REFUND_FEE` refund haircuts (default **empty** / legacy exact). Never undeployed candidates. |
-| `CID_LEGACY_SCAN_LOCKS` | optional | Extra CID lock identities to scan for visibility. Workers process the configured primary CID Type ID. |
+| `CID_LEGACY_SCAN_LOCKS` | optional | Scan-only CID lock identities, including legacy `data`, `data1`, and `data2` locks. |
 | `CID_LOG_FORMAT` / `RUST_LOG` | optional | Structured logs (`docs/observability.md`) |
 | `CID_CONFIG` | optional | TOML path (`--config` wins). See `examples/cid.network.toml.example`. No keys. |
 

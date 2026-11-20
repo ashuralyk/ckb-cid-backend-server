@@ -24,9 +24,11 @@ The daemon continuously digests CID Intentions:
 1. Scan live Intentions by the configured CID code Type ID. The shared `cid-intention-filter` routing helpers validate the CID lock identity and extract the Process state Type ID. Malformed, foreign-CID, and unregistered Intentions remain live.
 2. Resolve the registered Process state and code cells by exact Type-ID scripts. The state lock points at the Process code Type ID with `hash_type=type`, and its args bind the configured CID Type ID.
 3. Call `Process.filter` on the same code-cell ELF used by `Process.batch` and `Process.assemble`. Each request carries at most 64 cells and 64 KiB. The daemon retries the candidate window on a malformed response, a count mismatch, or an unknown reason. A cell that exceeds 64 KiB by itself stays live.
-4. Select batches from reason 0. Reasons 1 and 4–7 go through individual `digest_incompatible` refund attempts, including deposits below the minimum (reason 5). Reserved reasons 2 and 3 are logged as protocol violations and leave those cells live. By default the daemon defers the Process if `Process.filter` is missing. Set `loop.allow_missing_filter = true` or `CID_ALLOW_MISSING_FILTER=true` to enable legacy assembly on the explicit SSRI method-missing exit.
-5. Validate the full `Process.assemble` transaction, dry-run it, and submit it unchanged. The example guest pays the execution fee from the recreated Process state. Assembly exit 21 uses the existing refund path. Exits 39 and 40 trigger Intention isolation and refunds. Exit 41 quarantines the current Process state for that code-cell version and suppresses that Process's refunds. A replacement state or Process code cell can be tried on a later tick.
+4. Select batches from reason 0. For the pinned v0.1.4 example ELF, the daemon also checks whether a reason-0 beneficiary uses the Process lock code hash and refunds that Intention as reason 6. Reasons 1 and 4–7 go through individual `digest_incompatible` refund attempts. Reserved reasons 2 and 3 are logged as protocol violations and leave those cells live. A missing filter defers the Process by default. Set `loop.allow_missing_filter = true` or `CID_ALLOW_MISSING_FILTER=true` to enable legacy assembly on the explicit SSRI method-missing exit.
+5. Validate the full `Process.assemble` transaction, dry-run it, and submit it unchanged. Guest-added funding inputs are checked against the configured CID locks and known data-hash aliases. Assembly exit 21 uses the existing refund path. For exits 39 and 40 the daemon identifies offending Intentions, resuming a long comparison search across ticks, and retries their refunds under the same policy if submission fails or drops. Exit 41 quarantines the current Process state and suppresses its refunds until the state or code cell changes.
 6. Track occupied inputs until confirmation depth is met. Refunds spend the Intention and preserve its data and type, returning capacity to the User Lock in its args. The existing refund builder supports CKB and standard xUDT. It logs and leaves unsupported refund outputs live. The default fee mode returns exact capacity. A configured bounded-refund CID identity lets the daemon deduct the required transaction fee within the on-chain per-output limit.
+
+Filter and isolated 39/40 refunds include the live Process code outpoint that authorized the verdict. The daemon considers up to 16 of these singleton refunds per Process per tick, resumes after the last attempt, and stops that Process's sweep when RPC is unavailable.
 
 Upstream contract pin for testnet v0.1.4 is `b2d01e0a5a9760c8ee627633365aa98dd7a99859`. For the public config, deployment outpoints, and registry POST body, see the [runbook](docs/runbook.md).
 
@@ -62,7 +64,7 @@ cargo run -p cid-backend-daemon -- --config examples/cid.testnet.toml
 
 Configure the CID code cell with `cid_lock.type_id_args` (its 32-byte TYPE_ID script args) and optionally `cid_lock.type_id` (the full type-script hash). Register every Process state and code Type ID through the HTTP API. Every tick resolves the live code cells by exact type script and uses the current outpoints as code dependencies. Cell outpoints and data hashes can change on an in-place upgrade while the Type IDs stay the same.
 
-Static `[[cell_deps]]` can supply extra scripts such as xUDT. Legacy scan entries can still be discovered for visibility. The v0.1.4 worker only routes Intentions that use the primary CID code Type ID configured for the daemon and bound to the Process state.
+Static `[[cell_deps]]` can supply extra scripts such as xUDT. The primary CID lock requires `hash_type=type` and the CID code Type-ID script hash. Move `data`, `data1`, and `data2` identities to `cid_lock.legacy_scan_locks` or `CID_LEGACY_SCAN_LOCKS` for scan-only visibility.
 
 `config.loaded` logs `rpc` / `indexer` as scheme+host+port only (userinfo and path/query stripped).
 
@@ -75,7 +77,7 @@ Static `[[cell_deps]]` can supply extra scripts such as xUDT. Legacy scan entrie
 | `CID_CKB_RPC_URL` | required | Node JSON-RPC |
 | `CID_INDEXER_URL` | optional | Indexer JSON-RPC; empty uses `CID_CKB_RPC_URL` |
 | `CID_LOCK_CODE_HASH` | required unless Type-ID | CID lock `code_hash`, 32-byte hex (`0x` optional); derived when `CID_LOCK_TYPE_ID_ARGS` is set |
-| `CID_LOCK_HASH_TYPE` | optional | `type` (default) / `data` / `data1` / `data2`; Type-ID mode requires `type` |
+| `CID_LOCK_HASH_TYPE` | optional | Primary CID lock hash type, must be `type` (default) |
 | `CID_LOCK_TYPE_ID_ARGS` | optional | 32-byte TYPE_ID args for CID lock **code** cell |
 | `CID_LOCK_TYPE_ID` | optional | Full type-script hash verify (not args) |
 | `CID_PROCESS_TYPE_ID_ARGS` | optional | TYPE_ID args for Process **code** cell |
@@ -91,6 +93,7 @@ Static `[[cell_deps]]` can supply extra scripts such as xUDT. Legacy scan entrie
 | `CID_HEALTH_BIND` | optional | `host:port` (e.g. `127.0.0.1:9100`); unset or empty **disables** HTTP |
 | `CID_CONFIRMATION_DEPTH` | optional | Blocks after a committed Execution Tx before settle; default **24**, must be **≥ 1** |
 | `CID_ALLOW_MISSING_FILTER` | optional | Default `false`. Set `true` to allow fallback on explicit SSRI method-missing exit. |
+| `CID_EXAMPLE_POLICY_DATA_HASHES` | optional | Comma-separated additional audited example ELF data hashes. Overrides `process.example_policy_data_hashes`. The pinned v0.1.4 hash is built in. |
 | `CID_LOG_FORMAT` | optional | `json` (default) or `pretty` (`text` is an alias for pretty) |
 | `CID_CONFIG` | optional | TOML path if `--config` is omitted |
 | `CID_GENESIS_HASH` | optional | Overrides `network.genesis_hash` |
@@ -132,7 +135,7 @@ That script: auto-downloads pinned `ckb` v0.119.0 **only** as `x86_64-unknown-li
 cargo test -p cid-backend-daemon --test local_chain_e2e -- --ignored --nocapture
 ```
 
-The cargo line is **not** equivalent by itself. On a clean machine it fails without the node and those paths (`local_chain_e2e.rs`). On macOS / ARM Linux, install a matching `ckb` v0.119.0 into `$CKB_DIR/ckb` first. Also needs `curl` and `tar` for the Linux x86_64 download path.
+The fixture requires its opt-in flag, the guest paths, and a numeric loopback HTTP endpoint reporting `ckb_dev`. Its setup uses the public dev-chain genesis key. The committed transaction must consume the original Intention and contain the expected beneficiary output. On macOS / ARM Linux, install a matching `ckb` v0.119.0 into `$CKB_DIR/ckb` first.
 
 Success prints `local-chain execution tx committed:` and `local-chain closure ok:`. Details (Process data must be an ELF, Process lock is always-success, no post-Intention signature) are in [`docs/local-dev-chain.md`](docs/local-dev-chain.md).
 
@@ -224,14 +227,14 @@ flowchart TD
 Each tick ([`digest_loop.rs`](crates/cid-backend-core/src/digest_loop.rs)):
 
 1. Refresh tip and reconcile `pending` (confirmation / reorg) **before** Type-ID code-dep refresh, so unavailable code deps never stall settlement.
-2. Resolve Type-ID code cells (bounded exact search); merge with static extras. On Process Type-ID, SSRI uses that code-cell ELF and requires the Process **state** type script `hash_type=type` + `code_hash` = derived TYPE_ID. Legacy mode uses state-cell ELF.
+2. Resolve Type-ID code cells with a bounded exact search and merge their dependencies with static extras. SSRI uses the live Process code-cell ELF. The Process state lock references that code Type ID with `hash_type=type`.
 3. Scan live Intentions; skip cells whose lock args fail to decode.
 4. Bucket by Process; `isolate_window` splits into legal `[min, max]` sub-batches. Reject/isolate fingerprints include Type-ID code outpoints so code upgrades clear stale `CachedRejected` without dropping `pending` / `in_flight`.
 5. `digest_ok` occupies the Process recreate until settle; User Lock refunds in the same tick may still submit.
 
 ### Memory-only state and restart
 
-All bookkeeping is process memory: `in_flight` / `pending` / `rejected_combos` / `isolate_resume` / `isolate_expanded` / health counters. No SQLite / Redis / cursor file. It is dropped on exit; the next tick is a full indexer rescan from the head. After restart, a still-mempool tx may be submitted again (D6); already-spent cells surface as `Conflict`.
+Occupancy, rejected combinations, isolation progress, and refund retry state are held in memory. After restart, the daemon rescans from the indexer head. A transaction still in the mempool may be submitted again (D6). Already-spent cells surface as `Conflict`.
 
 ### Confirmation depth and reorg
 

@@ -9,38 +9,16 @@ mod tests {
     use cid_backend_core::rpc::out_point_key;
     use cid_backend_core::type_id::{TypeIdCodeDep, TypeIdIdentity};
     use ckb_types::core::ScriptHashType;
-    use ckb_types::packed::{Byte32, CellDep, CellOutput, OutPoint, Script};
+    use ckb_types::packed::{CellDep, CellOutput, Script};
     use ckb_types::prelude::*;
 
     use crate::fake_rpc::FakeRpc;
     use crate::helpers::{
-        default_loop_config, fixture_process_entry_with_code, intention_cell, loop_with_resolver,
-        loop_with_resolver_and_code, process_cell, process_cell_for_code, process_type_hash,
-        FIXTURE_ELF, PROC_CODE_ARGS,
+        code_cell, default_loop_config, fixture_process_entry_with_code, intention_cell,
+        loop_with_resolver, loop_with_resolver_and_code, process_cell, process_cell_for_code,
+        process_type_hash, FIXTURE_ELF, PROC_CODE_ARGS,
     };
     use crate::scripted_ssri::ScriptedSsri;
-
-    fn code_cell(tx_byte: u8, args: [u8; 32], data: Vec<u8>) -> cid_backend_core::rpc::LiveCell {
-        let type_script = cid_backend_core::type_id::type_id_script(&args);
-        let lock = Script::new_builder()
-            .code_hash(Byte32::from_slice(&[0x99; 32]).unwrap())
-            .hash_type(ScriptHashType::Data1.into())
-            .args(Vec::<u8>::new().pack())
-            .build();
-        let output = CellOutput::new_builder()
-            .capacity(1_000_0000_0000u64.pack())
-            .lock(lock)
-            .type_(Some(type_script).pack())
-            .build();
-        cid_backend_core::rpc::LiveCell {
-            out_point: OutPoint::new_builder()
-                .tx_hash(Byte32::from_slice(&[tx_byte; 32]).unwrap())
-                .index(0u32.pack())
-                .build(),
-            output,
-            data,
-        }
-    }
 
     fn cfg(type_id_code_deps: Vec<TypeIdCodeDep>, extra: Vec<CellDep>) -> LoopConfig {
         LoopConfig {

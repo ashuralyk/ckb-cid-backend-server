@@ -10,11 +10,13 @@
 #![allow(clippy::inconsistent_digit_grouping)]
 
 use std::env;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use cid_backend_core::digest_loop::{DigestLoop, NopClock};
+use cid_backend_core::host_query::HostQueryRpc;
 use cid_backend_core::rpc::{script_hash32, Rpc, TxStatus};
 use cid_backend_core::ssri::EmbeddedSsri;
 use cid_backend_core::{ProcessEntry, TypeIdCodeDep, TypeIdIdentity};
@@ -307,6 +309,111 @@ fn code_output(lock: &Script, type_script: Option<Script>, data: &[u8]) -> (Cell
     )
 }
 
+fn local_rpc_address(url: &str) -> Option<SocketAddr> {
+    let authority = url.strip_prefix("http://")?;
+    let addr: SocketAddr = authority
+        .strip_suffix('/')
+        .unwrap_or(authority)
+        .parse()
+        .ok()?;
+    (addr.ip().is_loopback() && addr.port() != 0).then_some(addr)
+}
+
+fn is_dev_chain(info: &Value) -> bool {
+    info["chain"].as_str() == Some("ckb_dev")
+}
+
+fn check_committed_execution(
+    result: &Value,
+    intention: &OutPoint,
+    beneficiary: &Script,
+    capacity: u64,
+) -> Result<(), &'static str> {
+    if result["tx_status"]["status"] != "committed" {
+        return Err("execution transaction is not committed");
+    }
+    let tx = &result["transaction"];
+    let tx_hash = hex_bytes(intention.tx_hash().as_slice());
+    let index: u32 = intention.index().unpack();
+    let index = format!("0x{index:x}");
+    let inputs = tx["inputs"].as_array().ok_or("missing committed inputs")?;
+    if !inputs.iter().any(|input| {
+        let previous = &input["previous_output"];
+        previous["tx_hash"] == tx_hash && previous["index"] == index
+    }) {
+        return Err("committed transaction did not consume the original Intention");
+    }
+    let outputs = tx["outputs"]
+        .as_array()
+        .ok_or("missing committed outputs")?;
+    let data = tx["outputs_data"]
+        .as_array()
+        .ok_or("missing committed outputs_data")?;
+    let capacity = format!("0x{capacity:x}");
+    if !outputs.iter().zip(data).any(|(output, data)| {
+        output["capacity"] == capacity
+            && output["type"].is_null()
+            && *data == "0x"
+            && json_script(&output["lock"]) == *beneficiary
+    }) {
+        return Err("committed transaction did not pay the expected beneficiary");
+    }
+    Ok(())
+}
+
+#[test]
+fn fixture_targets_only_a_loopback_dev_node() {
+    for url in [
+        "https://127.0.0.1:8114",
+        "http://localhost:8114",
+        "http://example.org:8114",
+        "http://127.0.0.1:8114@example.org:8114",
+        "http://127.0.0.1:8114/proxy",
+    ] {
+        assert!(local_rpc_address(url).is_none(), "{url}");
+    }
+    assert!(local_rpc_address("http://127.0.0.1:8114").is_some());
+    assert!(local_rpc_address("http://[::1]:8114/").is_some());
+    for chain in ["ckb", "ckb_testnet", "ckb_staging"] {
+        assert!(!is_dev_chain(&json!({"chain": chain})));
+    }
+    assert!(!is_dev_chain(&json!({})));
+    assert!(is_dev_chain(&json!({"chain": "ckb_dev"})));
+}
+
+#[test]
+fn committed_execution_requires_the_intention_input_and_beneficiary_output() {
+    let op = OutPoint::new_builder()
+        .tx_hash([0x42; 32].pack())
+        .index(1u32.pack())
+        .build();
+    let hash = hex_bytes(op.tx_hash().as_slice());
+    let beneficiary = secp_lock();
+    let mut result = json!({
+        "tx_status": {"status": "committed"},
+        "transaction": {
+            "inputs": [{"previous_output": {"tx_hash": hash, "index": "0x1"}}],
+            "outputs": [{
+                "capacity": "0x64",
+                "type": null,
+                "lock": {
+                    "code_hash": hex_bytes(beneficiary.code_hash().as_slice()),
+                    "hash_type": "type",
+                    "args": hex_bytes(&beneficiary.args().raw_data()),
+                },
+            }],
+            "outputs_data": ["0x"],
+        },
+    });
+    assert_eq!(
+        check_committed_execution(&result, &op, &beneficiary, 100),
+        Ok(())
+    );
+    assert!(check_committed_execution(&result, &op, &beneficiary, 101).is_err());
+    result["transaction"]["inputs"][0]["previous_output"]["index"] = json!("0x0");
+    assert!(check_committed_execution(&result, &op, &beneficiary, 100).is_err());
+}
+
 #[test]
 #[ignore = "local CKB dev chain; run scripts/local-dev-chain.sh"]
 fn scan_resolve_ssri_submit_confirms_on_local_dev_chain() {
@@ -314,7 +421,19 @@ fn scan_resolve_ssri_submit_confirms_on_local_dev_chain() {
         eprintln!("skip: set CID_LOCAL_CHAIN_E2E=1 (use scripts/local-dev-chain.sh)");
         return;
     }
-    let rpc_url = env::var("CID_CKB_RPC_URL").expect("CID_CKB_RPC_URL");
+    let url = env::var("CID_CKB_RPC_URL").expect("CID_CKB_RPC_URL");
+    let addr = local_rpc_address(&url).expect("fixture requires a numeric loopback HTTP RPC URL");
+    let rpc_url = format!("http://{addr}");
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(30))
+        .redirects(0)
+        .try_proxy_from_env(false)
+        .build();
+    let rpc = CkbRpc::with_agent(&rpc_url, &rpc_url, agent);
+    let info = rpc
+        .call_node("get_blockchain_info", json!([]))
+        .expect("chain info");
+    assert!(is_dev_chain(&info), "fixture requires ckb_dev");
     let process_elf =
         std::fs::read(read_env_path("CID_PROCESS_EXAMPLE_PATH")).expect("process elf");
     let cid_elf = std::fs::read(read_env_path("CID_LOCK_ELF_PATH")).expect("cid elf");
@@ -326,7 +445,6 @@ fn scan_resolve_ssri_submit_confirms_on_local_dev_chain() {
 
     let always_code_hash = blake2b_256(&always_elf);
 
-    let rpc = CkbRpc::new(&rpc_url, &rpc_url);
     let secp_lock = secp_lock();
     let (secp_code_dep, secp_data_dep) = genesis_deps(&rpc);
     let (issued_op, issued_cap) = live_funding_cell(&rpc);
@@ -434,7 +552,7 @@ fn scan_resolve_ssri_submit_confirms_on_local_dev_chain() {
         .tx_hash(tx2_hash.clone())
         .index(0u32.pack())
         .build();
-    let _intent_op = OutPoint::new_builder()
+    let intent_op = OutPoint::new_builder()
         .tx_hash(tx2_hash.clone())
         .index(1u32.pack())
         .build();
@@ -465,6 +583,7 @@ fn scan_resolve_ssri_submit_confirms_on_local_dev_chain() {
         registry_max_entries: 64,
         confirmation_depth: 1,
         allow_missing_filter: false,
+        example_policy_data_hashes: vec![],
         fee_rate: cid_backend_core::DEFAULT_FEE_RATE,
         bounded_refund_locks: vec![],
         extra_scan_locks: vec![],
@@ -473,8 +592,7 @@ fn scan_resolve_ssri_submit_confirms_on_local_dev_chain() {
         validate_genesis: false,
         log_format: cid_backend_daemon::logging::LogFormat::Json,
     };
-    let live_rpc = CkbRpc::from_config(&cfg);
-    let mut loop_ = DigestLoop::new(live_rpc, NopClock, EmbeddedSsri, cfg.to_loop_config());
+    let mut loop_ = DigestLoop::new(rpc, NopClock, EmbeddedSsri, cfg.to_loop_config());
     assert!(loop_.register_process(ProcessEntry {
         identity_type_hash: process_type_hash,
         identity: process_state,
@@ -508,16 +626,23 @@ fn scan_resolve_ssri_submit_confirms_on_local_dev_chain() {
         hex_bytes(hash.as_slice())
     );
 
-    thread::sleep(Duration::from_secs(1));
-    let intentions = loop_
+    let committed = loop_
         .rpc()
-        .list_live_intentions(&cid_code_hash, ScriptHashType::Data1)
-        .expect("rescan");
-    assert!(
-        intentions.is_empty(),
-        "intention still live after committed digest_ok: {}",
-        intentions.len()
-    );
+        .call_node("get_transaction", json!([hex_bytes(hash.as_slice())]))
+        .expect("committed transaction");
+    let beneficiary = Script::new_builder()
+        .code_hash(always_code_hash.pack())
+        .hash_type(ScriptHashType::Data1.into())
+        .args([0xEEu8].pack())
+        .build();
+    check_committed_execution(&committed, &intent_op, &beneficiary, intent_cap)
+        .expect("execution matches the intended spend");
+    assert!(loop_
+        .rpc()
+        .get_live_cell(&intent_op)
+        .expect("Intention liveness")
+        .is_none());
+    thread::sleep(Duration::from_secs(1));
     let proc = loop_
         .rpc()
         .get_live_process_by_type_hash(&process_type_hash)

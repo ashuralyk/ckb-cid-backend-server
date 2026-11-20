@@ -23,7 +23,7 @@ pub struct ScannedIntention {
 }
 
 impl ScannedIntention {
-    fn protocol_lock(&self) -> CidScript {
+    pub(crate) fn protocol_lock(&self) -> CidScript {
         CidScript {
             code_hash: self.lock_code_hash,
             hash_type: self.lock_hash_type as u8,

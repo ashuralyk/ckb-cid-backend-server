@@ -11,6 +11,8 @@ Process-as-lock / full-tx SSRI cutover.
 
 Missing `Process.filter` defers the window by default. `loop.allow_missing_filter = true` (or `CID_ALLOW_MISSING_FILTER=true`) enables fallback on the explicit method-missing exit. The daemon logs this once per Process code-cell version.
 
+Filter and isolated 39/40 refunds require the verdict-producing live Process ELF and include its code outpoint as a dependency. The sweep considers up to 16 singleton refunds per Process per tick, advances past the last attempt, and stops on RPC unavailability.
+
 No private keys, no signing, no `.env`, no contract `deployment/` writes.
 
 ## Config
@@ -20,12 +22,15 @@ See `examples/cid.testnet.toml` / `examples/cid.network.toml.example`.
 | Section | Role |
 |---------|------|
 | `[cid_lock]` | CID lock **code** Type ID (scan identity) |
+| `[process].example_policy_data_hashes` | Optional additional audited example ELF data hashes, as 32-byte hex strings. The pinned v0.1.4 example is recognized automatically. |
 | `[registry]` | `path` + `max_entries` for on-disk Process registry |
 | `[observe].api_bind` | HTTP Process registry API |
 | `[observe].health_bind` | `/healthz` `/readyz` `/stats` `/metrics` |
 | `[loop]` | poll interval, confirmation depth, missing-filter fallback |
 
 Register existing Process state cells through the HTTP API.
+
+The primary CID identity must use `hash_type=type`. Move legacy data-hash identities to `cid_lock.legacy_scan_locks` or `CID_LEGACY_SCAN_LOCKS` for discovery only.
 
 ## Process registry API
 
@@ -50,6 +55,8 @@ The contract pin is `b2d01e0a5a9760c8ee627633365aa98dd7a99859`. These are the co
 |-----------|-------------------------|------------------|
 | CID lock | `0x48ee645be85d43c1b531b43c857c2792ea275c471df58a51066e0adddf7a9e73` | `0x816d279f64d00533c61a5c851ed5ce5c6285c5dcc8b3253505432d05aa11e2a4` |
 | Example Process | `0x3b9d86096d5be14cd560e2dd161845d9b4773171695629053d0bafaf6a7dcc4d` | `0x2374e455d8cdcae5d5387257ec0d5b33114d3b5338d823d5e388b5a0a767f226` |
+
+When the live ELF matches the pinned example data hash, the backend checks accepted Intentions for a beneficiary that uses the live Process lock code hash. A match follows the reason-6 malformed digest refund path.
 
 Send this JSON to `POST http://127.0.0.1:9101/v1/processes`. Replace the state placeholder with the 32-byte TYPE_ID args of your live Process instance.
 
@@ -91,7 +98,7 @@ script raw bytes then block/tx/output index (see contract
 
 Pinned `cid_process_example` pays fee from Process state and **rejects extra
 funding inputs** with `UnsupportedFundingLock` (38). Do not pass funding cells
-to the example guest / calculator submit helper. Exit 21 retains the existing incompatible refund path. Exits 39 (deposit below minimum) and 40 (CID lock mismatch) trigger diagnostic assembly calls to identify individual offenders. When the guest's minimum batch size exceeds one, the worker needs a valid comparison batch before authorizing refunds. Exit 41 (invalid Process state lock args) logs `process.unhealthy` and pauses assembly and refunds for that state and Process code version. Host query failures (36) and insufficient state capacity (37) leave Intentions live for retry.
+to the example guest / calculator submit helper. Exit 21 retains the existing incompatible refund path. Exits 39 (deposit below minimum) and 40 (CID lock mismatch) trigger diagnostic assembly calls to identify individual offenders. When the guest's minimum batch size exceeds one, the worker searches up to 64 comparison batches before resuming on a later tick for the same candidates and Process snapshot. Individually confirmed verdicts survive transient failures and dropped refunds while the Intention is still live and the Process policy is unchanged. Exit 41 (invalid Process state lock args) logs `process.unhealthy` and pauses assembly and refunds for that state and Process code version. Host query failures (36) and insufficient state capacity (37) leave Intentions live for retry.
 
 ## Ops checklist
 

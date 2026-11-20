@@ -1,17 +1,18 @@
 //! One OS thread per configured Process. Batch submit work runs on that thread.
 
-use crate::fee::RefundPolicy;
+use crate::fee::{CidLockIdentity, RefundPolicy};
 use crate::host_query::HostQueryRpc;
 use crate::process::ResolvedProcess;
 use crate::process::{ProcessEntry, ProcessResolver};
 use crate::process_batch::{
-    run_process_batch, BatchMode, BatchOutcome, BatchReportDelta, ProcessBatchParams,
+    run_process_batch, BatchMode, BatchOutcome, BatchReportDelta, IsolationProbe,
+    ProcessBatchParams,
 };
 use crate::rpc::{LiveCell, Rpc};
 use crate::scan::ScannedIntention;
 use crate::ssri::SsriHost;
 use crate::submit::SubmitState;
-use ckb_types::packed::{CellDep, OutPoint};
+use ckb_types::packed::{Byte32, CellDep, OutPoint, Script};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
@@ -41,6 +42,12 @@ pub struct ProcessWorkerState {
     /// (e.g. fee unaffordable). Below-min leftovers retry refund without a
     /// legal `[min,max]` assemble window.
     pub pending_incompatible_refund: HashSet<Vec<u8>>,
+    /// Individually isolated exit-39/40 verdicts for the current code and state lock.
+    pub(crate) isolated_refunds: HashMap<OutPoint, i8>,
+    pub(crate) isolated_refund_policy: Option<(Script, Byte32)>,
+    pub(crate) refund_cursor: Option<OutPoint>,
+    pub(crate) isolation_probe: Option<IsolationProbe>,
+    pub(crate) isolation_probe_paused: bool,
     pub generation: u64,
     /// State out point quarantined after Process.assemble exit 41.
     pub unhealthy_state: Option<OutPoint>,
@@ -63,6 +70,11 @@ impl ProcessWorkerState {
             isolate_expanded: HashSet::new(),
             isolate_pending: Vec::new(),
             pending_incompatible_refund: HashSet::new(),
+            isolated_refunds: HashMap::new(),
+            isolated_refund_policy: None,
+            refund_cursor: None,
+            isolation_probe: None,
+            isolation_probe_paused: false,
             generation,
             unhealthy_state: None,
             filter_missing_logged: false,
@@ -88,6 +100,10 @@ impl ProcessWorkerState {
         self.isolate_pending.clear();
         self.isolate_resume = None;
         self.pending_incompatible_refund.clear();
+        self.isolated_refunds.clear();
+        self.isolated_refund_policy = None;
+        self.refund_cursor = None;
+        self.isolation_probe = None;
     }
 
     pub fn process_type_hash(&self) -> [u8; 32] {
@@ -107,6 +123,7 @@ enum ProcessWorkerJob {
         rest: Arc<[ScannedIntention]>,
         execution_code_key: Vec<u8>,
         tick_cell_deps: Vec<CellDep>,
+        cid_locks: Arc<[CidLockIdentity]>,
         refund_policy: RefundPolicy,
         max_assembled_tx_bytes: usize,
         min: u32,
@@ -238,6 +255,7 @@ impl ProcessWorker {
         batch: Vec<ScannedIntention>,
         execution_code_key: Vec<u8>,
         tick_cell_deps: Vec<CellDep>,
+        cid_locks: Arc<[CidLockIdentity]>,
         refund_policy: RefundPolicy,
         max_assembled_tx_bytes: usize,
         window_fp: Vec<u8>,
@@ -265,6 +283,7 @@ impl ProcessWorker {
                 rest: rest.clone(),
                 execution_code_key,
                 tick_cell_deps,
+                cid_locks,
                 refund_policy,
                 max_assembled_tx_bytes,
                 min,
@@ -340,6 +359,7 @@ fn worker_thread_main<R, S>(
                 rest,
                 execution_code_key,
                 tick_cell_deps,
+                cid_locks,
                 refund_policy,
                 max_assembled_tx_bytes,
                 min,
@@ -374,6 +394,7 @@ fn worker_thread_main<R, S>(
                         rest: &rest,
                         execution_code_key: &execution_code_key,
                         tick_cell_deps: &tick_cell_deps,
+                        cid_locks: &cid_locks,
                         refund_policy: &refund_policy,
                         max_assembled_tx_bytes,
                         job_epoch,

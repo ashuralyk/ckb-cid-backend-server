@@ -42,6 +42,14 @@ impl CkbRpc {
         let agent = ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(30))
             .build();
+        Self::with_agent(node_url, indexer_url, agent)
+    }
+
+    pub fn with_agent(
+        node_url: impl Into<String>,
+        indexer_url: impl Into<String>,
+        agent: ureq::Agent,
+    ) -> Self {
         Self {
             node_url: node_url.into(),
             indexer_url: indexer_url.into(),

@@ -10,9 +10,12 @@ use crate::ssri::{filter_intentions, SsriError, SsriHost};
 use crate::submit::{combo_fingerprint, execution_code_key, SubmitState};
 use crate::type_id::TypeIdCodeDep;
 use crate::workers::{WorkerPool, WorkerRemoveError};
-use cid_intention_filter::{FILTER_ACCEPTED, FILTER_RESERVED_2, FILTER_RESERVED_3};
+use cid_intention_filter::{
+    FILTER_ACCEPTED, FILTER_MALFORMED_DIGEST, FILTER_RESERVED_2, FILTER_RESERVED_3,
+};
+use cid_process_example_policy::classify_intention_excluding_process_lock;
 use ckb_types::core::ScriptHashType;
-use ckb_types::packed::{Byte32, CellDep};
+use ckb_types::packed::{Byte32, CellDep, CellOutput};
 use ckb_types::prelude::*;
 use std::collections::HashSet;
 use std::fmt::Write as _;
@@ -21,6 +24,9 @@ use std::thread;
 use std::time::Duration;
 
 const LOG_TARGET: &str = "cid_backend";
+// cid_process_example v0.1.4 in the pinned contracts' testnet deployment record.
+const PINNED_EXAMPLE_DATA_HASH: [u8; 32] =
+    ckb_types::h256!("0x2374e455d8cdcae5d5387257ec0d5b33114d3b5338d823d5e388b5a0a767f226").0;
 
 /// Default max molecule size for guest-assembled execution txs (512 KiB).
 pub const DEFAULT_MAX_ASSEMBLED_TX_BYTES: usize = 512 * 1024;
@@ -161,6 +167,7 @@ where
     ssri: Arc<S>,
     config: LoopConfig,
     allow_missing_filter: bool,
+    example_policy_data_hashes: Vec<[u8; 32]>,
     workers: WorkerPool<R, S>,
     /// Optional shared command queue for live registry API updates.
     worker_cmds: Option<Arc<Mutex<Vec<WorkerCommand>>>>,
@@ -168,6 +175,7 @@ where
     busy: Option<ProcessBusyMap>,
     last_tip: Option<u64>,
     tick_cell_deps: Vec<CellDep>,
+    tick_cid_locks: Arc<[CidLockIdentity]>,
     execution_code_key: Vec<u8>,
 }
 
@@ -198,11 +206,13 @@ where
             ssri,
             config,
             allow_missing_filter: false,
+            example_policy_data_hashes: Vec::new(),
             workers,
             worker_cmds,
             busy: None,
             last_tip: None,
             tick_cell_deps: Vec::new(),
+            tick_cid_locks: Arc::from([]),
             execution_code_key: Vec::new(),
         }
     }
@@ -228,6 +238,12 @@ where
     /// Opt in to assembly for guests that explicitly lack Process.filter.
     pub fn with_missing_filter_fallback(mut self, allow: bool) -> Self {
         self.allow_missing_filter = allow;
+        self
+    }
+
+    /// Apply the example's state-aware checks to additional audited ELF data hashes.
+    pub fn with_example_policy_data_hashes(mut self, hashes: Vec<[u8; 32]>) -> Self {
+        self.example_policy_data_hashes = hashes;
         self
     }
 
@@ -483,12 +499,22 @@ where
 
         self.refresh_worker_process_code();
 
-        let scan_ids: Vec<([u8; 32], ScriptHashType)> = self
-            .config
-            .scan_lock_identities()
-            .into_iter()
+        let mut cid_locks = self.config.scan_lock_identities();
+        let scan_ids: Vec<([u8; 32], ScriptHashType)> = cid_locks
+            .iter()
             .map(|id| (id.code_hash, id.hash_type))
             .collect();
+        if let Some(hash) = resolved.cid_lock_data_hash {
+            cid_locks.extend(
+                [
+                    ScriptHashType::Data,
+                    ScriptHashType::Data1,
+                    ScriptHashType::Data2,
+                ]
+                .map(|hash_type| CidLockIdentity::new(hash, hash_type)),
+            );
+        }
+        self.tick_cid_locks = cid_locks.into();
         let scanned = match scan_intentions_multi(self.rpc.as_ref(), &scan_ids) {
             Ok(v) => v,
             Err(RpcError::Unavailable(m)) => {
@@ -536,6 +562,10 @@ where
                 state
                     .pending_incompatible_refund
                     .retain(|k| live_keys.contains(k) || pending_occupied.contains(k));
+                state.isolated_refunds.retain(|op, _| {
+                    live_keys.contains(op.as_slice()) || pending_occupied.contains(op.as_slice())
+                });
+                state.isolation_probe_paused = false;
             });
         });
 
@@ -606,8 +636,18 @@ where
 
         // Wait for assembly to finish first. A Process state fault discovered
         // by assemble must also stop refunds authorized by its filter.
-        for bucket in buckets {
+        for mut bucket in buckets {
             let hash = bucket.process.type_hash;
+            if let Some(worker) = self.workers.get(&hash) {
+                worker.with_state(|state| {
+                    bucket.refunds.extend(
+                        bucket
+                            .accepted
+                            .into_iter()
+                            .filter(|item| state.isolated_refunds.contains_key(&item.out_point)),
+                    );
+                });
+            }
             if !bucket.refunds.is_empty() && self.process_is_healthy(&bucket.process) {
                 self.dispatch_process_batch(
                     hash,
@@ -617,7 +657,7 @@ where
                     1,
                     None,
                     &mut report,
-                    BatchMode::FilterRefund,
+                    BatchMode::PolicyRefund,
                 );
             }
         }
@@ -679,7 +719,7 @@ where
         polled: crate::workers::PolledBatch,
     ) -> bool {
         Self::apply_batch_report(report, &polled.delta);
-        if polled.mode == BatchMode::FilterRefund {
+        if polled.mode == BatchMode::PolicyRefund {
             return false;
         }
         let mut continue_round = false;
@@ -739,7 +779,20 @@ where
                     });
                 }
             }
-            BatchOutcome::Continue => {
+            BatchOutcome::ProbePending => {
+                worker.with_state_mut(|state| {
+                    state.isolate_resume = polled
+                        .window
+                        .first()
+                        .map(|item| out_point_key(&item.out_point));
+                    if !state.isolate_pending.is_empty() {
+                        let mut items = polled.window;
+                        items.extend_from_slice(&polled.rest);
+                        state.isolate_pending.push(items);
+                    }
+                });
+            }
+            BatchOutcome::Continue | BatchOutcome::RpcUnavailable => {
                 if polled.mode.refund_only() {
                     // Cached / permanent refund_only soft-skip must not re-enter
                     // isolate rounds (would burn up to 64 RunBatch/tick).
@@ -841,6 +894,7 @@ where
             return Ok(crate::code_deps::ResolvedExecutionDeps {
                 cell_deps: self.config.extra_cell_deps.clone(),
                 process_code: None,
+                cid_lock_data_hash: None,
                 type_id_outpoints: Vec::new(),
             });
         }
@@ -1053,6 +1107,17 @@ where
             report.skipped += bucket.len();
             return None;
         }
+        let process_lock = process.live_cell.lock();
+        worker.with_state_mut(|state| {
+            let policy = (
+                process_lock.clone(),
+                CellOutput::calc_data_hash(&process.live_cell.data),
+            );
+            if state.isolated_refund_policy.as_ref() != Some(&policy) {
+                state.isolated_refunds.clear();
+                state.isolated_refund_policy = Some(policy);
+            }
+        });
         bucket.retain(
             |item| match item.belongs_to_process(&cid.code_hash, &process.type_hash) {
                 Ok(()) => true,
@@ -1067,9 +1132,30 @@ where
 
         let mut accepted = Vec::new();
         let mut refunds = Vec::new();
+        let example_policy = process.verdict_code_cell().is_some_and(|cell| {
+            let hash = CellOutput::calc_data_hash(&cell.data).unpack();
+            hash == PINNED_EXAMPLE_DATA_HASH || self.example_policy_data_hashes.contains(&hash)
+        });
+        let process_lock_code_hash = process_lock.code_hash().unpack();
         match filter_intentions(self.ssri.as_ref(), &process.binary, &bucket) {
             Ok(reasons) => {
-                for (item, reason) in bucket.into_iter().zip(reasons) {
+                for (item, mut reason) in bucket.into_iter().zip(reasons) {
+                    if example_policy && reason == Some(FILTER_ACCEPTED) {
+                        let asset = item
+                            .type_script
+                            .as_ref()
+                            .map(|typ| (typ.code_hash().unpack(), typ.hash_type().into()));
+                        let classified = classify_intention_excluding_process_lock(
+                            &item.protocol_lock(),
+                            item.capacity,
+                            asset.as_ref().map(|(hash, hash_type)| (hash, *hash_type)),
+                            &item.data,
+                            Some(&process_lock_code_hash),
+                        );
+                        if classified == FILTER_MALFORMED_DIGEST {
+                            reason = Some(classified);
+                        }
+                    }
                     match reason {
                         Some(FILTER_ACCEPTED) => accepted.push(item),
                         Some(reason @ (FILTER_RESERVED_2 | FILTER_RESERVED_3)) => {
@@ -1144,6 +1230,13 @@ where
             return;
         }
         let hash = process.type_hash;
+        if self
+            .workers
+            .get(&hash)
+            .is_some_and(|worker| worker.with_state(|state| state.isolation_probe_paused))
+        {
+            return;
+        }
         let (min, max) = match self.ssri.get_batch_bounds(&process.binary) {
             Ok(b) => b,
             Err(e) => {
@@ -1246,6 +1339,7 @@ where
                         .map(|w| {
                             w.with_state(|s| {
                                 !s.submit.in_flight.contains(&out_point_key(&i.out_point))
+                                    && !s.isolated_refunds.contains_key(&i.out_point)
                             })
                         })
                         .unwrap_or(true)
@@ -1386,7 +1480,11 @@ where
                     // Resume at this window after poll (do not skip to `rest`).
                     return items.first().map(|i| out_point_key(&i.out_point));
                 }
-                BatchOutcome::Submitted | BatchOutcome::Continue | BatchOutcome::RetryLater => {
+                BatchOutcome::Submitted
+                | BatchOutcome::Continue
+                | BatchOutcome::RetryLater
+                | BatchOutcome::RpcUnavailable
+                | BatchOutcome::ProbePending => {
                     if !rest.is_empty() {
                         stack.push(rest);
                     }
@@ -1533,6 +1631,7 @@ where
             batch,
             self.batch_code_key(process),
             self.tick_cell_deps.clone(),
+            self.tick_cid_locks.clone(),
             self.config.refund_policy.clone(),
             max_size,
             window_fp,

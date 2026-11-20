@@ -3,6 +3,7 @@
 use crate::assemble::{
     assemble_refund_with_policy, execution_from_assembled, validate_assembled_tx, AssembleError,
 };
+use crate::code_deps::{cell_dep_code, merge_cell_deps};
 const DEFAULT_MAX_ASSEMBLED_TX_BYTES: usize = 512 * 1024;
 use crate::fee::{CidLockIdentity, RefundPolicy};
 use crate::host_query::HostQueryRpc;
@@ -16,8 +17,8 @@ use crate::ssri::{
 };
 use crate::submit::{combo_fingerprint, dry_run_gate, submit_execution, DryRunGate};
 use crate::workers::ProcessWorkerState;
-use cid_intention_filter::intention_process_type_id_parts;
 use cid_process_executor::AssembledTx;
+use cid_protocol::CidArgs;
 use ckb_types::packed::{CellDep, OutPoint};
 use ckb_types::prelude::{Entity, Unpack};
 use std::fmt::Write as _;
@@ -46,6 +47,8 @@ pub enum BatchOutcome {
     /// Soft retry (e.g. [`AssembleError::RefundFeeUnaffordable`]): do **not**
     /// cache `rejected_combos` and do **not** trigger isolate drop_first/shrink.
     RetryLater,
+    ProbePending,
+    RpcUnavailable,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -60,7 +63,7 @@ pub struct BatchReportDelta {
 pub enum BatchMode {
     Assemble,
     RetryRefund,
-    FilterRefund,
+    PolicyRefund,
 }
 
 impl BatchMode {
@@ -78,6 +81,7 @@ pub struct ProcessBatchParams<'a> {
     pub rest: &'a [ScannedIntention],
     pub execution_code_key: &'a [u8],
     pub tick_cell_deps: &'a [CellDep],
+    pub cid_locks: &'a [CidLockIdentity],
     pub refund_policy: &'a RefundPolicy,
     pub max_assembled_tx_bytes: usize,
     pub job_epoch: u64,
@@ -132,6 +136,9 @@ where
     R: Rpc + HostQueryRpc + Send + Sync + 'static,
     S: SsriHost,
 {
+    if params.mode == BatchMode::PolicyRefund {
+        return refund_policy_rejections(rpc.as_ref(), params);
+    }
     let ProcessBatchParams {
         hash,
         state,
@@ -140,6 +147,7 @@ where
         rest,
         execution_code_key,
         tick_cell_deps,
+        cid_locks,
         refund_policy,
         max_assembled_tx_bytes,
         job_epoch,
@@ -166,9 +174,7 @@ where
             );
             return (BatchOutcome::CachedRejected, report);
         }
-        if mode != BatchMode::FilterRefund
-            && worker.submit.pending_occupies(&process.live_cell.out_point)
-        {
+        if worker.submit.pending_occupies(&process.live_cell.out_point) {
             tracing::warn!(
                 target: LOG_TARGET,
                 event = "tick.skip",
@@ -179,28 +185,7 @@ where
         }
     }
 
-    if mode == BatchMode::FilterRefund {
-        for item in &batch {
-            assemble_and_submit_refund(
-                rpc.as_ref(),
-                &state,
-                std::slice::from_ref(item),
-                INCOMPATIBLE_BATCH,
-                execution_code_key,
-                tick_cell_deps,
-                refund_policy,
-                &mut report,
-                BatchMode::FilterRefund,
-                lease,
-            );
-        }
-        let outcome = if report.submitted > 0 {
-            BatchOutcome::Submitted
-        } else {
-            BatchOutcome::Continue
-        };
-        return (outcome, report);
-    }
+    let cell_deps = draft_cell_deps_for_batch(process, tick_cell_deps);
     if refund_only {
         tracing::info!(
             target: LOG_TARGET,
@@ -213,7 +198,7 @@ where
             &batch,
             INCOMPATIBLE_BATCH,
             execution_code_key,
-            tick_cell_deps,
+            &cell_deps,
             refund_policy,
             &mut report,
             true,
@@ -221,7 +206,6 @@ where
         );
     }
 
-    let cell_deps = draft_cell_deps_for_batch(process, tick_cell_deps);
     if cell_deps.is_empty() {
         tracing::warn!(
             target: LOG_TARGET,
@@ -270,8 +254,31 @@ where
     if let Err(SsriError::Incompatible(code @ (DEPOSIT_BELOW_MINIMUM | CID_LOCK_MISMATCH))) =
         assemble_outcome
     {
-        let (good, bad) = match isolate_intentions(&batch, rest, min as usize, code, &attempt) {
-            Ok(result) => result,
+        let mut probe = state
+            .lock()
+            .expect("process worker state")
+            .isolation_probe
+            .take();
+        let result = isolate_intentions(
+            &batch,
+            rest,
+            min as usize,
+            code,
+            &process.live_cell.out_point,
+            &mut probe,
+            &attempt,
+        );
+        state.lock().expect("process worker state").isolation_probe = probe;
+        let (good, bad) = match result {
+            Ok(Some(result)) => result,
+            Ok(None) => {
+                state
+                    .lock()
+                    .expect("process worker state")
+                    .isolation_probe_paused = true;
+                report.skipped += batch.len();
+                return (BatchOutcome::ProbePending, report);
+            }
             Err(SsriError::Incompatible(PROCESS_LOCK_ARGS_INVALID)) => {
                 return mark_process_unhealthy(hash, process, &state, batch.len());
             }
@@ -303,21 +310,13 @@ where
         ) {
             return mark_process_unhealthy(hash, process, &state, batch.len() + bad.len());
         }
-        for (item, code) in bad {
-            tracing::warn!(target: LOG_TARGET, event = "assemble.intention_isolated",
-                process_type_hash = %hex_pref(&hash), out_point = ?item.out_point, code);
-            assemble_and_submit_refund(
-                rpc.as_ref(),
-                &state,
-                std::slice::from_ref(&item),
-                code,
-                execution_code_key,
-                tick_cell_deps,
-                refund_policy,
-                &mut report,
-                BatchMode::RetryRefund,
-                lease,
-            );
+        if process.verdict_code_cell().is_some() && !batch_cancelled(&epoch, job_epoch) {
+            let mut worker = state.lock().expect("process worker state");
+            for (item, code) in bad {
+                tracing::warn!(target: LOG_TARGET, event = "assemble.intention_isolated",
+                    process_type_hash = %hex_pref(&hash), out_point = ?item.out_point, code);
+                worker.isolated_refunds.insert(item.out_point, code);
+            }
         }
         let Some(remaining) = remaining else {
             report.skipped += batch.len();
@@ -430,7 +429,7 @@ where
                 &batch,
                 code,
                 execution_code_key,
-                tick_cell_deps,
+                &cell_deps,
                 refund_policy,
                 &mut report,
                 false,
@@ -455,7 +454,7 @@ where
         }
     };
 
-    match find_unselected_intention(rpc.as_ref(), &skeleton, &batch, process) {
+    match find_unselected_intention(rpc.as_ref(), &skeleton, &batch, process, cid_locks) {
         Ok(None) => {}
         Ok(Some(out_point)) => {
             tracing::warn!(target: LOG_TARGET, event = "assemble.invalid",
@@ -596,6 +595,7 @@ fn find_unselected_intention<R: HostQueryRpc>(
     skeleton: &crate::assemble::ExecutionSkeleton,
     batch: &[ScannedIntention],
     process: &ResolvedProcess,
+    cid_locks: &[CidLockIdentity],
 ) -> Result<Option<OutPoint>, RpcError> {
     for input in skeleton.tx.inputs().into_iter() {
         let op = input.previous_output();
@@ -607,14 +607,9 @@ fn find_unselected_intention<R: HostQueryRpc>(
         })?;
         let lock = cell.lock();
         let code_hash: [u8; 32] = lock.code_hash().unpack();
-        if code_hash == batch[0].lock_code_hash
-            || intention_process_type_id_parts(
-                &code_hash,
-                lock.hash_type().into(),
-                &lock.args().raw_data(),
-                &code_hash,
-            )
-            .is_ok()
+        if cid_locks.iter().any(|identity| {
+            code_hash == identity.code_hash && lock.hash_type() == identity.hash_type.into()
+        }) || CidArgs::decode(&lock.args().raw_data()).is_ok()
         {
             return Ok(Some(op));
         }
@@ -624,16 +619,28 @@ fn find_unselected_intention<R: HostQueryRpc>(
 
 type IsolatedIntentions = (Vec<ScannedIntention>, Vec<(ScannedIntention, i8)>);
 
+/// Resume only the same ordered candidate set and Process state.
+pub(crate) struct IsolationProbe {
+    process: OutPoint,
+    candidates: Vec<OutPoint>,
+    window_len: usize,
+    min: usize,
+    indices: Option<Vec<usize>>,
+}
+
 fn isolate_intentions(
     batch: &[ScannedIntention],
     rest: &[ScannedIntention],
     min: usize,
     original_code: i8,
+    process: &OutPoint,
+    probe: &mut Option<IsolationProbe>,
     attempt: &impl Fn(&[ScannedIntention]) -> Result<AssembledTx, SsriError>,
-) -> Result<IsolatedIntentions, SsriError> {
+) -> Result<Option<IsolatedIntentions>, SsriError> {
     let mut good = Vec::new();
     let mut bad = Vec::new();
     if min == 1 {
+        *probe = None;
         for item in batch {
             let result = if batch.len() == 1 {
                 Err(SsriError::Incompatible(original_code))
@@ -650,14 +657,37 @@ fn isolate_intentions(
                 Err(error) => return Err(error),
             }
         }
-        return Ok((good, bad));
+        return Ok(Some((good, bad)));
     }
 
     // Find a valid comparison batch, keeping the search bounded. Include
     // later filter-accepted peers because bad cells can occur in every
     // contiguous minimum-size window.
     let candidates: Vec<_> = batch.iter().chain(rest).collect();
-    let mut indices: Vec<_> = (0..min).collect();
+    if !probe.as_ref().is_some_and(|saved| {
+        &saved.process == process
+            && saved.min == min
+            && saved.window_len == batch.len()
+            && saved
+                .candidates
+                .iter()
+                .eq(candidates.iter().map(|item| &item.out_point))
+    }) {
+        *probe = Some(IsolationProbe {
+            process: process.clone(),
+            candidates: candidates
+                .iter()
+                .map(|item| item.out_point.clone())
+                .collect(),
+            window_len: batch.len(),
+            min,
+            indices: Some((0..min).collect()),
+        });
+    }
+    let saved = probe.as_mut().expect("probe initialized");
+    let Some(indices) = &mut saved.indices else {
+        return Ok(Some((good, bad)));
+    };
     const MAX_PROBES: usize = 64;
     for _ in 0..MAX_PROBES {
         let control: Vec<_> = indices.iter().map(|&i| candidates[i].clone()).collect();
@@ -685,16 +715,18 @@ fn isolate_intentions(
                     }
                 }
                 good.truncate(batch.len());
-                break;
+                *probe = None;
+                return Ok(Some((good, bad)));
             }
             Err(SsriError::Incompatible(DEPOSIT_BELOW_MINIMUM | CID_LOCK_MISMATCH)) => {}
             Err(error) => return Err(error),
         }
-        if !advance_probe_indices(&mut indices, candidates.len()) {
-            break;
+        if !advance_probe_indices(indices, candidates.len()) {
+            saved.indices = None;
+            return Ok(Some((good, bad)));
         }
     }
-    Ok((good, bad))
+    Ok(None)
 }
 
 /// Move to the next subset, exhausting nearby candidates before adding a
@@ -726,6 +758,8 @@ fn mark_process_unhealthy(
     worker.unhealthy_state = Some(process.live_cell.out_point.clone());
     worker.isolate_pending.clear();
     worker.isolate_resume = None;
+    worker.isolation_probe = None;
+    worker.isolated_refunds.clear();
     (
         BatchOutcome::Continue,
         BatchReportDelta {
@@ -734,6 +768,80 @@ fn mark_process_unhealthy(
             ..BatchReportDelta::default()
         },
     )
+}
+
+fn refund_policy_rejections<R: Rpc + HostQueryRpc>(
+    rpc: &R,
+    mut params: ProcessBatchParams<'_>,
+) -> (BatchOutcome, BatchReportDelta) {
+    const MAX_ATTEMPTS: usize = 16;
+    let mut report = BatchReportDelta::default();
+    let Some(code) = params.process.verdict_code_cell() else {
+        report.skipped = params.batch.len();
+        report.last_error = Some("policy refund requires a live Process code-cell ELF".into());
+        return (BatchOutcome::Continue, report);
+    };
+    let deps = match merge_cell_deps(&[cell_dep_code(&code.out_point)], params.tick_cell_deps) {
+        Ok(deps) => deps,
+        Err(error) => {
+            report.skipped = params.batch.len();
+            report.last_error = Some(format!("policy refund: {error}"));
+            return (BatchOutcome::Continue, report);
+        }
+    };
+    let cursor = {
+        let worker = params.state.lock().expect("process worker state");
+        if worker.unhealthy_state.as_ref() == Some(&params.process.live_cell.out_point) {
+            report.skipped = params.batch.len();
+            return (BatchOutcome::Continue, report);
+        }
+        worker.refund_cursor.clone()
+    };
+    params
+        .batch
+        .sort_unstable_by(|a, b| a.out_point.as_slice().cmp(b.out_point.as_slice()));
+    let start = cursor.map_or(0, |op| {
+        params
+            .batch
+            .partition_point(|item| item.out_point.as_slice() <= op.as_slice())
+    });
+    let lease = (&*params.epoch, params.job_epoch);
+    let (before, after) = params.batch.split_at(start);
+    for item in after.iter().chain(before).take(MAX_ATTEMPTS) {
+        if batch_cancelled(lease.0, lease.1) {
+            break;
+        }
+        let code = {
+            let mut worker = params.state.lock().expect("process worker state");
+            worker.refund_cursor = Some(item.out_point.clone());
+            worker
+                .isolated_refunds
+                .get(&item.out_point)
+                .copied()
+                .unwrap_or(INCOMPATIBLE_BATCH)
+        };
+        let outcome = assemble_and_submit_refund(
+            rpc,
+            &params.state,
+            std::slice::from_ref(item),
+            code,
+            params.execution_code_key,
+            &deps,
+            params.refund_policy,
+            &mut report,
+            BatchMode::PolicyRefund,
+            lease,
+        );
+        if outcome == BatchOutcome::RpcUnavailable {
+            break;
+        }
+    }
+    let outcome = if report.submitted > 0 {
+        BatchOutcome::Submitted
+    } else {
+        BatchOutcome::Continue
+    };
+    (outcome, report)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -877,7 +985,7 @@ fn assemble_and_submit_refund<R: Rpc + HostQueryRpc>(
                 // (shrinking cannot raise fee budget). Mark for below-min retry.
                 report.last_error = Some(e.to_string());
                 // A filter rejection is always retried using a fresh verdict.
-                if attempt_mode != BatchMode::FilterRefund {
+                if attempt_mode != BatchMode::PolicyRefund {
                     let mut worker = state.lock().expect("process worker state");
                     for item in group {
                         worker
@@ -949,7 +1057,11 @@ fn assemble_and_submit_refund<R: Rpc + HostQueryRpc>(
             );
             report.last_error = Some(format!("dry-run: {m}"));
             report.skipped += group.len();
-            return BatchOutcome::Continue;
+            return if matches!(m, RpcError::Unavailable(_)) {
+                BatchOutcome::RpcUnavailable
+            } else {
+                BatchOutcome::Continue
+            };
         }
         DryRunGate::Proceed => {}
     }
@@ -1006,7 +1118,7 @@ fn assemble_and_submit_refund<R: Rpc + HostQueryRpc>(
             );
             report.last_error = Some(format!("submit failed: {e}"));
             report.skipped += group.len();
-            BatchOutcome::Continue
+            BatchOutcome::RpcUnavailable
         }
     }
 }

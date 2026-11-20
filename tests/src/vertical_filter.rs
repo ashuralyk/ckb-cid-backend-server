@@ -9,13 +9,15 @@ mod tests {
 
     use crate::fake_rpc::FakeRpc;
     use crate::helpers::{
-        default_loop_config, intention_cell, intention_cell_with_lock, loop_with_resolver,
-        process_cell, process_type_hash,
+        code_cell, default_loop_config, intention_cell, intention_cell_with_lock, live_cell,
+        lock_script, loop_with_resolver, out_point, process_cell, process_type_hash, FIXTURE_ELF,
+        PROC_CODE_ARGS,
     };
     use crate::scripted_ssri::ScriptedSsri;
 
     fn chain(count: u8) -> (FakeRpc, LiveCell, Vec<OutPoint>) {
         let rpc = FakeRpc::new();
+        rpc.insert_cell(code_cell(0xA0, PROC_CODE_ARGS, FIXTURE_ELF.to_vec()));
         let state = process_cell(1, 1000_0000_0000, vec![]);
         rpc.insert_cell(state.clone());
         let ops = (1..=count)
@@ -123,8 +125,6 @@ mod tests {
 
     #[test]
     fn assembly_can_add_an_ordinary_funding_input() {
-        use crate::helpers::{live_cell, lock_script, out_point};
-
         let (rpc, state, ops) = chain(1);
         let funding_op = out_point(2, 0);
         rpc.insert_cell(live_cell(
@@ -141,6 +141,154 @@ mod tests {
             input_sets(loop_.rpc()),
             [vec![ops[0].clone(), state.out_point, funding_op]]
         );
+    }
+
+    #[test]
+    fn assembly_cannot_add_a_legacy_data1_cid_input() {
+        let (rpc, _, ops) = chain(1);
+        let hash = [0x33; 32];
+        let legacy = intention_cell_with_lock(
+            2,
+            process_type_hash(1),
+            600_0000_0000,
+            hash,
+            ScriptHashType::Data1,
+        );
+        let legacy_op = legacy.out_point.clone();
+        rpc.insert_cell(legacy);
+        let mut config = default_loop_config();
+        config
+            .extra_scan_locks
+            .push(cid_backend_core::CidLockIdentity::new(
+                hash,
+                ScriptHashType::Data1,
+            ));
+        let ssri = ScriptedSsri::mimic((1, 4)).with_added_input(legacy_op.clone());
+        let mut loop_ = loop_with_resolver(rpc, ssri, config, 1);
+        assert_eq!(loop_.tick().submitted, 0);
+        assert_eq!(loop_.rpc().dry_run_attempts(), 0);
+        assert!(loop_.rpc().has_cell(&legacy_op));
+        assert!(loop_.rpc().has_cell(&ops[0]));
+    }
+
+    #[test]
+    fn assembly_checks_the_resolved_cid_binary_data_hash_alias() {
+        use cid_backend_core::{TypeIdCodeDep, TypeIdIdentity};
+        use ckb_types::packed::CellOutput;
+
+        let (rpc, state, _) = chain(0);
+        let identity = TypeIdIdentity::new([0xCC; 32]);
+        let cid_hash = identity.type_script_hash();
+        let data = vec![0xCA, 0xFE];
+        let alias = CellOutput::calc_data_hash(&data).unpack();
+        rpc.insert_cell(code_cell(0xC0, identity.args, data));
+        let state_lock = state
+            .lock()
+            .as_builder()
+            .args([cid_hash.as_slice(), &[1]].concat().pack())
+            .build();
+        rpc.insert_cell(LiveCell {
+            output: state.output.as_builder().lock(state_lock).build(),
+            ..state
+        });
+        rpc.insert_cell(intention_cell_with_lock(
+            1,
+            process_type_hash(1),
+            600_0000_0000,
+            cid_hash,
+            ScriptHashType::Type,
+        ));
+        let alias_op = out_point(2, 0);
+        rpc.insert_cell(live_cell(
+            alias_op.clone(),
+            lock_script(alias, ScriptHashType::Data1, vec![0xAA]),
+            None,
+            100_0000_0000,
+            vec![],
+        ));
+        let mut config = default_loop_config();
+        config.cid_code_hash = cid_hash;
+        config.type_id_code_deps = vec![TypeIdCodeDep {
+            label: "cid_lock".into(),
+            identity,
+        }];
+        let ssri = ScriptedSsri::mimic((1, 4)).with_added_input(alias_op);
+        let mut loop_ = loop_with_resolver(rpc, ssri, config, 1);
+        assert_eq!(loop_.tick().submitted, 0);
+        assert_eq!(loop_.rpc().dry_run_attempts(), 0);
+    }
+
+    #[test]
+    fn stale_filter_refund_cannot_submit_and_upgrade_refilters() {
+        let (rpc, state, ops) = chain(1);
+        let stale = out_point(0xA0, 0);
+        rpc.mark_dep_spent(stale.clone());
+        let mut reason = 5;
+        let ssri = ScriptedSsri::mimic((1, 4)).with_filter(move |_| {
+            let previous = reason;
+            reason = 0;
+            Ok(vec![previous])
+        });
+        let mut loop_ = loop_with_resolver(rpc, ssri, default_loop_config(), 1);
+        assert_eq!(loop_.tick().submitted, 0);
+        assert_eq!(loop_.rpc().submit_attempts(), 1);
+        assert!(loop_.rpc().has_cell(&ops[0]));
+        loop_.rpc().consume(&stale);
+        loop_.rpc().insert_cell(code_cell(
+            0xA1,
+            PROC_CODE_ARGS,
+            [FIXTURE_ELF, &[2]].concat(),
+        ));
+        assert_eq!(loop_.tick().submitted, 1);
+        assert_eq!(
+            input_sets(loop_.rpc()),
+            [vec![ops[0].clone(), state.out_point]]
+        );
+    }
+
+    #[test]
+    fn stale_assemble_verdict_cannot_submit_a_refund() {
+        let (rpc, _, ops) = chain(1);
+        rpc.mark_dep_spent(out_point(0xA0, 0));
+        let mut loop_ = loop_with_resolver(
+            rpc,
+            ScriptedSsri::incompatible(21),
+            default_loop_config(),
+            1,
+        );
+        assert_eq!(loop_.tick().submitted, 0);
+        assert!(loop_.rpc().has_cell(&ops[0]));
+    }
+
+    #[test]
+    fn filter_refunds_require_the_live_elf_that_supplied_the_verdict() {
+        let (rpc, _, ops) = chain(1);
+        rpc.consume(&out_point(0xA0, 0));
+        rpc.insert_cell(code_cell(0xA1, PROC_CODE_ARGS, vec![0]));
+        let ssri = ScriptedSsri::mimic((2, 4)).with_filter(|n| Ok(vec![5; n]));
+        let mut loop_ = loop_with_resolver(rpc, ssri, default_loop_config(), 1);
+        assert_eq!(loop_.tick().submitted, 0);
+        assert_eq!(loop_.rpc().dry_run_attempts(), 0);
+        assert!(loop_.rpc().has_cell(&ops[0]));
+    }
+
+    #[test]
+    fn filter_refund_sweep_is_bounded_and_resumes_after_unavailability() {
+        let (rpc, _, ops) = chain(33);
+        rpc.inject_unavailable_dry_run_once();
+        let ssri = ScriptedSsri::mimic((2, 4)).with_filter(|n| Ok(vec![5; n]));
+        let mut loop_ = loop_with_resolver(rpc, ssri, default_loop_config(), 1);
+        assert_eq!(loop_.tick().submitted, 0);
+        assert_eq!(loop_.rpc().dry_run_attempts(), 1);
+        loop_.rpc().inject_unavailable_refund_once(ops[1].clone());
+        assert_eq!(loop_.tick().submitted, 0);
+        assert_eq!(loop_.rpc().dry_run_attempts(), 2);
+        // Both failed cells stay live, and the sweep resumes past them.
+        assert_eq!(loop_.tick().submitted, 16);
+        assert!(loop_.rpc().has_cell(&ops[0]));
+        assert_eq!(loop_.tick().submitted, 16);
+        assert!(loop_.rpc().has_cell(&ops[1]));
+        assert_eq!(loop_.tick().submitted, 1);
     }
 
     #[test]
@@ -226,6 +374,116 @@ mod tests {
         assert!(inputs.contains(&vec![ops[0].clone()]));
         assert!(inputs.contains(&vec![ops[1].clone(), ops[3].clone(), state.out_point]));
         assert!(inputs.contains(&vec![ops[2].clone()]));
+    }
+
+    #[test]
+    fn isolated_refund_retries_after_peer_commit_and_refund_unavailability() {
+        let (rpc, state, ops) = chain(3);
+        rpc.inject_unavailable_refund_once(ops[1].clone());
+        let ssri = ScriptedSsri::mimic((2, 4)).with_intention_error(ops[1].clone(), 39);
+        let mut loop_ = loop_with_resolver(rpc, ssri, default_loop_config(), 1);
+        assert_eq!(loop_.tick().submitted, 1);
+        assert_eq!(
+            input_sets(loop_.rpc()),
+            [vec![ops[0].clone(), ops[2].clone(), state.out_point]]
+        );
+        assert_eq!(loop_.tick().submitted, 1);
+        assert_eq!(input_sets(loop_.rpc())[1], [ops[1].clone()]);
+    }
+
+    #[test]
+    fn dropped_isolated_refund_retries_only_under_the_authorizing_code() {
+        for upgraded in [false, true] {
+            let (rpc, _, ops) = chain(3);
+            rpc.defer_commit();
+            let ssri = ScriptedSsri::mimic((2, 4)).with_intention_error(ops[1].clone(), 40);
+            let mut loop_ = loop_with_resolver(rpc, ssri, default_loop_config(), 1);
+            assert_eq!(loop_.tick().submitted, 2);
+            for tx in loop_.rpc().submitted() {
+                if tx.inputs().len() == 1 {
+                    loop_.rpc().simulate_drop(&tx.hash());
+                } else {
+                    loop_.rpc().commit_pending(&tx.hash());
+                }
+            }
+            if upgraded {
+                loop_.rpc().consume(&out_point(0xA0, 0));
+                loop_.rpc().insert_cell(code_cell(
+                    0xA1,
+                    PROC_CODE_ARGS,
+                    [FIXTURE_ELF, &[2]].concat(),
+                ));
+            }
+            assert_eq!(loop_.tick().submitted, usize::from(!upgraded));
+            if !upgraded {
+                assert_eq!(input_sets(loop_.rpc())[2], [ops[1].clone()]);
+            }
+        }
+    }
+
+    #[test]
+    fn isolation_resumes_after_64_comparison_probes() {
+        let (rpc, state, ops) = chain(13);
+        let mut ssri = ScriptedSsri::mimic((2, 13));
+        for op in &ops[..11] {
+            ssri = ssri.with_intention_error(op.clone(), 39);
+        }
+        let mut loop_ = loop_with_resolver(rpc, ssri, default_loop_config(), 1);
+        assert_eq!(loop_.tick().submitted, 0);
+        assert_eq!(loop_.ssri().seen_binaries.lock().unwrap().len(), 66);
+        assert_eq!(loop_.tick().submitted, 12);
+        assert!(input_sets(loop_.rpc()).contains(&vec![
+            ops[11].clone(),
+            ops[12].clone(),
+            state.out_point
+        ]));
+    }
+
+    #[test]
+    fn example_policy_refunds_a_process_lock_beneficiary_before_assembly() {
+        use cid_protocol::{CidArgs, Payload, Script};
+        use ckb_types::packed::CellOutput;
+
+        for enabled in [false, true] {
+            let (rpc, state, _) = chain(0);
+            let mut item = intention_cell(1, process_type_hash(1), 600_0000_0000);
+            let beneficiary = Script {
+                code_hash: state.lock().code_hash().unpack(),
+                hash_type: 1,
+                args: vec![],
+            };
+            let user = crate::helpers::user_lock();
+            let args = CidArgs::new(
+                process_type_hash(1),
+                user.clone(),
+                Payload::from_script(&beneficiary).unwrap(),
+            )
+            .encode()
+            .unwrap();
+            let lock = item.lock().as_builder().args(args.pack()).build();
+            item.output = item.output.as_builder().lock(lock).build();
+            let op = item.out_point.clone();
+            rpc.insert_cell(item);
+            let config = default_loop_config();
+            let ssri = ScriptedSsri::mimic((1, 4)).with_intention_error(op.clone(), 32);
+            let mut loop_ = loop_with_resolver(rpc, ssri, config, 1);
+            if enabled {
+                loop_ = loop_
+                    .with_example_policy_data_hashes(vec![
+                        CellOutput::calc_data_hash(FIXTURE_ELF).unpack()
+                    ]);
+            }
+            assert_eq!(loop_.tick().submitted, usize::from(enabled));
+            if enabled {
+                assert_eq!(input_sets(loop_.rpc()), [vec![op]]);
+                let output = loop_.rpc().submitted()[0].outputs().get(0).unwrap();
+                assert_eq!(
+                    output.lock(),
+                    lock_script(user.code_hash, ScriptHashType::Type, user.args)
+                );
+                assert!(loop_.ssri().seen_binaries.lock().unwrap().is_empty());
+            }
+        }
     }
 
     #[test]

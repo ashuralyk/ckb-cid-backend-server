@@ -15,6 +15,9 @@ struct Inner {
     fail_next_submit: bool,
     reject_next_submit: bool,
     reject_next_dry_run: bool,
+    spent_deps: HashSet<OutPoint>,
+    unavailable_submit_inputs: HashSet<OutPoint>,
+    unavailable_next_dry_run: bool,
     reject_inputs: HashSet<Vec<u8>>,
     submit_attempts: usize,
     dry_run_attempts: usize,
@@ -143,6 +146,23 @@ impl FakeRpc {
     /// Next `dry_run_transaction` returns `SubmitRejected` (combo blacklist path).
     pub fn inject_dry_run_reject_once(&self) {
         self.inner.lock().unwrap().reject_next_dry_run = true;
+    }
+
+    /// The node rejects this dependency while the indexer still lists it.
+    pub fn mark_dep_spent(&self, op: OutPoint) {
+        self.inner.lock().unwrap().spent_deps.insert(op);
+    }
+
+    pub fn inject_unavailable_refund_once(&self, op: OutPoint) {
+        self.inner
+            .lock()
+            .unwrap()
+            .unavailable_submit_inputs
+            .insert(op);
+    }
+
+    pub fn inject_unavailable_dry_run_once(&self) {
+        self.inner.lock().unwrap().unavailable_next_dry_run = true;
     }
 
     /// Every submit that spends `op` returns `SubmitRejected` (A-fails / B-succeeds).
@@ -394,6 +414,9 @@ impl Rpc for FakeRpc {
     fn dry_run_transaction(&self, _tx: &TransactionView) -> Result<(), RpcError> {
         let mut inner = self.inner.lock().unwrap();
         inner.dry_run_attempts += 1;
+        if std::mem::take(&mut inner.unavailable_next_dry_run) {
+            return Err(RpcError::Unavailable("injected dry-run unavailable".into()));
+        }
         if inner.reject_next_dry_run {
             inner.reject_next_dry_run = false;
             return Err(RpcError::SubmitRejected("injected dry-run reject".into()));
@@ -404,6 +427,20 @@ impl Rpc for FakeRpc {
     fn submit_transaction(&self, tx: &TransactionView) -> Result<Byte32, RpcError> {
         let mut inner = self.inner.lock().unwrap();
         inner.submit_attempts += 1;
+        if tx
+            .cell_deps()
+            .into_iter()
+            .any(|dep| inner.spent_deps.contains(&dep.out_point()))
+        {
+            return Err(RpcError::Conflict("dependency is spent".into()));
+        }
+        if tx.inputs().len() == 1
+            && inner
+                .unavailable_submit_inputs
+                .remove(&tx.inputs().get(0).unwrap().previous_output())
+        {
+            return Err(RpcError::Unavailable("injected refund unavailable".into()));
+        }
         if inner.unavailable_next_submit {
             inner.unavailable_next_submit = false;
             return Err(RpcError::Unavailable("injected submit unavailable".into()));

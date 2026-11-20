@@ -54,14 +54,14 @@ impl SubmitState {
 pub enum DryRunGate {
     Proceed,
     Rejected(String),
-    Skip(String),
+    Skip(RpcError),
 }
 
 pub fn dry_run_gate<R: Rpc>(rpc: &R, tx: &TransactionView) -> DryRunGate {
     match rpc.dry_run_transaction(tx) {
         Ok(()) => DryRunGate::Proceed,
         Err(RpcError::SubmitRejected(m)) => DryRunGate::Rejected(m),
-        Err(e) => DryRunGate::Skip(e.to_string()),
+        Err(e) => DryRunGate::Skip(e),
     }
 }
 

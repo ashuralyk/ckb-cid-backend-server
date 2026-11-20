@@ -263,10 +263,9 @@ pub fn draft_cell_deps_for_batch(
             .out_point(code.out_point.clone())
             .dep_type(DepType::Code.into())
             .build();
-        if !deps
-            .iter()
-            .any(|d| d.out_point().as_slice() == dep.out_point().as_slice())
-        {
+        if let Some(existing) = deps.iter_mut().find(|d| d.out_point() == dep.out_point()) {
+            *existing = dep;
+        } else {
             deps.push(dep);
         }
     }

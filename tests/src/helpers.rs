@@ -53,6 +53,16 @@ pub fn live_cell(
     }
 }
 
+pub fn code_cell(tag: u8, args: [u8; 32], data: Vec<u8>) -> LiveCell {
+    live_cell(
+        out_point(tag, 0),
+        lock_script([0x99; 32], ScriptHashType::Data1, vec![]),
+        Some(type_id_script(&args)),
+        100_000_000_000,
+        data,
+    )
+}
+
 pub fn user_lock() -> CidScript {
     CidScript {
         code_hash: [0x42; 32],

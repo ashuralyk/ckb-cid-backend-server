@@ -30,6 +30,15 @@ pub struct ResolvedProcess {
     pub code_cell: Option<LiveCell>,
 }
 
+impl ResolvedProcess {
+    /// The source of an on-chain policy verdict must be the live guest ELF.
+    pub(crate) fn verdict_code_cell(&self) -> Option<&LiveCell> {
+        self.code_cell
+            .as_ref()
+            .filter(|cell| cell.data == self.binary)
+    }
+}
+
 struct CachedBinary {
     source_key: Vec<u8>,
     binary: Vec<u8>,

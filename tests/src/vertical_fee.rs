@@ -7,8 +7,8 @@ mod tests {
 
     use crate::fake_rpc::FakeRpc;
     use crate::helpers::{
-        default_loop_config, intention_cell, loop_with_resolver, process_cell, process_type_script,
-        user_lock,
+        code_cell, default_loop_config, intention_cell, loop_with_resolver, process_cell,
+        process_type_script, user_lock, FIXTURE_ELF, PROC_CODE_ARGS,
     };
     use crate::scripted_ssri::ScriptedSsri;
 
@@ -131,6 +131,7 @@ mod tests {
         use cid_backend_core::DEFAULT_FEE_RATE;
 
         let rpc = FakeRpc::new();
+        rpc.insert_cell(code_cell(0xA0, PROC_CODE_ARGS, FIXTURE_ELF.to_vec()));
         let hash = script_hash32(&process_type_script(3));
         let mut expensive = intention_cell(1, hash, 2000_0000_0000);
         expensive.data = vec![0; 1024];
