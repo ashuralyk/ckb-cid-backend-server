@@ -1,16 +1,14 @@
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
+    use cid_backend_core::digest_loop::LoopConfig;
+    use cid_backend_core::rpc::script_hash32;
     use ckb_types::core::ScriptHashType;
     use ckb_types::prelude::*;
-    use cid_backend_core::digest_loop::{DigestLoop, LoopConfig, NopClock};
-    use cid_backend_core::process::ProcessResolver;
-    use cid_backend_core::rpc::script_hash32;
+    use std::time::Duration;
 
     use crate::fake_rpc::FakeRpc;
     use crate::helpers::{
-        intention_cell, process_cell, process_type_script, CID_CODE,
+        intention_cell, loop_with_resolver, process_cell, process_type_script, CID_CODE,
     };
     use crate::scripted_ssri::ScriptedSsri;
 
@@ -18,7 +16,11 @@ mod tests {
         let rpc = FakeRpc::new();
         let ts = process_type_script(2);
         let hash = script_hash32(&ts);
-        rpc.insert_cell(process_cell(2, 400_0000_0000, vec![0x7f, b'E', b'L', b'F', 2]));
+        rpc.insert_cell(process_cell(
+            2,
+            400_0000_0000,
+            vec![0x7f, b'E', b'L', b'F', 2],
+        ));
         for i in 1..=n_intentions {
             rpc.insert_cell(intention_cell(i, hash, 100_0000_0000));
         }
@@ -30,20 +32,19 @@ mod tests {
             cid_code_hash: CID_CODE,
             hash_type: ScriptHashType::Type,
             poll_interval: Duration::from_secs(1),
-            extra_cell_deps: vec![],
+            extra_cell_deps: vec![crate::helpers::placeholder_code_dep()],
+            type_id_code_deps: vec![],
+            confirmation_depth: 1,
+            extra_scan_locks: vec![],
+            refund_policy: Default::default(),
+            max_assembled_tx_bytes: 512 * 1024,
         }
     }
 
     #[test]
     fn below_min_does_not_submit() {
         let (rpc, _) = setup(1);
-        let mut loop_ = DigestLoop::new(
-            rpc,
-            NopClock,
-            ScriptedSsri::mimic((2, 2)),
-            cfg(),
-            ProcessResolver::new(),
-        );
+        let mut loop_ = loop_with_resolver(rpc, ScriptedSsri::mimic((2, 2)), cfg(), 2);
         let report = loop_.tick();
         assert_eq!(report.submitted, 0);
         assert_eq!(loop_.rpc().submitted().len(), 0);
@@ -61,13 +62,7 @@ mod tests {
     #[test]
     fn at_max_submits_exactly_max() {
         let (rpc, _) = setup(2);
-        let mut loop_ = DigestLoop::new(
-            rpc,
-            NopClock,
-            ScriptedSsri::mimic((2, 2)),
-            cfg(),
-            ProcessResolver::new(),
-        );
+        let mut loop_ = loop_with_resolver(rpc, ScriptedSsri::mimic((2, 2)), cfg(), 2);
         let report = loop_.tick();
         assert_eq!(report.submitted, 1);
         let tx = &loop_.rpc().submitted()[0];
@@ -77,13 +72,7 @@ mod tests {
     #[test]
     fn above_max_takes_first_max_asc_leaves_remainder_below_min() {
         let (rpc, _) = setup(3);
-        let mut loop_ = DigestLoop::new(
-            rpc,
-            NopClock,
-            ScriptedSsri::mimic((2, 2)),
-            cfg(),
-            ProcessResolver::new(),
-        );
+        let mut loop_ = loop_with_resolver(rpc, ScriptedSsri::mimic((2, 2)), cfg(), 2);
         let report = loop_.tick();
         assert_eq!(report.submitted, 1);
         let tx = &loop_.rpc().submitted()[0];
@@ -113,19 +102,17 @@ mod tests {
         for i in 1..=4 {
             rpc.insert_cell(intention_cell(i, hash, 100_0000_0000));
         }
-        let mut loop_ = DigestLoop::new(
-            rpc,
-            NopClock,
-            ScriptedSsri::mimic((2, 2)),
-            cfg(),
-            ProcessResolver::new(),
-        );
+        let mut loop_ = loop_with_resolver(rpc, ScriptedSsri::mimic((2, 2)), cfg(), 2);
 
         let first = loop_.tick();
         assert_eq!(first.submitted, 1, "one digest_ok per tick");
         assert_eq!(first.conflicts, 0, "must not double-spend Process");
         let tx1 = &loop_.rpc().submitted()[0];
-        let process_in = tx1.inputs().get(tx1.inputs().len() - 1).unwrap().previous_output();
+        let process_in = tx1
+            .inputs()
+            .get(tx1.inputs().len() - 1)
+            .unwrap()
+            .previous_output();
         assert_eq!(process_in, proc.out_point);
         let remaining_intentions = loop_
             .rpc()

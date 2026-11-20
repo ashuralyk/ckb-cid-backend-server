@@ -1,7 +1,9 @@
-use std::cell::RefCell;
+use std::sync::Mutex;
 
 use cid_backend_core::ssri::{SsriError, SsriHost};
-use cid_process_executor::{IntentionInput, PartialTx};
+use cid_backend_core::type_id::TYPE_ID_CODE_HASH;
+use cid_process_executor::{AssembledTx, HostCell, MockHost};
+use cid_protocol::CidArgs;
 use ckb_types::core::ScriptHashType;
 use ckb_types::packed::{CellOutput, RawTransaction, Script, Transaction};
 use ckb_types::prelude::*;
@@ -9,6 +11,8 @@ use ckb_types::prelude::*;
 pub struct ScriptedSsri {
     pub bounds: (u32, u32),
     pub mode: Mode,
+    /// Binaries observed by `get_batch_bounds` / `assemble` (SSRI source tests).
+    pub seen_binaries: Mutex<Vec<Vec<u8>>>,
 }
 
 pub enum Mode {
@@ -16,60 +20,56 @@ pub enum Mode {
     AlwaysIncompatible(i8),
     Unusable,
     OkThenIncompatible {
-        remaining_ok: RefCell<u32>,
+        remaining_ok: Mutex<u32>,
         code: i8,
     },
+    /// Digest_ok beneficiary output capacity (independent of Intention capacity).
+    FixedBeneficiary(u64),
 }
 
 impl ScriptedSsri {
-    pub fn mimic(bounds: (u32, u32)) -> Self {
+    fn base(bounds: (u32, u32), mode: Mode) -> Self {
         Self {
             bounds,
-            mode: Mode::MimicExample,
+            mode,
+            seen_binaries: Mutex::new(Vec::new()),
         }
+    }
+
+    pub fn mimic(bounds: (u32, u32)) -> Self {
+        Self::base(bounds, Mode::MimicExample)
     }
 
     pub fn incompatible(code: i8) -> Self {
-        Self {
-            bounds: (1, 4),
-            mode: Mode::AlwaysIncompatible(code),
-        }
+        Self::base((1, 4), Mode::AlwaysIncompatible(code))
     }
 
     pub fn unusable() -> Self {
-        Self {
-            bounds: (1, 4),
-            mode: Mode::Unusable,
-        }
+        Self::base((1, 4), Mode::Unusable)
     }
 
     pub fn ok_then_incompatible(bounds: (u32, u32), ok_calls: u32, code: i8) -> Self {
-        Self {
+        Self::base(
             bounds,
-            mode: Mode::OkThenIncompatible {
-                remaining_ok: RefCell::new(ok_calls),
+            Mode::OkThenIncompatible {
+                remaining_ok: Mutex::new(ok_calls),
                 code,
             },
-        }
+        )
+    }
+
+    pub fn fixed_beneficiary(bounds: (u32, u32), capacity: u64) -> Self {
+        Self::base(bounds, Mode::FixedBeneficiary(capacity))
+    }
+
+    fn note_binary(&self, binary: &[u8]) {
+        self.seen_binaries.lock().unwrap().push(binary.to_vec());
     }
 }
 
-fn pack_partial(outputs: Vec<CellOutput>, data: Vec<Vec<u8>>) -> PartialTx {
-    let bytes = Transaction::new_builder()
-        .raw(
-            RawTransaction::new_builder()
-                .outputs(outputs.pack())
-                .outputs_data(data.iter().map(|d| d.as_slice().pack()).pack())
-                .build(),
-        )
-        .build()
-        .as_slice()
-        .to_vec();
-    PartialTx::from_bytes(&bytes).unwrap()
-}
-
 impl SsriHost for ScriptedSsri {
-    fn get_batch_bounds(&self, _binary: &[u8]) -> Result<(u32, u32), SsriError> {
+    fn get_batch_bounds(&self, binary: &[u8]) -> Result<(u32, u32), SsriError> {
+        self.note_binary(binary);
         match &self.mode {
             Mode::Unusable => Err(SsriError::Unusable("scripted".into())),
             _ => Ok(self.bounds),
@@ -78,18 +78,21 @@ impl SsriHost for ScriptedSsri {
 
     fn assemble(
         &self,
-        _binary: &[u8],
-        intentions: &[IntentionInput],
-    ) -> Result<PartialTx, SsriError> {
+        binary: &[u8],
+        draft_tx: &[u8],
+        host: MockHost,
+    ) -> Result<AssembledTx, SsriError> {
+        self.note_binary(binary);
         match &self.mode {
             Mode::AlwaysIncompatible(c) => Err(SsriError::Incompatible(*c)),
             Mode::Unusable => Err(SsriError::Unusable("scripted".into())),
-            Mode::MimicExample => Ok(mimic_assemble(intentions)),
+            Mode::MimicExample => mimic_assemble(draft_tx, host, None),
+            Mode::FixedBeneficiary(cap) => mimic_assemble(draft_tx, host, Some(*cap)),
             Mode::OkThenIncompatible { remaining_ok, code } => {
-                let mut n = remaining_ok.borrow_mut();
+                let mut n = remaining_ok.lock().unwrap();
                 if *n > 0 {
                     *n -= 1;
-                    Ok(mimic_assemble(intentions))
+                    mimic_assemble(draft_tx, host, None)
                 } else {
                     Err(SsriError::Incompatible(*code))
                 }
@@ -98,22 +101,96 @@ impl SsriHost for ScriptedSsri {
     }
 }
 
-fn mimic_assemble(intentions: &[IntentionInput]) -> PartialTx {
-    let mut outputs = Vec::new();
-    let mut data = Vec::new();
-    for it in intentions {
-        let lock = Script::new_builder()
-            .code_hash([0x11u8; 32].pack())
-            .hash_type(ScriptHashType::Type.into())
-            .args(it.lock_args.clone().pack())
-            .build();
-        outputs.push(
-            CellOutput::new_builder()
-                .capacity(it.capacity.pack())
-                .lock(lock)
-                .build(),
-        );
-        data.push(it.data.clone());
+fn is_process_state(cell: &HostCell) -> bool {
+    cell.output
+        .type_()
+        .to_opt()
+        .map(|ts| {
+            let code: [u8; 32] = ts.code_hash().unpack();
+            code == TYPE_ID_CODE_HASH
+                && matches!(
+                    ScriptHashType::try_from(ts.hash_type()),
+                    Ok(ScriptHashType::Type)
+                )
+        })
+        .unwrap_or(false)
+}
+
+fn beneficiary_output(
+    cell: &HostCell,
+    fixed_cap: Option<u64>,
+) -> Result<(CellOutput, Vec<u8>), SsriError> {
+    let lock_args: Vec<u8> = cell.output.lock().args().unpack();
+    let args =
+        CidArgs::decode(&lock_args).map_err(|e| SsriError::Unusable(format!("cid args: {e:?}")))?;
+    let user = args.entry.user_lock;
+    let lock = Script::new_builder()
+        .code_hash(user.code_hash.pack())
+        .hash_type(user.hash_type.into())
+        .args(user.args.pack())
+        .build();
+    let cap = fixed_cap.unwrap_or(cell.output.capacity().unpack());
+    let mut builder = CellOutput::new_builder().capacity(cap.pack()).lock(lock);
+    if let Some(ts) = cell.output.type_().to_opt() {
+        builder = builder.type_(Some(ts).pack());
     }
-    pack_partial(outputs, data)
+    Ok((builder.build(), cell.data.clone()))
+}
+
+fn mimic_assemble(
+    draft_tx: &[u8],
+    host: MockHost,
+    fixed_cap: Option<u64>,
+) -> Result<AssembledTx, SsriError> {
+    let draft = Transaction::from_slice(draft_tx)
+        .map_err(|e| SsriError::Unusable(format!("draft: {e:?}")))?;
+    let mut inputs = Vec::new();
+    let mut beneficiary_outputs = Vec::new();
+    let mut beneficiary_data = Vec::new();
+    let mut process_out: Option<(CellOutput, Vec<u8>)> = None;
+
+    for input in draft.raw().inputs().into_iter() {
+        let op = input.previous_output();
+        let cell = host
+            .get_cell(op.as_slice())
+            .ok_or_else(|| SsriError::Unusable("missing host cell".into()))?;
+        // Preserve draft `since` (matches Process.assemble / WitnessEx::new_plain path).
+        inputs.push(input);
+        if is_process_state(&cell) {
+            process_out = Some((cell.output.clone(), cell.data.clone()));
+        } else {
+            let (out, data) = beneficiary_output(&cell, fixed_cap)?;
+            beneficiary_outputs.push(out);
+            beneficiary_data.push(data);
+        }
+    }
+
+    let (proc_out, proc_data) =
+        process_out.ok_or_else(|| SsriError::Unusable("no process input in draft".into()))?;
+
+    // Process recreate first (TYPE_ID continuity), then beneficiaries.
+    let mut outputs = vec![proc_out];
+    let mut outputs_data = vec![proc_data];
+    outputs.extend(beneficiary_outputs);
+    outputs_data.extend(beneficiary_data);
+
+    let witnesses: Vec<ckb_types::packed::Bytes> =
+        (0..inputs.len()).map(|_| Default::default()).collect();
+    // Preserve draft cell_deps / header_deps (Process.assemble copies them).
+    let bytes = Transaction::new_builder()
+        .raw(
+            RawTransaction::new_builder()
+                .version(draft.raw().version())
+                .cell_deps(draft.raw().cell_deps())
+                .header_deps(draft.raw().header_deps())
+                .inputs(inputs.pack())
+                .outputs(outputs.pack())
+                .outputs_data(outputs_data.iter().map(|d| d.as_slice().pack()).pack())
+                .build(),
+        )
+        .witnesses(witnesses.pack())
+        .build()
+        .as_slice()
+        .to_vec();
+    AssembledTx::from_bytes(&bytes).map_err(|e| SsriError::Unusable(format!("{e:?}")))
 }

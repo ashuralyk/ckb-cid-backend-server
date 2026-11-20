@@ -1,0 +1,41 @@
+# Example CID Server config (one file = one network).
+# Copy, replace EVERY <PLACEHOLDER>, then:
+#   cargo run -p cid-backend-daemon -- --config /path/to/your.toml
+#
+# Placeholders are NOT valid hex / URLs. This file cannot run as-is.
+#
+# Processes are registered at runtime via the HTTP API (observe.api_bind),
+# not listed under [process]. See docs/runbook.md.
+
+[network]
+name = "<NETWORK_LABEL>"
+genesis_hash = "<GENESIS_BLOCK_HASH_32>"
+validate_genesis = false
+
+[rpc]
+url = "<CKB_NODE_JSON_RPC_URL>"
+# indexer_url = "<CKB_INDEXER_JSON_RPC_URL>"  # omit to use url
+
+[cid_lock]
+# Type-ID deploy: type_id_args; scan code_hash derived; hash_type=type.
+type_id_args = "<CID_LOCK_TYPE_ID_ARGS_32>"
+type_id = "<CID_LOCK_TYPE_ID_FULL_HASH_32>"   # optional verify; must match derived
+
+# Static extras only (secp, xUDT, always-success, …).
+# [[cell_deps]]
+# tx_hash = "<XUDT_CODE_CELL_TX>"
+# index = 0
+# dep_type = "code"
+
+[registry]
+path = "data/process-registry.json"
+max_entries = 64
+
+[loop]
+poll_interval_secs = 5
+confirmation_depth = 24
+
+[observe]
+# health_bind = "127.0.0.1:9100"
+api_bind = "127.0.0.1:9101"
+log_format = "json"

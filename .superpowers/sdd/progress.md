@@ -13,3 +13,7 @@
 - Task 11: complete (commits 7ad9536)
 - Task 12: complete (commits 9fd2b60)
 - Task 13: complete (commits 774a26c)
+- Phase 1 (real SSRI CI must-load): complete (commits 7aa6243, 10cbf54)
+- Phase 2 (real CKB JSON-RPC/Indexer adapter + local-dev-chain closure): complete (commits 38fce50)
+- Phase 4 (structured logs, health, in-process metrics): complete (commits 300b0e6)
+- Phase 3 (confirmation depth, reorg recovery, retry vs permanent failure): complete

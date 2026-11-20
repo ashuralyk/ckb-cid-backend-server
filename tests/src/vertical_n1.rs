@@ -1,16 +1,12 @@
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
-    use ckb_types::core::ScriptHashType;
-    use ckb_types::prelude::*;
-    use cid_backend_core::digest_loop::{DigestLoop, LoopConfig, NopClock};
-    use cid_backend_core::process::ProcessResolver;
     use cid_backend_core::rpc::{out_point_key, script_hash32};
 
-    use crate::helpers::{intention_cell, process_cell, process_type_script, CID_CODE};
-    use crate::scripted_ssri::ScriptedSsri;
     use crate::fake_rpc::FakeRpc;
+    use crate::helpers::{
+        default_loop_config, intention_cell, loop_with_resolver, process_cell, process_type_script,
+    };
+    use crate::scripted_ssri::ScriptedSsri;
 
     #[test]
     fn tick_n1_digest_ok_shape_accepted_by_fakerpc() {
@@ -22,18 +18,8 @@ mod tests {
         rpc.insert_cell(intent.clone());
         rpc.insert_cell(proc.clone());
 
-        let mut loop_ = DigestLoop::new(
-            rpc,
-            NopClock,
-            ScriptedSsri::mimic((1, 4)),
-            LoopConfig {
-                cid_code_hash: CID_CODE,
-                hash_type: ScriptHashType::Type,
-                poll_interval: Duration::from_secs(1),
-                extra_cell_deps: vec![],
-            },
-            ProcessResolver::new(),
-        );
+        let mut loop_ =
+            loop_with_resolver(rpc, ScriptedSsri::mimic((1, 4)), default_loop_config(), 1);
         let report = loop_.tick();
         assert_eq!(report.submitted, 1);
         assert_eq!(report.conflicts, 0);
@@ -49,8 +35,8 @@ mod tests {
             .collect();
         assert_eq!(ops[0], intent.out_point);
         assert_eq!(ops[1], proc.out_point);
-        assert_eq!(tx.outputs().len(), 2, "beneficiary + process recreate");
-        let proc_out = tx.outputs().get(1).unwrap();
+        assert_eq!(tx.outputs().len(), 2, "process recreate + beneficiary");
+        let proc_out = tx.outputs().get(0).unwrap();
         assert_eq!(
             proc_out.type_().to_opt().map(|t| script_hash32(&t)),
             Some(hash)
@@ -64,6 +50,8 @@ mod tests {
         assert!(loop_
             .state()
             .submit
+            .as_ref()
+            .unwrap()
             .in_flight
             .contains(&out_point_key(&intent.out_point)));
         assert!(loop_
@@ -80,20 +68,13 @@ mod tests {
         let hash = script_hash32(&ts);
         let intent = intention_cell(1, hash, 100_0000_0000);
         rpc.insert_cell(intent.clone());
-        rpc.insert_cell(process_cell(1, 200_0000_0000, vec![0x7f, b'E', b'L', b'F', 1]));
+        rpc.insert_cell(process_cell(
+            1,
+            200_0000_0000,
+            vec![0x7f, b'E', b'L', b'F', 1],
+        ));
 
-        let mut loop_ = DigestLoop::new(
-            rpc,
-            NopClock,
-            ScriptedSsri::unusable(),
-            LoopConfig {
-                cid_code_hash: CID_CODE,
-                hash_type: ScriptHashType::Type,
-                poll_interval: Duration::from_secs(1),
-                extra_cell_deps: vec![],
-            },
-            ProcessResolver::new(),
-        );
+        let mut loop_ = loop_with_resolver(rpc, ScriptedSsri::unusable(), default_loop_config(), 1);
         let report = loop_.tick();
         assert_eq!(report.submitted, 0);
         assert!(loop_.rpc().submitted().is_empty());

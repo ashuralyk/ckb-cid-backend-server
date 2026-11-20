@@ -1,16 +1,14 @@
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
+    use cid_backend_core::digest_loop::LoopConfig;
+    use cid_backend_core::rpc::script_hash32;
     use ckb_types::core::ScriptHashType;
     use ckb_types::prelude::*;
-    use cid_backend_core::digest_loop::{DigestLoop, LoopConfig, NopClock};
-    use cid_backend_core::process::ProcessResolver;
-    use cid_backend_core::rpc::script_hash32;
+    use std::time::Duration;
 
     use crate::fake_rpc::FakeRpc;
     use crate::helpers::{
-        intention_cell, process_cell, process_type_script, user_lock, CID_CODE,
+        intention_cell, loop_with_resolver, process_cell, process_type_script, user_lock, CID_CODE,
     };
     use crate::scripted_ssri::ScriptedSsri;
 
@@ -24,24 +22,31 @@ mod tests {
         rpc.insert_cell(intent.clone());
         rpc.insert_cell(proc.clone());
 
-        let mut loop_ = DigestLoop::new(
+        let mut loop_ = loop_with_resolver(
             rpc,
-            NopClock,
             ScriptedSsri::incompatible(21),
             LoopConfig {
                 cid_code_hash: CID_CODE,
                 hash_type: ScriptHashType::Type,
                 poll_interval: Duration::from_secs(1),
-                extra_cell_deps: vec![],
+                extra_cell_deps: vec![crate::helpers::placeholder_code_dep()],
+                type_id_code_deps: vec![],
+                confirmation_depth: 1,
+                extra_scan_locks: vec![],
+                refund_policy: Default::default(),
+                max_assembled_tx_bytes: 512 * 1024,
             },
-            ProcessResolver::new(),
+            3,
         );
         let report = loop_.tick();
         assert_eq!(report.submitted, 1);
 
         let tx = &loop_.rpc().submitted()[0];
         assert_eq!(tx.inputs().len(), 1);
-        assert_eq!(tx.inputs().get(0).unwrap().previous_output(), intent.out_point);
+        assert_eq!(
+            tx.inputs().get(0).unwrap().previous_output(),
+            intent.out_point
+        );
         assert_eq!(tx.outputs().len(), 1);
         let out = tx.outputs().get(0).unwrap();
         let cap: u64 = out.capacity().unpack();
@@ -61,5 +66,30 @@ mod tests {
             let code: [u8; 32] = c.lock().code_hash().unpack();
             code == user_lock().code_hash && c.capacity() == 100_0000_0000
         }));
+    }
+
+    #[test]
+    fn assemble_host_and_state_errors_do_not_refund() {
+        let mut refunded = Vec::new();
+        for code in [36, 37] {
+            let rpc = FakeRpc::new();
+            let hash = script_hash32(&process_type_script(3));
+            rpc.insert_cell(intention_cell(1, hash, 100_0000_0000));
+            rpc.insert_cell(process_cell(3, 200_0000_0000, vec![]));
+            let mut loop_ = loop_with_resolver(
+                rpc,
+                ScriptedSsri::incompatible(code),
+                crate::helpers::default_loop_config(),
+                3,
+            );
+            let _ = loop_.tick();
+            if !loop_.rpc().submitted().is_empty() {
+                refunded.push(code);
+            }
+        }
+        assert!(
+            refunded.is_empty(),
+            "guest exits triggered refunds: {refunded:?}"
+        );
     }
 }

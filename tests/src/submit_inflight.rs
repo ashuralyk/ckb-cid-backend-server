@@ -1,11 +1,11 @@
 #[cfg(test)]
 mod tests {
+    use cid_backend_core::assemble::ExecutionSkeleton;
+    use cid_backend_core::rpc::out_point_key;
+    use cid_backend_core::submit::{submit_execution, SubmitState};
     use ckb_types::core::{ScriptHashType, TransactionBuilder};
     use ckb_types::packed::CellInput;
     use ckb_types::prelude::*;
-    use cid_backend_core::assemble::ExecutionSkeleton;
-    use cid_backend_core::rpc::{out_point_key, Rpc};
-    use cid_backend_core::submit::{submit_execution, SubmitState};
 
     use crate::fake_rpc::FakeRpc;
     use crate::helpers::{live_cell, lock_script, out_point};
@@ -29,9 +29,13 @@ mod tests {
                     .build(),
             )
             .build();
-        let skeleton = ExecutionSkeleton { tx };
+        let skeleton = ExecutionSkeleton {
+            tx,
+            fee_guard: None,
+        };
         let mut state = SubmitState::default();
-        let hash = submit_execution(&rpc, &skeleton, &mut state, &[op.clone()]).unwrap();
+        let hash =
+            submit_execution(&rpc, &skeleton, &mut state, std::slice::from_ref(&op)).unwrap();
         assert!(!hash.as_slice().is_empty() || hash.as_slice().len() == 32);
         assert!(state.in_flight.contains(&out_point_key(&op)));
         assert!(state.failed.is_empty());
@@ -57,15 +61,15 @@ mod tests {
         let mut state2 = SubmitState::default();
         let err = submit_execution(
             &rpc,
-            &ExecutionSkeleton { tx: tx2 },
+            &ExecutionSkeleton {
+                tx: tx2,
+                fee_guard: None,
+            },
             &mut state2,
-            &[op2.clone()],
+            std::slice::from_ref(&op2),
         )
         .unwrap_err();
-        assert!(matches!(
-            err,
-            cid_backend_core::rpc::RpcError::Conflict(_)
-        ));
+        assert!(matches!(err, cid_backend_core::rpc::RpcError::Conflict(_)));
         assert!(state2.failed.contains(&out_point_key(&op2)));
         assert!(!state2.in_flight.contains(&out_point_key(&op2)));
         assert_eq!(rpc.live_cells().len(), 1);

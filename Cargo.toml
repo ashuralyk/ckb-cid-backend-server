@@ -9,5 +9,6 @@ members = [
 [workspace.dependencies]
 ckb-types = "0.119"
 log = "0.4"
-cid-process-executor = { git = "https://github.com/ashuralyk/ckb-common-intention-dispatcher", rev = "d9ee77805f7ac930ab149648bed70f484a9886de" }
-cid-protocol = { git = "https://github.com/ashuralyk/ckb-common-intention-dispatcher", rev = "d9ee77805f7ac930ab149648bed70f484a9886de" }
+tracing = "0.1"
+cid-process-executor = { git = "https://github.com/ashuralyk/ckb-common-intention-dispatcher", rev = "5ea581fad5922ad0e4104d99757be143ee6706f8" }
+cid-protocol = { git = "https://github.com/ashuralyk/ckb-common-intention-dispatcher", rev = "5ea581fad5922ad0e4104d99757be143ee6706f8" }
