@@ -37,8 +37,11 @@ recreate is skipped until settlement (`process_occupied`).
 
 A filter-authorized User Lock refund spends the Intention and uses the live
 Process state and code as cell dependencies. The worker defers the refund while
-a pending digest consumes its authorizing state. In the other direction, a
-pending refund blocks digest submissions that would consume its state dependency.
+a pending digest consumes or creates its authorizing state. If a legal accepted batch is
+available, the worker requires a completed assembly check before releasing the
+deferred refund. A confirming digest's recreated state stays occupied until
+settlement. In the other direction, a pending refund blocks digest submissions
+that would consume its state dependency.
 The worker lifts that dependency interlock after the node reports the refund
 committed and a fresh tip read places the tip at or above the commit height
 without a rewind during reconciliation. The worker holds the interlock again
@@ -111,10 +114,12 @@ can still be split to reach later Intentions. Isolation is iterative.
 
 A subset whose guest-added funding input is no longer live is skipped. A
 funding lookup error leaves that subset at the probe cursor for retry. A
-conflict at dry-run or submission advances the cursor. When the search runs
-out of subsets, the worker leaves the Intentions live and
-skips the same candidate set for the next three successful scans. A change
-to the candidate set, Process state, or execution code reopens the search.
+conflict at dry-run or submission advances the active subset cursor or moves to
+the next window. The worker leaves the Intentions live after either natural
+exhaustion or the 256-probe limit. Natural exhaustion pauses assembly for three
+successful scans. At the limit, assembly waits until the candidate set, Process
+state, or execution code changes. Exit 37 on a Process state with zero fee
+headroom pauses assembly until the state or execution code changes.
 
 Uncached no-send skips (`RefundUnbuildable`, capacity shortfall, SSRI
 assemble Unusable) still count toward the per-tick work bound — they are

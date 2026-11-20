@@ -51,10 +51,12 @@ pub struct ProcessWorkerState {
     pub isolate_pending: Vec<Vec<ScannedIntention>>,
     pub(crate) refund_cursor: Option<OutPoint>,
     pub(crate) filter_refund_deferred: bool,
+    pub(crate) refund_assembly_checked: bool,
     /// State dependencies of submitted filter refunds, keyed by transaction.
     pub(crate) refund_state_deps: HashMap<Vec<u8>, OutPoint>,
     pub(crate) isolation_probe: Option<IsolationProbe>,
     pub(crate) exhausted_isolation: Option<ExhaustedIsolation>,
+    unfunded_process: Option<(OutPoint, Option<OutPoint>)>,
     pub(crate) probe_budget: ProbeBudget,
     pub generation: u64,
     /// Exit 41 quarantines a state/code pair. The height is the first tip
@@ -80,9 +82,11 @@ impl ProcessWorkerState {
             isolate_pending: Vec::new(),
             refund_cursor: None,
             filter_refund_deferred: false,
+            refund_assembly_checked: false,
             refund_state_deps: HashMap::new(),
             isolation_probe: None,
             exhausted_isolation: None,
+            unfunded_process: None,
             probe_budget: ProbeBudget::default(),
             generation,
             quarantines: HashMap::new(),
@@ -130,9 +134,21 @@ impl ProcessWorkerState {
         });
     }
 
-    pub(crate) fn advance_conflicting_probe(&mut self) {
+    pub(crate) fn mark_process_unfunded(&mut self, process: &ResolvedProcess) {
+        self.unfunded_process = Some(process_snapshot(process));
+        self.isolation_probe = None;
+    }
+
+    pub(crate) fn is_process_unfunded(&self, process: &ResolvedProcess) -> bool {
+        self.unfunded_process.as_ref() == Some(&process_snapshot(process))
+    }
+
+    pub(crate) fn advance_conflicting_probe(&mut self) -> BatchOutcome {
         if let Some(probe) = &mut self.isolation_probe {
             probe.advance_after_conflict();
+            BatchOutcome::Continue
+        } else {
+            BatchOutcome::RetryLater
         }
     }
 
@@ -144,6 +160,7 @@ impl ProcessWorkerState {
         self.refund_cursor = None;
         self.isolation_probe = None;
         self.exhausted_isolation = None;
+        self.unfunded_process = None;
     }
 
     pub(crate) fn has_pending_filter_refund(&self, state: &OutPoint) -> bool {

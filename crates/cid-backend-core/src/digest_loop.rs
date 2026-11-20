@@ -513,9 +513,14 @@ where
                     .refund_state_deps
                     .retain(|hash, _| state.submit.pending.contains_key(hash));
                 state.probe_budget = process_batch::ProbeBudget::default();
-                if let Some(exhausted) = &mut state.exhausted_isolation {
-                    exhausted.polls_remaining -= 1;
-                    if exhausted.polls_remaining == 0 {
+                state.refund_assembly_checked = false;
+                if let Some(polls) = state
+                    .exhausted_isolation
+                    .as_mut()
+                    .and_then(|exhausted| exhausted.polls_remaining.as_mut())
+                {
+                    *polls -= 1;
+                    if *polls == 0 {
                         state.exhausted_isolation = None;
                     }
                 }
@@ -585,7 +590,7 @@ where
                     started = true;
                 }
             }
-            let more = self.wait_all_batches(&mut report);
+            let more = self.wait_all_batches(&mut report, &buckets);
             if !started || !more {
                 break;
             }
@@ -595,7 +600,15 @@ where
         // by assemble must also stop refunds authorized by its filter.
         for bucket in buckets {
             let hash = bucket.process.type_hash;
-            if !bucket.refunds.is_empty() && self.process_is_healthy(&bucket.process) {
+            let can_refund = self.workers.get(&hash).is_some_and(|worker| {
+                worker.with_state(|state| {
+                    !state.is_process_quarantined(&bucket.process)
+                        && (!state.filter_refund_deferred
+                            || state.refund_assembly_checked
+                            || bucket.accepted.is_empty())
+                })
+            });
+            if !bucket.refunds.is_empty() && can_refund {
                 self.dispatch_process_batch(
                     hash,
                     &bucket.process,
@@ -608,7 +621,7 @@ where
                 );
             }
         }
-        self.wait_all_batches(&mut report);
+        self.wait_all_batches(&mut report, &[]);
 
         self.tick_cell_deps.clear();
         self.clear_worker_tick_code();
@@ -710,14 +723,17 @@ where
                     });
                 }
             }
-            BatchOutcome::ProcessOccupied => {}
+            BatchOutcome::AssemblyChecked => {
+                worker.with_state_mut(|state| state.refund_assembly_checked = true);
+            }
+            BatchOutcome::ProcessOccupied | BatchOutcome::ProbeCapped => {}
         }
         continue_round
     }
 
     /// Block until every outstanding RunBatch has an ack — never invent outcomes.
     /// Returns true when isolate should run another round this tick.
-    fn wait_all_batches(&mut self, report: &mut TickReport) -> bool {
+    fn wait_all_batches(&mut self, report: &mut TickReport, buckets: &[FilteredBucket]) -> bool {
         let mut more = false;
         loop {
             let mut any_outstanding = false;
@@ -726,6 +742,19 @@ where
                     continue;
                 };
                 if let Some(polled) = worker.try_poll_batch() {
+                    if polled.outcome == BatchOutcome::ProbeCapped {
+                        if let Some(bucket) = buckets.iter().find(|b| b.process.type_hash == hash) {
+                            let exhausted = process_batch::ExhaustedIsolation::new(
+                                &bucket.process,
+                                &self.batch_code_key(&bucket.process),
+                                bucket.accepted.iter(),
+                                true,
+                            );
+                            worker.with_state_mut(|state| {
+                                state.exhausted_isolation = Some(exhausted);
+                            });
+                        }
+                    }
                     if matches!(
                         polled.outcome,
                         BatchOutcome::Submitted | BatchOutcome::SubmittedProcess
@@ -1120,11 +1149,19 @@ where
             return;
         }
         let hash = process.type_hash;
-        if self
-            .workers
-            .get(&hash)
-            .is_some_and(|worker| worker.with_state(|state| state.probe_budget.remaining == 0))
-        {
+        if self.workers.get(&hash).is_some_and(|worker| {
+            worker.with_state_mut(|state| {
+                if state.is_process_unfunded(process) {
+                    if mode == BatchMode::CheckAssembly {
+                        state.refund_assembly_checked = true;
+                    }
+                    report.skipped += bucket.len();
+                    return true;
+                }
+                state.probe_budget.remaining == 0
+                    || (mode == BatchMode::CheckAssembly && state.refund_assembly_checked)
+            })
+        }) {
             return;
         }
         if self.workers.get(&hash).is_some_and(|worker| {
@@ -1163,6 +1200,14 @@ where
                 min,
                 max,
             );
+            report.skipped += bucket.len();
+            return;
+        }
+
+        if mode == BatchMode::CheckAssembly && bucket.len() < min as usize {
+            if let Some(worker) = self.workers.get(&hash) {
+                worker.with_state_mut(|state| state.refund_assembly_checked = true);
+            }
             report.skipped += bucket.len();
             return;
         }
@@ -1289,7 +1334,9 @@ where
                 // isolate_pending at poll time instead of relying on this arm.
                 continue;
             }
-            let cached = !resuming_probe && self.window_combo_cached(&hash, &window, process);
+            let cached = mode != BatchMode::CheckAssembly
+                && !resuming_probe
+                && self.window_combo_cached(&hash, &window, process);
             let outcome = if cached {
                 tracing::debug!(
                     target: LOG_TARGET,
@@ -1368,10 +1415,12 @@ where
                     return items.first().map(|i| out_point_key(&i.out_point));
                 }
                 BatchOutcome::Submitted
+                | BatchOutcome::AssemblyChecked
                 | BatchOutcome::Continue
                 | BatchOutcome::RetryLater
                 | BatchOutcome::RpcUnavailable
-                | BatchOutcome::ProbePending => {
+                | BatchOutcome::ProbePending
+                | BatchOutcome::ProbeCapped => {
                     if !rest.is_empty() {
                         stack.push(rest);
                     }

@@ -22,10 +22,13 @@ Stable field `event` (target `cid_backend`):
 | `scan.unavailable` | Indexer/RPC scan failed |
 | `process.resolve_miss` | No usable live Process binary |
 | `assemble.batch_failed` | Assembly error and attempted Intention outpoints |
+| `assemble.probe_failed` | Assembly error for a subset examined during isolation |
+| `assemble.probe_limit` | The Process reached the 256-probe limit for the current search |
+| `assemble.process_unfunded` | Exit 37 and zero state fee headroom paused assembly for the state and code |
 | `assemble.batch_isolated` | Working subset found during isolation |
 | `process.unhealthy` | Exit 41 quarantined the Process state/code pair and paused its filter refunds |
 | `ssri.filter_failed` | Filter error deferred the Process bucket |
-| `refund.process_state_pending` | Refund deferred while a pending digest spends its state dependency |
+| `refund.process_state_pending` | Refund deferred while a pending digest spends or creates its state dependency |
 | `refund.snapshot_mismatch` | Node re-read disagrees with the Intention, Process state, or code snapshot |
 | `refund.path` | Singleton User Lock refund built (`path=user_lock`, `out_point`, `fee`) or unbuildable (`path=unbuildable`, `error`) |
 | `refund.fee_unaffordable` | The singleton bounded refund cannot cover the fee and its Intention stays live |

@@ -6,14 +6,14 @@ use crate::assemble::{
 };
 use crate::code_deps::{cell_dep_code, merge_cell_deps};
 const DEFAULT_MAX_ASSEMBLED_TX_BYTES: usize = 512 * 1024;
-use crate::fee::{CidLockIdentity, RefundPolicy};
+use crate::fee::{cell_occupied_capacity, CidLockIdentity, RefundPolicy};
 use crate::host_query::HostQueryRpc;
 use crate::process::ResolvedProcess;
 use crate::rpc::{LiveCell, Rpc, RpcError};
 use crate::scan::ScannedIntention;
 use crate::ssri::{
     build_batch_draft, draft_cell_deps_for_batch, draft_cells_for_batch, intention_draft_cell,
-    SsriError, SsriHost, PROCESS_LOCK_ARGS_INVALID,
+    SsriError, SsriHost, PROCESS_LOCK_ARGS_INVALID, STATE_CAPACITY_INSUFFICIENT,
 };
 use crate::submit::{combo_fingerprint, dry_run_gate, submit_execution, DryRunGate};
 use crate::worker_commands::{Submission, WorkerCommands};
@@ -30,6 +30,7 @@ use std::sync::{Arc, Mutex};
 const LOG_TARGET: &str = "cid_backend";
 const MAX_COMPARISON_PROBES: usize = 64;
 const MAX_ARRIVAL_PROBES: usize = 16;
+const MAX_SNAPSHOT_PROBES: usize = 256;
 
 #[derive(Clone, Copy)]
 pub(crate) struct ProbeBudget {
@@ -61,11 +62,13 @@ pub enum BatchOutcome {
     Submitted,
     Rejected,
     CachedRejected,
+    AssemblyChecked,
     Continue,
     ProcessOccupied,
     /// Leave cells live and advance to the next window without caching a verdict.
     RetryLater,
     ProbePending,
+    ProbeCapped,
     RpcUnavailable,
 }
 
@@ -196,7 +199,8 @@ where
             report.skipped += batch.len();
             return (BatchOutcome::Continue, report);
         }
-        if worker.isolation_probe.is_none()
+        if mode != BatchMode::CheckAssembly
+            && worker.isolation_probe.is_none()
             && window_combo_cached(&worker, &batch, process, execution_code_key)
         {
             tracing::debug!(
@@ -271,6 +275,34 @@ where
         let mut worker = state.lock().expect("process worker state");
         (worker.isolation_probe.take(), worker.probe_budget)
     };
+    // The pinned guest preserves occupied capacity and pays a positive fee
+    // from the Process state for every batch. A funded state can still return
+    // exit 37 for some subsets, so only stop on verified zero headroom.
+    let no_fee_headroom =
+        cell_occupied_capacity(&process.live_cell.output, &process.live_cell.data)
+            .is_some_and(|occupied| process.live_cell.capacity() <= occupied);
+    let mark_unfunded = || {
+        tracing::warn!(target: LOG_TARGET, event = "assemble.process_unfunded",
+            process_type_hash = %hex_pref(&hash), out_point = ?process.live_cell.out_point,
+            code = STATE_CAPACITY_INSUFFICIENT);
+        state
+            .lock()
+            .expect("process worker state")
+            .mark_process_unfunded(process);
+        let outcome = if mode == BatchMode::CheckAssembly {
+            BatchOutcome::AssemblyChecked
+        } else {
+            BatchOutcome::RetryLater
+        };
+        (
+            outcome,
+            BatchReportDelta {
+                skipped: batch.len(),
+                last_error: Some("Process assembly failed (exit 37: no fee headroom)".into()),
+                ..BatchReportDelta::default()
+            },
+        )
+    };
     let prepared = if probe.is_none() {
         match attempt(&batch) {
             Ok(assembled) => match prepare(&assembled, &batch) {
@@ -282,6 +314,9 @@ where
             },
             Err(SsriError::Incompatible(PROCESS_LOCK_ARGS_INVALID)) => {
                 return mark_process_unhealthy(hash, process, &state, batch.len());
+            }
+            Err(SsriError::Incompatible(STATE_CAPACITY_INSUFFICIENT)) if no_fee_headroom => {
+                return mark_unfunded();
             }
             Err(error) => {
                 tracing::warn!(target: LOG_TARGET, event = "assemble.batch_failed",
@@ -309,12 +344,14 @@ where
         probe.include_arrivals(batch.iter().chain(rest));
         let mut live = HashMap::new();
         let mut try_subset = |items: &[ScannedIntention]| {
-            if window_combo_cached(
-                &state.lock().expect("process worker state"),
-                items,
-                process,
-                execution_code_key,
-            ) {
+            if mode != BatchMode::CheckAssembly
+                && window_combo_cached(
+                    &state.lock().expect("process worker state"),
+                    items,
+                    process,
+                    execution_code_key,
+                )
+            {
                 return Ok(None);
             }
             for item in items {
@@ -342,8 +379,13 @@ where
                     result => Ok(Some(result)),
                 },
                 Err(error @ SsriError::Incompatible(PROCESS_LOCK_ARGS_INVALID)) => Err(error),
+                Err(error @ SsriError::Incompatible(STATE_CAPACITY_INSUFFICIENT))
+                    if no_fee_headroom =>
+                {
+                    Err(error)
+                }
                 Err(error) => {
-                    tracing::debug!(target: LOG_TARGET, event = "assemble.probe_failed",
+                    tracing::warn!(target: LOG_TARGET, event = "assemble.probe_failed",
                         process_type_hash = %hex_pref(&hash), %error,
                         intentions = ?items.iter().map(|item| &item.out_point).collect::<Vec<_>>());
                     Ok(None)
@@ -351,17 +393,19 @@ where
             }
         };
         let result = probe.search(&candidates, &mut budget, &mut try_subset);
-        let pending = probe.has_work();
+        let capped = probe.remaining == 0 && probe.has_work();
+        let pending = !capped && probe.has_work();
         {
             let mut worker = state.lock().expect("process worker state");
             worker.probe_budget = budget;
-            if pending {
+            if pending || matches!(result, Ok(Some(_))) {
                 worker.isolation_probe = Some(probe);
-            } else if matches!(result, Ok(None)) {
+            } else if !capped && matches!(result, Ok(None)) {
                 worker.exhausted_isolation = Some(ExhaustedIsolation::new(
                     process,
                     execution_code_key,
                     batch.iter().chain(rest),
+                    false,
                 ));
             }
         }
@@ -376,15 +420,28 @@ where
             Err(SsriError::Incompatible(PROCESS_LOCK_ARGS_INVALID)) => {
                 return mark_process_unhealthy(hash, process, &state, batch.len());
             }
+            Err(SsriError::Incompatible(STATE_CAPACITY_INSUFFICIENT)) if no_fee_headroom => {
+                return mark_unfunded();
+            }
             result => {
+                let checked = mode == BatchMode::CheckAssembly && !capped && result.is_ok();
                 if let Err(error) = result {
                     tracing::warn!(target: LOG_TARGET, event = "assemble.probe_deferred",
                         process_type_hash = %hex_pref(&hash), %error);
                     report.last_error = Some(format!("assemble isolation: {error}"));
                 }
                 report.skipped += batch.len();
-                let outcome = if pending {
+                let outcome = if capped {
+                    tracing::warn!(target: LOG_TARGET, event = "assemble.probe_limit",
+                        process_type_hash = %hex_pref(&hash), limit = MAX_SNAPSHOT_PROBES);
+                    report.last_error.get_or_insert_with(|| {
+                        format!("assemble isolation reached its {MAX_SNAPSHOT_PROBES}-probe limit")
+                    });
+                    BatchOutcome::ProbeCapped
+                } else if pending {
                     BatchOutcome::ProbePending
+                } else if checked {
+                    BatchOutcome::AssemblyChecked
                 } else {
                     BatchOutcome::RetryLater
                 };
@@ -434,7 +491,7 @@ where
     };
 
     if mode == BatchMode::CheckAssembly {
-        return (BatchOutcome::Continue, report);
+        return (BatchOutcome::AssemblyChecked, report);
     }
 
     let consumed_process = skeleton
@@ -481,11 +538,11 @@ where
         }
         DryRunGate::Skip(RpcError::Conflict(m)) => {
             let mut worker = state.lock().expect("process worker state");
-            worker.advance_conflicting_probe();
+            let outcome = worker.advance_conflicting_probe();
             tracing::warn!(target: LOG_TARGET, event = "dry_run.conflict", error = %m);
             report.conflicts += 1;
             report.last_error = Some(format!("dry-run conflict: {m}"));
-            return (BatchOutcome::Continue, report);
+            return (outcome, report);
         }
         DryRunGate::Skip(m) => {
             tracing::warn!(
@@ -521,7 +578,7 @@ where
             }
         }
         Err(RpcError::Conflict(m)) => {
-            worker.advance_conflicting_probe();
+            let outcome = worker.advance_conflicting_probe();
             tracing::warn!(
                 target: LOG_TARGET,
                 event = "submit.conflict",
@@ -529,7 +586,7 @@ where
             );
             report.conflicts += 1;
             report.last_error = Some(format!("submit conflict: {m}"));
-            (BatchOutcome::Continue, report)
+            (outcome, report)
         }
         Err(RpcError::SubmitRejected(m)) => {
             worker.submit.rejected_combos.insert(fp);
@@ -602,23 +659,24 @@ fn prepare_execution(
     Ok(skeleton)
 }
 
-/// Back off after checking all subsets. The same candidate set may be rotated
+/// Back off after exhausting the subsets or hitting the probe cap. The candidate set may be rotated
 /// by the window cursor, so key it independently of that order.
 pub(crate) struct ExhaustedIsolation {
     fingerprint: Vec<u8>,
-    pub(crate) polls_remaining: u8,
+    pub(crate) polls_remaining: Option<u8>,
 }
 
 impl ExhaustedIsolation {
-    fn new<'a>(
+    pub(crate) fn new<'a>(
         process: &ResolvedProcess,
         execution_code_key: &[u8],
         items: impl Iterator<Item = &'a ScannedIntention>,
+        capped: bool,
     ) -> Self {
         Self {
             fingerprint: Self::fingerprint(process, execution_code_key, items),
             // Skip the next three successful scans and retry on the fourth.
-            polls_remaining: 4,
+            polls_remaining: (!capped).then_some(4),
         }
     }
 
@@ -653,6 +711,7 @@ pub(crate) struct IsolationProbe {
     older: SubsetSearch,
     arrivals: VecDeque<SubsetSearch>,
     selected_from_arrivals: Option<bool>,
+    remaining: usize,
 }
 
 struct SubsetSearch {
@@ -687,6 +746,7 @@ impl IsolationProbe {
             older,
             arrivals: VecDeque::new(),
             selected_from_arrivals: None,
+            remaining: MAX_SNAPSHOT_PROBES,
         }
     }
 
@@ -730,6 +790,25 @@ impl IsolationProbe {
     }
 
     fn search<T>(
+        &mut self,
+        candidates: &HashMap<&OutPoint, &ScannedIntention>,
+        budget: &mut ProbeBudget,
+        attempt: &mut impl FnMut(&[ScannedIntention]) -> Result<Option<T>, SsriError>,
+    ) -> Result<Option<(Vec<ScannedIntention>, T)>, SsriError> {
+        let limit = budget.remaining.min(self.remaining);
+        let mut turn = ProbeBudget {
+            remaining: limit,
+            arrivals: budget.arrivals,
+        };
+        let result = self.search_with_budget(candidates, &mut turn, attempt);
+        let used = limit - turn.remaining;
+        self.remaining -= used;
+        budget.remaining -= used;
+        budget.arrivals = turn.arrivals;
+        result
+    }
+
+    fn search_with_budget<T>(
         &mut self,
         candidates: &HashMap<&OutPoint, &ScannedIntention>,
         budget: &mut ProbeBudget,
@@ -916,11 +995,7 @@ fn refund_filter_rejections<R: Rpc + HostQueryRpc>(
             report.skipped = params.batch.len();
             return (BatchOutcome::Continue, report);
         }
-        if worker.submit.pending.values().any(|tx| {
-            tx.consumed
-                .iter()
-                .any(|op| op.as_slice() == authorizing_state.out_point.as_slice())
-        }) {
+        if worker.submit.pending_occupies(&authorizing_state.out_point) {
             worker.filter_refund_deferred = true;
             tracing::debug!(target: LOG_TARGET, event = "refund.process_state_pending",
                 out_point = ?authorizing_state.out_point);
