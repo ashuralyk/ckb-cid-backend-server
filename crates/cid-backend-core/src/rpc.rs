@@ -31,6 +31,7 @@ pub enum TxStatus {
     /// still waits for `LoopConfig::confirmation_depth`.
     Committed {
         block_number: u64,
+        block_hash: [u8; 32],
     },
     Dropped,
 }

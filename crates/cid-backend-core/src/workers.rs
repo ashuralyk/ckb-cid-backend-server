@@ -143,15 +143,6 @@ impl ProcessWorkerState {
         self.unfunded_process.as_ref() == Some(&process_snapshot(process))
     }
 
-    pub(crate) fn advance_conflicting_probe(&mut self) -> BatchOutcome {
-        if let Some(probe) = &mut self.isolation_probe {
-            probe.advance_after_conflict();
-            BatchOutcome::Continue
-        } else {
-            BatchOutcome::RetryLater
-        }
-    }
-
     pub(crate) fn clear_execution_rejections(&mut self) {
         self.submit.rejected_combos.clear();
         self.isolate_expanded.clear();

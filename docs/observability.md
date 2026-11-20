@@ -23,7 +23,7 @@ Stable field `event` (target `cid_backend`):
 | `process.resolve_miss` | No usable live Process binary |
 | `assemble.batch_failed` | Assembly error and attempted Intention outpoints |
 | `assemble.probe_failed` | Assembly error for a subset examined during isolation |
-| `assemble.probe_limit` | The Process reached the 256-probe limit for the current search |
+| `assemble.invalid` | The assembled transaction failed structural or funding-input validation |
 | `assemble.process_unfunded` | Exit 37 and zero state fee headroom paused assembly for the state and code |
 | `assemble.batch_isolated` | Working subset found during isolation |
 | `process.unhealthy` | Exit 41 quarantined the Process state/code pair and paused its filter refunds |
@@ -38,7 +38,9 @@ Stable field `event` (target `cid_backend`):
 | `submit.rejected` | Transaction-level submit rejection (`TransactionFailedToVerify` / malformed / outputs-validator); that combo is skipped, not every consumed outpoint |
 | `submit.rejected_combo` | Isolation skipped a combo already in `rejected_combos` (no new `send_transaction`) |
 | `pending.committed` | First sight of Committed (occupancy still held) |
-| `pending.settled` | Confirmation depth reached |
+| `pending.settled` | A canonical commit reached confirmation depth |
+| `pending.noncanonical` | The reported commit block is missing or differs from the canonical hash at its height |
+| `pending.block_lookup` | The canonical commit-height hash lookup failed |
 | `pending.dropped` / `pending.reorg` | Pending/confirming tx gone |
 | `reorg.tip_rewind` | Tip height moved backwards |
 | `config.load_failed` | Illegal env / TOML / health bind failure (process exits) |

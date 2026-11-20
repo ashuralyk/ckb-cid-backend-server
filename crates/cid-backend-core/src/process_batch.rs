@@ -30,7 +30,6 @@ use std::sync::{Arc, Mutex};
 const LOG_TARGET: &str = "cid_backend";
 const MAX_COMPARISON_PROBES: usize = 64;
 const MAX_ARRIVAL_PROBES: usize = 16;
-const MAX_SNAPSHOT_PROBES: usize = 256;
 
 #[derive(Clone, Copy)]
 pub(crate) struct ProbeBudget {
@@ -68,7 +67,6 @@ pub enum BatchOutcome {
     /// Leave cells live and advance to the next window without caching a verdict.
     RetryLater,
     ProbePending,
-    ProbeCapped,
     RpcUnavailable,
 }
 
@@ -310,6 +308,7 @@ where
                     report.last_error = Some(format!("guest-added input {op:?} is not live"));
                     None
                 }
+                Err(PreparationError::Rejected) if mode == BatchMode::CheckAssembly => None,
                 result => Some(result),
             },
             Err(SsriError::Incompatible(PROCESS_LOCK_ARGS_INVALID)) => {
@@ -376,6 +375,7 @@ where
                     Err(PreparationError::InputLookup(error)) => Err(SsriError::Unusable(format!(
                         "verify guest-added input: {error}"
                     ))),
+                    Err(PreparationError::Rejected) if mode == BatchMode::CheckAssembly => Ok(None),
                     result => Ok(Some(result)),
                 },
                 Err(error @ SsriError::Incompatible(PROCESS_LOCK_ARGS_INVALID)) => Err(error),
@@ -393,19 +393,17 @@ where
             }
         };
         let result = probe.search(&candidates, &mut budget, &mut try_subset);
-        let capped = probe.remaining == 0 && probe.has_work();
-        let pending = !capped && probe.has_work();
+        let pending = probe.has_work();
         {
             let mut worker = state.lock().expect("process worker state");
             worker.probe_budget = budget;
             if pending || matches!(result, Ok(Some(_))) {
                 worker.isolation_probe = Some(probe);
-            } else if !capped && matches!(result, Ok(None)) {
+            } else if matches!(result, Ok(None)) {
                 worker.exhausted_isolation = Some(ExhaustedIsolation::new(
                     process,
                     execution_code_key,
                     batch.iter().chain(rest),
-                    false,
                 ));
             }
         }
@@ -424,21 +422,14 @@ where
                 return mark_unfunded();
             }
             result => {
-                let checked = mode == BatchMode::CheckAssembly && !capped && result.is_ok();
+                let checked = mode == BatchMode::CheckAssembly && result.is_ok();
                 if let Err(error) = result {
                     tracing::warn!(target: LOG_TARGET, event = "assemble.probe_deferred",
                         process_type_hash = %hex_pref(&hash), %error);
                     report.last_error = Some(format!("assemble isolation: {error}"));
                 }
                 report.skipped += batch.len();
-                let outcome = if capped {
-                    tracing::warn!(target: LOG_TARGET, event = "assemble.probe_limit",
-                        process_type_hash = %hex_pref(&hash), limit = MAX_SNAPSHOT_PROBES);
-                    report.last_error.get_or_insert_with(|| {
-                        format!("assemble isolation reached its {MAX_SNAPSHOT_PROBES}-probe limit")
-                    });
-                    BatchOutcome::ProbeCapped
-                } else if pending {
+                let outcome = if pending {
                     BatchOutcome::ProbePending
                 } else if checked {
                     BatchOutcome::AssemblyChecked
@@ -451,24 +442,7 @@ where
     };
     let skeleton = match prepared {
         Ok(skeleton) => skeleton,
-        Err(PreparationError::Invalid(error)) => {
-            let reason = match error {
-                AssembleError::SizeLimit { .. } => "size_limit",
-                _ => "guest_tx",
-            };
-            tracing::warn!(target: LOG_TARGET, event = "assemble.invalid", reason, %error);
-            let mut worker = state.lock().expect("process worker state");
-            return record_invalid_assembled_reject(
-                &mut worker,
-                &batch,
-                process,
-                execution_code_key,
-                &mut report,
-            );
-        }
-        Err(PreparationError::UnselectedIntention(out_point)) => {
-            tracing::warn!(target: LOG_TARGET, event = "assemble.invalid",
-                reason = "unselected_intention", ?out_point);
+        Err(PreparationError::Rejected) => {
             let mut worker = state.lock().expect("process worker state");
             return record_invalid_assembled_reject(
                 &mut worker,
@@ -522,6 +496,22 @@ where
         .map(|i| i.previous_output())
         .collect();
 
+    let isolate_conflict = |worker: &mut ProcessWorkerState| {
+        if let Some(probe) = &mut worker.isolation_probe {
+            probe.advance_selected();
+        } else if batch.len() > min as usize || !rest.is_empty() {
+            worker.isolation_probe = Some(IsolationProbe::new(
+                &process.live_cell.out_point,
+                &batch,
+                rest,
+                min as usize,
+            ));
+        } else {
+            return BatchOutcome::RetryLater;
+        }
+        BatchOutcome::Continue
+    };
+
     // Dry-run without holding the state mutex.
     match dry_run_gate(rpc.as_ref(), &skeleton.tx) {
         DryRunGate::Rejected(m) => {
@@ -538,7 +528,7 @@ where
         }
         DryRunGate::Skip(RpcError::Conflict(m)) => {
             let mut worker = state.lock().expect("process worker state");
-            let outcome = worker.advance_conflicting_probe();
+            let outcome = isolate_conflict(&mut worker);
             tracing::warn!(target: LOG_TARGET, event = "dry_run.conflict", error = %m);
             report.conflicts += 1;
             report.last_error = Some(format!("dry-run conflict: {m}"));
@@ -578,7 +568,7 @@ where
             }
         }
         Err(RpcError::Conflict(m)) => {
-            let outcome = worker.advance_conflicting_probe();
+            let outcome = isolate_conflict(&mut worker);
             tracing::warn!(
                 target: LOG_TARGET,
                 event = "submit.conflict",
@@ -614,8 +604,7 @@ where
 }
 
 enum PreparationError {
-    Invalid(AssembleError),
-    UnselectedIntention(OutPoint),
+    Rejected,
     NonLiveInput(OutPoint),
     InputLookup(RpcError),
 }
@@ -628,9 +617,16 @@ fn prepare_execution(
     max_size: usize,
     cid_locks: &[CidLockIdentity],
 ) -> Result<ExecutionSkeleton, PreparationError> {
-    validate_assembled_tx(assembled, batch, process, max_size)
-        .map_err(PreparationError::Invalid)?;
-    let skeleton = execution_from_assembled(assembled).map_err(PreparationError::Invalid)?;
+    let skeleton = validate_assembled_tx(assembled, batch, process, max_size)
+        .and_then(|()| execution_from_assembled(assembled))
+        .map_err(|error| {
+            let reason = match error {
+                AssembleError::SizeLimit { .. } => "size_limit",
+                _ => "guest_tx",
+            };
+            tracing::warn!(target: LOG_TARGET, event = "assemble.invalid", reason, %error);
+            PreparationError::Rejected
+        })?;
 
     // Additional funding inputs must be live and cannot bypass Intention selection.
     for input in skeleton.tx.inputs().into_iter() {
@@ -653,17 +649,19 @@ fn prepare_execution(
             code_hash == identity.code_hash && lock.hash_type() == identity.hash_type.into()
         }) || CidArgs::decode(&lock.args().raw_data()).is_ok()
         {
-            return Err(PreparationError::UnselectedIntention(op));
+            tracing::warn!(target: LOG_TARGET, event = "assemble.invalid",
+                reason = "unselected_intention", out_point = ?op);
+            return Err(PreparationError::Rejected);
         }
     }
     Ok(skeleton)
 }
 
-/// Back off after exhausting the subsets or hitting the probe cap. The candidate set may be rotated
+/// Back off after exhausting the subsets. The candidate set may be rotated
 /// by the window cursor, so key it independently of that order.
 pub(crate) struct ExhaustedIsolation {
     fingerprint: Vec<u8>,
-    pub(crate) polls_remaining: Option<u8>,
+    pub(crate) polls_remaining: u8,
 }
 
 impl ExhaustedIsolation {
@@ -671,12 +669,11 @@ impl ExhaustedIsolation {
         process: &ResolvedProcess,
         execution_code_key: &[u8],
         items: impl Iterator<Item = &'a ScannedIntention>,
-        capped: bool,
     ) -> Self {
         Self {
             fingerprint: Self::fingerprint(process, execution_code_key, items),
             // Skip the next three successful scans and retry on the fourth.
-            polls_remaining: (!capped).then_some(4),
+            polls_remaining: 4,
         }
     }
 
@@ -711,7 +708,6 @@ pub(crate) struct IsolationProbe {
     older: SubsetSearch,
     arrivals: VecDeque<SubsetSearch>,
     selected_from_arrivals: Option<bool>,
-    remaining: usize,
 }
 
 struct SubsetSearch {
@@ -746,7 +742,6 @@ impl IsolationProbe {
             older,
             arrivals: VecDeque::new(),
             selected_from_arrivals: None,
-            remaining: MAX_SNAPSHOT_PROBES,
         }
     }
 
@@ -758,7 +753,7 @@ impl IsolationProbe {
         self.older.has_work() || !self.arrivals.is_empty()
     }
 
-    pub(crate) fn advance_after_conflict(&mut self) {
+    fn advance_selected(&mut self) {
         match self.selected_from_arrivals.take() {
             Some(true) => {
                 let group = self.arrivals.back_mut().expect("selected arrival group");
@@ -790,25 +785,6 @@ impl IsolationProbe {
     }
 
     fn search<T>(
-        &mut self,
-        candidates: &HashMap<&OutPoint, &ScannedIntention>,
-        budget: &mut ProbeBudget,
-        attempt: &mut impl FnMut(&[ScannedIntention]) -> Result<Option<T>, SsriError>,
-    ) -> Result<Option<(Vec<ScannedIntention>, T)>, SsriError> {
-        let limit = budget.remaining.min(self.remaining);
-        let mut turn = ProbeBudget {
-            remaining: limit,
-            arrivals: budget.arrivals,
-        };
-        let result = self.search_with_budget(candidates, &mut turn, attempt);
-        let used = limit - turn.remaining;
-        self.remaining -= used;
-        budget.remaining -= used;
-        budget.arrivals = turn.arrivals;
-        result
-    }
-
-    fn search_with_budget<T>(
         &mut self,
         candidates: &HashMap<&OutPoint, &ScannedIntention>,
         budget: &mut ProbeBudget,
@@ -884,6 +860,11 @@ impl SubsetSearch {
                 indices.iter().map(|&i| snapshot[i].cloned()).collect()
             };
             if let Some(items) = items {
+                let mut locks = HashSet::new();
+                if !items.iter().all(|item| locks.insert(item.lock_group_key())) {
+                    self.advance(max);
+                    continue;
+                }
                 if let Some(assembled) = attempt(&items)? {
                     // Keep this position for transient RPC errors. A conflict
                     // advances it and a cached rejection skips it on resume.

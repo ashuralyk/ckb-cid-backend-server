@@ -7,8 +7,8 @@ mod tests {
 
     use crate::fake_rpc::FakeRpc;
     use crate::helpers::{
-        cid_lock_args, intention_cell, live_cell, lock_script, loop_with_resolver, out_point,
-        process_cell, process_type_script, CID_CODE,
+        cid_lock_args, distinct_intention_cell, intention_cell, live_cell, lock_script,
+        loop_with_resolver, out_point, process_cell, process_type_script, CID_CODE,
     };
     use crate::scripted_ssri::ScriptedSsri;
 
@@ -256,9 +256,9 @@ mod tests {
         let rpc = FakeRpc::new();
         let ts = process_type_script(36);
         let hash = script_hash32(&ts);
-        let a = intention_cell(1, hash, 100_0000_0000);
-        let b = intention_cell(2, hash, 110_0000_0000);
-        let c = intention_cell(3, hash, 120_0000_0000);
+        let a = distinct_intention_cell(1, hash, 100_0000_0000);
+        let b = distinct_intention_cell(2, hash, 110_0000_0000);
+        let c = distinct_intention_cell(3, hash, 120_0000_0000);
         let proc = process_cell(36, 200_0000_0000, vec![0x7f, b'E', b'L', b'F', 36]);
         rpc.insert_cell(a.clone());
         rpc.insert_cell(b.clone());
@@ -316,10 +316,10 @@ mod tests {
         let rpc = FakeRpc::new();
         let ts = process_type_script(37);
         let hash = script_hash32(&ts);
-        let a = intention_cell(1, hash, 100_0000_0000);
-        let b = intention_cell(2, hash, 110_0000_0000);
-        let c = intention_cell(3, hash, 120_0000_0000);
-        let d = intention_cell(4, hash, 130_0000_0000);
+        let a = distinct_intention_cell(1, hash, 100_0000_0000);
+        let b = distinct_intention_cell(2, hash, 110_0000_0000);
+        let c = distinct_intention_cell(3, hash, 120_0000_0000);
+        let d = distinct_intention_cell(4, hash, 130_0000_0000);
         let proc = process_cell(37, 200_0000_0000, vec![0x7f, b'E', b'L', b'F', 37]);
         rpc.insert_cell(a.clone());
         rpc.insert_cell(b.clone());
@@ -361,8 +361,8 @@ mod tests {
         let rpc = FakeRpc::new();
         let ts = process_type_script(29);
         let hash = script_hash32(&ts);
-        let bad = intention_cell(1, hash, 100_0000_0000);
-        let good = intention_cell(2, hash, 110_0000_0000);
+        let bad = distinct_intention_cell(1, hash, 100_0000_0000);
+        let good = distinct_intention_cell(2, hash, 110_0000_0000);
         let proc = process_cell(29, 200_0000_0000, vec![0x7f, b'E', b'L', b'F', 29]);
         rpc.insert_cell(bad.clone());
         rpc.insert_cell(good.clone());

@@ -8,7 +8,8 @@ mod tests {
 
     use crate::fake_rpc::FakeRpc;
     use crate::helpers::{
-        intention_cell, loop_with_resolver, process_cell, process_type_script, CID_CODE,
+        distinct_intention_cell, intention_cell, loop_with_resolver, process_cell,
+        process_type_script, CID_CODE,
     };
     use crate::scripted_ssri::ScriptedSsri;
 
@@ -35,7 +36,7 @@ mod tests {
         let proc = process_cell(21, 400_0000_0000, vec![0x7f, b'E', b'L', b'F', 21]);
         rpc.insert_cell(proc.clone());
         for i in 1..=4 {
-            rpc.insert_cell(intention_cell(i, hash, 100_0000_0000));
+            rpc.insert_cell(distinct_intention_cell(i, hash, 100_0000_0000));
         }
         let mut loop_ = loop_with_resolver(rpc, ScriptedSsri::mimic((2, 2)), cfg(3), 21);
 
@@ -45,7 +46,10 @@ mod tests {
         loop_.rpc().commit_pending(&tx_hash);
         assert!(matches!(
             loop_.rpc().get_transaction_status(&tx_hash).unwrap(),
-            TxStatus::Committed { block_number: 0 }
+            TxStatus::Committed {
+                block_number: 0,
+                ..
+            }
         ));
 
         for i in 0..2 {
@@ -105,7 +109,7 @@ mod tests {
         let proc = process_cell(22, 400_0000_0000, vec![0x7f, b'E', b'L', b'F', 22]);
         rpc.insert_cell(proc.clone());
         for i in 1..=4 {
-            rpc.insert_cell(intention_cell(i, hash, 100_0000_0000));
+            rpc.insert_cell(distinct_intention_cell(i, hash, 100_0000_0000));
         }
         let mut loop_ = loop_with_resolver(rpc, ScriptedSsri::mimic((2, 2)), cfg(10), 22);
 
@@ -116,7 +120,10 @@ mod tests {
         loop_.rpc().commit_pending(&tx_hash);
         assert!(matches!(
             loop_.rpc().get_transaction_status(&tx_hash).unwrap(),
-            TxStatus::Committed { block_number: 89 }
+            TxStatus::Committed {
+                block_number: 89,
+                ..
+            }
         ));
         loop_.rpc().set_tip(100);
         loop_.rpc().rewind_tip_on_next_status(90);

@@ -25,11 +25,10 @@ use `1` so existing FakeRpc verticals keep settling on first `Committed` at the
 tip. The ignored local-chain E2E uses `1` as well.
 
 Before settling, the loop re-reads the tip after `get_transaction_status`
-returns `Committed`. If that tip query fails, the tip rewound relative to
-the start of the tick, or `tip < commit_block`, occupancy is kept
-(Unavailable-style) and no further digest_ok is attempted for that Process
-this tick. Settlement waits until a later tick where the committed block is
-still at sufficient depth.
+returns `Committed` and checks the canonical block hash at the reported commit
+height. A rewind during reconciliation, a tip below the commit height, a
+missing or mismatched hash, or an unavailable RPC keeps occupancy in place.
+Settlement waits for a later tick with a canonical commit at sufficient depth.
 
 While confirming, occupancy covers both the spent inputs **and** the tx's
 outputs (the Process recreate). A later `digest_ok` that would spend that
@@ -43,8 +42,8 @@ deferred refund. A confirming digest's recreated state stays occupied until
 settlement. In the other direction, a pending refund blocks digest submissions
 that would consume its state dependency.
 The worker lifts that dependency interlock after the node reports the refund
-committed and a fresh tip read places the tip at or above the commit height
-without a rewind during reconciliation. The worker holds the interlock again
+committed, a fresh tip read places the tip at or above the commit height
+without a rewind, and the canonical hash matches the reported commit block. The worker holds the interlock again
 if these checks fail or the refund returns to the pool before settlement.
 
 ## Reorg recovery
@@ -55,7 +54,8 @@ if these checks fail or the refund returns to the pool before settlement.
 | Tip rewinds while reading a Committed status (stale start-of-tick tip, or `tip < commit height`) | Re-read tip before settling. Keep occupancy this tick (`pending.tip_rewind` / confirming). Do not settle against the stale height. |
 | Confirming refund returns to `Pending` | Keep the Intention occupied and block digests that would spend the refund's Process state dependency. |
 | Confirming or committed tx becomes `Dropped` | Log `pending.reorg` (if we had seen Committed) or `pending.dropped`. Release occupancy. If cells are live, the next tick retries. |
-| Status or tip RPC unavailable | Keep occupancy. Do not settle. |
+| Commit block missing or replaced at the same height | Keep occupancy and the refund dependency interlock. Log `pending.noncanonical`. |
+| Status, tip, or block hash RPC unavailable | Keep occupancy until reconciliation succeeds. |
 
 Exit 41 quarantines a Process state/code pair. A replacement pair can run
 independently. The worker retains the old quarantine for the configured
@@ -110,16 +110,18 @@ completes, and on restart.
 
 Before SSRI assemble, the worker checks the digest fingerprint for the
 candidate window. A cache hit skips assembly and submission while the window
-can still be split to reach later Intentions. Isolation is iterative.
+can still be split to reach later Intentions. Windows and probes select at
+most one input per full CID lock script.
 
 A subset whose guest-added funding input is no longer live is skipped. A
-funding lookup error leaves that subset at the probe cursor for retry. A
-conflict at dry-run or submission advances the active subset cursor or moves to
-the next window. The worker leaves the Intentions live after either natural
-exhaustion or the 256-probe limit. Natural exhaustion pauses assembly for three
-successful scans. At the limit, assembly waits until the candidate set, Process
-state, or execution code changes. Exit 37 on a Process state with zero fee
-headroom pauses assembly until the state or execution code changes.
+funding lookup error leaves the subset at the probe cursor for retry.
+A conflict at dry-run or submission starts or advances subset isolation when
+alternatives are available. A structurally invalid transaction advances the
+subset cursor during a deferred refund’s assembly check. The worker keeps
+the subset cursor across ticks when the per-tick budget is spent. Natural
+exhaustion leaves the Intentions live and pauses assembly for three successful
+scans. Exit 37 on a Process state with zero fee headroom pauses assembly until
+the state or execution code changes.
 
 Uncached no-send skips (`RefundUnbuildable`, capacity shortfall, SSRI
 assemble Unusable) still count toward the per-tick work bound — they are

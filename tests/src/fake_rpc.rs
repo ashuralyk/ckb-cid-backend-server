@@ -33,6 +33,7 @@ struct Inner {
     fail_tip_queries: bool,
     fail_type_script_queries: bool,
     rewind_tip_on_status: Option<u64>,
+    replace_commit_block_on_status: bool,
     submitted: Vec<TransactionView>,
     consumed_by_tx: HashMap<Vec<u8>, Vec<LiveCell>>,
     tx_status: HashMap<Vec<u8>, TxStatus>,
@@ -45,6 +46,21 @@ struct Inner {
 }
 
 impl Inner {
+    fn block_hash(&self, number: u64) -> [u8; 32] {
+        self.block_hashes.get(&number).copied().unwrap_or_else(|| {
+            let mut hash = [0; 32];
+            hash[..8].copy_from_slice(&number.to_le_bytes());
+            hash
+        })
+    }
+
+    fn committed_status(&self) -> TxStatus {
+        TxStatus::Committed {
+            block_number: self.tip,
+            block_hash: self.block_hash(self.tip),
+        }
+    }
+
     fn indexed_cell(&self, op: &OutPoint) -> Option<&LiveCell> {
         match self.indexer_snapshots.get(op) {
             Some(snapshot) => snapshot.as_ref(),
@@ -305,6 +321,10 @@ impl FakeRpc {
         self.inner.lock().unwrap().rewind_tip_on_status = Some(new_tip);
     }
 
+    pub fn replace_commit_block_on_next_status(&self) {
+        self.inner.lock().unwrap().replace_commit_block_on_status = true;
+    }
+
     pub fn live_cells(&self) -> Vec<LiveCell> {
         let inner = self.inner.lock().unwrap();
         inner
@@ -365,7 +385,7 @@ impl FakeRpc {
                 .tx_status
                 .iter()
                 .filter_map(|(k, st)| match st {
-                    TxStatus::Committed { block_number } if *block_number > new_tip => {
+                    TxStatus::Committed { block_number, .. } if *block_number > new_tip => {
                         Byte32::from_slice(k).ok()
                     }
                     _ => None,
@@ -386,10 +406,8 @@ impl FakeRpc {
             return;
         }
         apply_commit(&mut inner, tx_hash);
-        let block_number = inner.tip;
-        inner
-            .tx_status
-            .insert(key, TxStatus::Committed { block_number });
+        let status = inner.committed_status();
+        inner.tx_status.insert(key, status);
     }
 }
 
@@ -601,10 +619,8 @@ impl Rpc for FakeRpc {
             inner.tx_status.insert(hash_key, TxStatus::Pending);
         } else {
             apply_commit(&mut inner, &tx_hash);
-            let block_number = inner.tip;
-            inner
-                .tx_status
-                .insert(hash_key, TxStatus::Committed { block_number });
+            let status = inner.committed_status();
+            inner.tx_status.insert(hash_key, status);
         }
         drop(inner);
         if let Some(callback) = self.after_submit.lock().unwrap().take() {
@@ -621,11 +637,19 @@ impl Rpc for FakeRpc {
         if inner.fail_status_queries {
             return Err(RpcError::Unavailable("injected status unavailable".into()));
         }
-        Ok(inner
+        let status = inner
             .tx_status
             .get(tx_hash.as_slice())
             .copied()
-            .unwrap_or(TxStatus::Dropped))
+            .unwrap_or(TxStatus::Dropped);
+        if let TxStatus::Committed { block_number, .. } = status {
+            if std::mem::take(&mut inner.replace_commit_block_on_status) {
+                inner.block_hashes.insert(block_number, [0xbb; 32]);
+                drop(inner);
+                self.return_to_pool(tx_hash);
+            }
+        }
+        Ok(status)
     }
 
     fn tip_block_number(&self) -> Result<u64, RpcError> {
@@ -657,13 +681,7 @@ impl HostQueryRpc for FakeRpc {
         if inner.fail_tip_queries {
             return Err(RpcError::Unavailable("injected tip unavailable".into()));
         }
-        if let Some(h) = inner.block_hashes.get(&number) {
-            return Ok(Some(*h));
-        }
-        // Deterministic synthetic tip hash when callers only set_tip.
-        let mut h = [0u8; 32];
-        h[..8].copy_from_slice(&number.to_le_bytes());
-        Ok(Some(h))
+        Ok(Some(inner.block_hash(number)))
     }
 
     fn get_header_by_number(&self, number: u64) -> Result<Option<Vec<u8>>, RpcError> {

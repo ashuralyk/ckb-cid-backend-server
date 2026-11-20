@@ -399,8 +399,19 @@ impl Rpc for CkbRpc {
         match status {
             "pending" | "proposed" => Ok(TxStatus::Pending),
             "committed" => {
-                let block_number = committed_block_number(self, &result)?;
-                Ok(TxStatus::Committed { block_number })
+                let block_hash = result
+                    .pointer("/tx_status/block_hash")
+                    .and_then(Value::as_str)
+                    .and_then(|hash| decode_hex(hash).ok())
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .ok_or_else(|| {
+                        RpcError::Unavailable("committed tx missing or invalid block_hash".into())
+                    })?;
+                let block_number = committed_block_number(self, &result, &block_hash)?;
+                Ok(TxStatus::Committed {
+                    block_number,
+                    block_hash,
+                })
             }
             _ => Ok(TxStatus::Dropped),
         }
@@ -619,26 +630,17 @@ fn format_rpc_transport_error(method: &str, err: ureq::Error) -> String {
     }
 }
 
-fn committed_block_number(rpc: &CkbRpc, tx: &Value) -> Result<u64, RpcError> {
+fn committed_block_number(
+    rpc: &CkbRpc,
+    tx: &Value,
+    block_hash: &[u8; 32],
+) -> Result<u64, RpcError> {
     if let Some(n) = tx.pointer("/tx_status/block_number") {
         if let Ok(v) = parse_uint(n) {
             return Ok(v);
         }
     }
-    let Some(hash) = tx.pointer("/tx_status/block_hash").and_then(|h| h.as_str()) else {
-        return Err(RpcError::Unavailable(
-            "committed tx missing block_number and block_hash".into(),
-        ));
-    };
-    let bytes = match decode_hex(hash) {
-        Ok(b) if b.len() == 32 => b,
-        _ => {
-            return Err(RpcError::Unavailable(
-                "committed tx invalid block_hash".into(),
-            ));
-        }
-    };
-    let header = rpc.rpc_call(&rpc.node_url, "get_header", json!([hex_bytes(&bytes)]))?;
+    let header = rpc.rpc_call(&rpc.node_url, "get_header", json!([hex_bytes(block_hash)]))?;
     if header.is_null() {
         return Err(RpcError::Unavailable(
             "get_header returned null (non-canonical or reorg)".into(),
@@ -1551,7 +1553,7 @@ mod tests {
             let i = n2.fetch_add(1, Ordering::SeqCst);
             match (i, method) {
                 (0, "get_transaction") => Ok(json!({
-                    "tx_status": {"status": "committed", "block_number": "0xa"}
+                    "tx_status": {"status": "committed", "block_number": "0xa", "block_hash": hex_bytes(&[0xac; 32])}
                 })),
                 (1, "get_transaction") => Ok(json!({
                     "tx_status": {
@@ -1568,11 +1570,17 @@ mod tests {
         let hash = Byte32::from_slice(&[1u8; 32]).unwrap();
         assert_eq!(
             rpc.get_transaction_status(&hash).unwrap(),
-            TxStatus::Committed { block_number: 10 }
+            TxStatus::Committed {
+                block_number: 10,
+                block_hash: [0xac; 32]
+            }
         );
         assert_eq!(
             rpc.get_transaction_status(&hash).unwrap(),
-            TxStatus::Committed { block_number: 21 }
+            TxStatus::Committed {
+                block_number: 21,
+                block_hash: [0xab; 32]
+            }
         );
         assert_eq!(rpc.tip_block_number().unwrap(), 32);
     }
@@ -1729,13 +1737,18 @@ mod tests {
     fn committed_explicit_height_zero_is_genesis_not_unknown() {
         let url = spawn_mock(Arc::new(|method, _| {
             assert_eq!(method, "get_transaction");
-            Ok(json!({"tx_status":{"status":"committed","block_number":"0x0"}}))
+            Ok(
+                json!({"tx_status":{"status":"committed","block_number":"0x0","block_hash":hex_bytes(&[0xac; 32])}}),
+            )
         }));
         let rpc = CkbRpc::new(&url, &url);
         let hash = Byte32::from_slice(&[1u8; 32]).unwrap();
         assert_eq!(
             rpc.get_transaction_status(&hash).unwrap(),
-            TxStatus::Committed { block_number: 0 }
+            TxStatus::Committed {
+                block_number: 0,
+                block_hash: [0xac; 32]
+            }
         );
     }
 
@@ -1747,8 +1760,10 @@ mod tests {
             assert_eq!(method, "get_transaction");
             let i = n2.fetch_add(1, Ordering::SeqCst);
             Ok(match i {
-                0 => json!({"tx_status":{"status":"committed"}}),
-                _ => json!({"tx_status":{"status":"committed","block_hash":"0x00"}}),
+                0 => json!({"tx_status":{"status":"committed","block_number":"0x0"}}),
+                _ => {
+                    json!({"tx_status":{"status":"committed","block_number":"0x0","block_hash":"0x00"}})
+                }
             })
         }));
         let rpc = CkbRpc::new(&url, &url);
@@ -1980,6 +1995,7 @@ mod tests {
                     Ok(json!({"number": "0x5a"}))
                 }
             }
+            "get_block_hash" => Ok(json!(hex_bytes(&[0xcd; 32]))),
             "get_tip_block_number" => Ok(json!(format!("0x{:x}", tip2.load(Ordering::SeqCst)))),
             other => host_query_or_dry_run(other, &params, &[intent.clone(), proc.clone()]),
         }));

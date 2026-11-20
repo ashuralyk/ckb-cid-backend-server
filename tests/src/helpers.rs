@@ -238,6 +238,19 @@ pub fn intention_cell(fill: u8, process_type_hash: [u8; 32], capacity: u64) -> L
     )
 }
 
+/// Distinct CID lock groups for tests that submit several Intentions together.
+pub fn distinct_intention_cell(fill: u8, process_type_hash: [u8; 32], capacity: u64) -> LiveCell {
+    let mut cell = intention_cell(fill, process_type_hash, capacity);
+    let mut user = user_lock();
+    user.args[0] = fill;
+    let args = CidArgs::new(process_type_hash, user, Payload { data: vec![0xAA] })
+        .encode()
+        .unwrap();
+    let lock = cell.lock().as_builder().args(args.pack()).build();
+    cell.output = cell.output.as_builder().lock(lock).build();
+    cell
+}
+
 pub fn intention_cell_with_lock(
     fill: u8,
     process_type_hash: [u8; 32],

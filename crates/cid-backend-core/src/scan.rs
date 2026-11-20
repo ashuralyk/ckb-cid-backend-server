@@ -44,6 +44,10 @@ impl ScannedIntention {
         intention_belongs_to_process(&self.protocol_lock(), cid_code_hash, process_type_hash)
     }
 
+    pub(crate) fn lock_group_key(&self) -> ([u8; 32], ScriptHashType, &[u8]) {
+        (self.lock_code_hash, self.lock_hash_type, &self.lock_args)
+    }
+
     pub fn lock_identity(&self) -> crate::fee::CidLockIdentity {
         crate::fee::CidLockIdentity::new(self.lock_code_hash, self.lock_hash_type)
     }

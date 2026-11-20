@@ -514,13 +514,9 @@ where
                     .retain(|hash, _| state.submit.pending.contains_key(hash));
                 state.probe_budget = process_batch::ProbeBudget::default();
                 state.refund_assembly_checked = false;
-                if let Some(polls) = state
-                    .exhausted_isolation
-                    .as_mut()
-                    .and_then(|exhausted| exhausted.polls_remaining.as_mut())
-                {
-                    *polls -= 1;
-                    if *polls == 0 {
+                if let Some(exhausted) = &mut state.exhausted_isolation {
+                    exhausted.polls_remaining -= 1;
+                    if exhausted.polls_remaining == 0 {
                         state.exhausted_isolation = None;
                     }
                 }
@@ -590,7 +586,7 @@ where
                     started = true;
                 }
             }
-            let more = self.wait_all_batches(&mut report, &buckets);
+            let more = self.wait_all_batches(&mut report);
             if !started || !more {
                 break;
             }
@@ -621,7 +617,7 @@ where
                 );
             }
         }
-        self.wait_all_batches(&mut report, &[]);
+        self.wait_all_batches(&mut report);
 
         self.tick_cell_deps.clear();
         self.clear_worker_tick_code();
@@ -726,14 +722,14 @@ where
             BatchOutcome::AssemblyChecked => {
                 worker.with_state_mut(|state| state.refund_assembly_checked = true);
             }
-            BatchOutcome::ProcessOccupied | BatchOutcome::ProbeCapped => {}
+            BatchOutcome::ProcessOccupied => {}
         }
         continue_round
     }
 
     /// Block until every outstanding RunBatch has an ack — never invent outcomes.
     /// Returns true when isolate should run another round this tick.
-    fn wait_all_batches(&mut self, report: &mut TickReport, buckets: &[FilteredBucket]) -> bool {
+    fn wait_all_batches(&mut self, report: &mut TickReport) -> bool {
         let mut more = false;
         loop {
             let mut any_outstanding = false;
@@ -742,19 +738,6 @@ where
                     continue;
                 };
                 if let Some(polled) = worker.try_poll_batch() {
-                    if polled.outcome == BatchOutcome::ProbeCapped {
-                        if let Some(bucket) = buckets.iter().find(|b| b.process.type_hash == hash) {
-                            let exhausted = process_batch::ExhaustedIsolation::new(
-                                &bucket.process,
-                                &self.batch_code_key(&bucket.process),
-                                bucket.accepted.iter(),
-                                true,
-                            );
-                            worker.with_state_mut(|state| {
-                                state.exhausted_isolation = Some(exhausted);
-                            });
-                        }
-                    }
                     if matches!(
                         polled.outcome,
                         BatchOutcome::Submitted | BatchOutcome::SubmittedProcess
@@ -862,7 +845,7 @@ where
                     worker.with_state_mut(|state| {
                         if let Some(pending) = state.submit.pending.get_mut(&hash_bytes) {
                             pending.currently_committed = false;
-                            if let Ok(TxStatus::Committed { block_number }) = status {
+                            if let Ok(TxStatus::Committed { block_number, .. }) = status {
                                 if !pending.seen_committed {
                                     pending.seen_committed = true;
                                     tracing::info!(
@@ -910,7 +893,10 @@ where
                             }
                         });
                     }
-                    Ok(TxStatus::Committed { block_number }) => {
+                    Ok(TxStatus::Committed {
+                        block_number,
+                        block_hash,
+                    }) => {
                         let start_tip = tip;
                         let Some(fresh_tip) = self.refresh_tip_only() else {
                             continue;
@@ -940,6 +926,19 @@ where
                                 tip = fresh_tip,
                             );
                             continue;
+                        }
+                        match self.rpc.get_block_hash(block_number) {
+                            Ok(Some(canonical_hash)) if canonical_hash == block_hash => {}
+                            Ok(_) => {
+                                tracing::warn!(target: LOG_TARGET, event = "pending.noncanonical",
+                                    tx_hash = %tx_hex, block_number);
+                                continue;
+                            }
+                            Err(error) => {
+                                tracing::warn!(target: LOG_TARGET, event = "pending.block_lookup",
+                                    tx_hash = %tx_hex, block_number, %error);
+                                continue;
+                            }
                         }
                         let confirmations = confirmation_count(fresh_tip, block_number);
                         if confirmations >= depth {
@@ -1204,7 +1203,14 @@ where
             return;
         }
 
-        if mode == BatchMode::CheckAssembly && bucket.len() < min as usize {
+        if mode == BatchMode::CheckAssembly
+            && bucket
+                .iter()
+                .map(ScannedIntention::lock_group_key)
+                .collect::<HashSet<_>>()
+                .len()
+                < min as usize
+        {
             if let Some(worker) = self.workers.get(&hash) {
                 worker.with_state_mut(|state| state.refund_assembly_checked = true);
             }
@@ -1318,9 +1324,20 @@ where
                 report.skipped += items.len();
                 continue;
             }
-            let n = items.len().min(max as usize);
-            let window = items[..n].to_vec();
-            let rest = items[n..].to_vec();
+            let mut locks = HashSet::new();
+            let mut window = Vec::new();
+            let mut rest = Vec::new();
+            for item in &items {
+                if window.len() < max as usize && locks.insert(item.lock_group_key()) {
+                    window.push(item.clone());
+                } else {
+                    rest.push(item.clone());
+                }
+            }
+            if window.len() < min as usize {
+                report.skipped += items.len();
+                continue;
+            }
             report.isolate_windows += 1;
             let fp = self.window_fingerprint(&window, process);
             let already = self
@@ -1419,8 +1436,7 @@ where
                 | BatchOutcome::Continue
                 | BatchOutcome::RetryLater
                 | BatchOutcome::RpcUnavailable
-                | BatchOutcome::ProbePending
-                | BatchOutcome::ProbeCapped => {
+                | BatchOutcome::ProbePending => {
                     if !rest.is_empty() {
                         stack.push(rest);
                     }
