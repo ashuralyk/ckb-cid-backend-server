@@ -22,7 +22,7 @@ use cid_process_executor::AssembledTx;
 use cid_protocol::CidArgs;
 use ckb_types::packed::{CellDep, CellOutput, OutPoint};
 use ckb_types::prelude::{Entity, Unpack};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -69,8 +69,6 @@ fn hex_pref(bytes: &[u8]) -> String {
 pub enum BatchOutcome {
     SubmittedProcess,
     Submitted,
-    Rejected,
-    CachedRejected,
     AssemblyChecked,
     Continue,
     ProcessOccupied,
@@ -78,7 +76,7 @@ pub enum BatchOutcome {
     RetryLater,
     /// Resume the current subset search within this tick.
     RetryIsolation,
-    /// The current window has no more subsets, so queued siblings can proceed.
+    /// The current candidates have no more subsets.
     IsolationExhausted,
     ProbePending,
     RpcUnavailable,
@@ -211,17 +209,6 @@ where
             report.skipped += batch.len();
             return (BatchOutcome::Continue, report);
         }
-        if mode != BatchMode::CheckAssembly
-            && worker.isolation_probe.is_none()
-            && window_combo_cached(&worker, &batch, process, execution_code_key)
-        {
-            tracing::debug!(
-                target: LOG_TARGET,
-                event = "submit.rejected_combo",
-                n = batch.len(),
-            );
-            return (BatchOutcome::CachedRejected, report);
-        }
         if worker.submit.pending_occupies(&process.live_cell.out_point)
             || worker.has_pending_filter_refund(&process.live_cell.out_point)
         {
@@ -283,9 +270,65 @@ where
     let prepare = |assembled: &AssembledTx, items: &[ScannedIntention]| {
         prepare_execution(rpc.as_ref(), assembled, items, process, max_size, cid_locks)
     };
-    let (probe, mut budget) = {
+    let (mut probe, mut budget) = {
         let mut worker = state.lock().expect("process worker state");
         (worker.isolation_probe.take(), worker.probe_budget)
+    };
+    let candidates: Vec<_> = batch.iter().chain(rest).collect();
+    let min_size = min as usize;
+    let max_size = batch.len();
+    let candidate_count = candidates.len();
+    let new_probe = |scan_number, rejected| {
+        IsolationProbe::new(candidate_count, min_size, max_size, scan_number, rejected)
+    };
+    let read_liveness = || {
+        candidates
+            .iter()
+            .map(|item| {
+                rpc.get_live_cell(&item.out_point)
+                    .map(|cell| cell.is_some())
+            })
+            .collect::<Result<Vec<_>, _>>()
+    };
+    let lookup_failed = |error| {
+        (
+            BatchOutcome::RetryLater,
+            BatchReportDelta {
+                skipped: max_size,
+                last_error: Some(format!("verify isolation candidate: {error}")),
+                ..BatchReportDelta::default()
+            },
+        )
+    };
+
+    let mut liveness = None;
+    if let Some(previous) = &probe {
+        if !previous.matches_shape(candidates.len(), min_size, max_size) {
+            probe = None;
+        } else if previous.scan_number != budget.scan_number {
+            let current = match read_liveness() {
+                Ok(current) => current,
+                Err(error) => return lookup_failed(error),
+            };
+            if previous.live.as_ref() != Some(&current) {
+                probe = None;
+            }
+            liveness = Some(current);
+        }
+    }
+
+    let cached = |items: &[ScannedIntention]| {
+        let rejected = mode != BatchMode::CheckAssembly
+            && window_combo_cached(
+                &state.lock().expect("process worker state"),
+                items,
+                process,
+                execution_code_key,
+            );
+        if rejected {
+            tracing::debug!(target: LOG_TARGET, event = "submit.rejected_combo", n = items.len());
+        }
+        rejected
     };
     // The pinned guest preserves occupied capacity and pays a positive fee
     // from the Process state for every batch. A funded state can still return
@@ -319,7 +362,13 @@ where
             },
         )
     };
-    let prepared = if probe.is_none() {
+    let initial_cached = probe.is_none() && cached(&batch);
+    let prepared = if probe.is_none()
+        && !initial_cached
+        && liveness
+            .as_ref()
+            .is_none_or(|live| live[..max_size].iter().all(|&is_live| is_live))
+    {
         match attempt(&batch) {
             Ok(assembled) => match prepare(&assembled, &batch) {
                 Err(PreparationError::NonLiveInput(op)) => {
@@ -349,42 +398,20 @@ where
     let prepared = if let Some(prepared) = prepared {
         prepared
     } else {
-        let candidates: Vec<_> = batch.iter().chain(rest).collect();
-        let mut probe = probe.unwrap_or_else(|| {
-            IsolationProbe::new(
-                candidates.len(),
-                min as usize,
-                batch.len(),
-                budget.scan_number,
-            )
-        });
-        let mut live = HashMap::new();
+        let mut probe = probe.unwrap_or_else(|| new_probe(budget.scan_number, initial_cached));
+        if probe.has_work() {
+            probe.live = match liveness.or(probe.live.take()) {
+                Some(live) => Some(live),
+                None => match read_liveness() {
+                    Ok(live) => Some(live),
+                    Err(error) => return lookup_failed(error),
+                },
+            };
+            probe.scan_number = budget.scan_number;
+        }
         let mut try_subset = |items: &[ScannedIntention]| {
-            if mode != BatchMode::CheckAssembly
-                && window_combo_cached(
-                    &state.lock().expect("process worker state"),
-                    items,
-                    process,
-                    execution_code_key,
-                )
-            {
+            if cached(items) {
                 return Ok(None);
-            }
-            for item in items {
-                let is_live = match live.get(&item.out_point) {
-                    Some(&is_live) => is_live,
-                    None => {
-                        let is_live = rpc
-                            .get_live_cell(&item.out_point)
-                            .map_err(|error| SsriError::Unusable(error.to_string()))?
-                            .is_some();
-                        live.insert(item.out_point.clone(), is_live);
-                        is_live
-                    }
-                };
-                if !is_live {
-                    return Ok(None);
-                }
             }
             match attempt(items) {
                 Ok(assembled) => match prepare(&assembled, items) {
@@ -414,7 +441,7 @@ where
         {
             let mut worker = state.lock().expect("process worker state");
             worker.probe_budget = budget;
-            if matches!(result, Ok(Some(_))) {
+            if pending && result.is_ok() {
                 worker.isolation_probe = Some(probe);
             }
         }
@@ -433,14 +460,15 @@ where
                 return mark_unfunded();
             }
             result => {
-                let checked = mode == BatchMode::CheckAssembly && result.is_ok();
+                let searched = result.is_ok();
+                let checked = mode == BatchMode::CheckAssembly && searched;
                 if let Err(error) = result {
                     tracing::warn!(target: LOG_TARGET, event = "assemble.probe_deferred",
                         process_type_hash = %hex_pref(&hash), %error);
                     report.last_error = Some(format!("assemble isolation: {error}"));
                 }
                 report.skipped += batch.len();
-                let outcome = if pending {
+                let outcome = if pending && searched {
                     BatchOutcome::ProbePending
                 } else if checked {
                     BatchOutcome::AssemblyChecked
@@ -451,19 +479,34 @@ where
             }
         }
     };
+    let retry_isolation = |worker: &mut ProcessWorkerState, rejected| {
+        let probe = match worker.isolation_probe.take() {
+            Some(mut probe) => {
+                probe.advance();
+                probe
+            }
+            None => new_probe(budget.scan_number, rejected),
+        };
+        if probe.has_work() {
+            worker.isolation_probe = Some(probe);
+            BatchOutcome::RetryIsolation
+        } else {
+            BatchOutcome::IsolationExhausted
+        }
+    };
+
     let skeleton = match prepared {
         Ok(skeleton) => skeleton,
         Err(PreparationError::Rejected) => {
             let mut worker = state.lock().expect("process worker state");
-            let isolation = advance_isolation(&mut worker);
-            let (outcome, delta) = record_invalid_assembled_reject(
+            record_invalid_assembled_reject(
                 &mut worker,
                 &batch,
                 process,
                 execution_code_key,
                 &mut report,
             );
-            return (isolation.unwrap_or(outcome), delta);
+            return (retry_isolation(&mut worker, true), report);
         }
         Err(PreparationError::InputLookup(error)) => {
             tracing::warn!(target: LOG_TARGET, event = "tick.skip",
@@ -493,7 +536,7 @@ where
     {
         let mut worker = state.lock().expect("process worker state");
         if worker.submit.rejected_combos.contains(&fp) {
-            let outcome = advance_isolation(&mut worker).unwrap_or(BatchOutcome::CachedRejected);
+            let outcome = retry_isolation(&mut worker, true);
             tracing::debug!(
                 target: LOG_TARGET,
                 event = "submit.rejected_combo",
@@ -510,28 +553,11 @@ where
         .map(|i| i.previous_output())
         .collect();
 
-    let isolate_conflict = |worker: &mut ProcessWorkerState| {
-        if let Some(outcome) = advance_isolation(worker) {
-            return outcome;
-        }
-        if batch.len() > min as usize || !rest.is_empty() {
-            worker.isolation_probe = Some(IsolationProbe::new(
-                batch.len() + rest.len(),
-                min as usize,
-                batch.len(),
-                budget.scan_number,
-            ));
-            BatchOutcome::RetryIsolation
-        } else {
-            BatchOutcome::IsolationExhausted
-        }
-    };
-
     // Dry-run without holding the state mutex.
     match dry_run_gate(rpc.as_ref(), &skeleton.tx) {
         DryRunGate::Rejected(m) => {
             let mut worker = state.lock().expect("process worker state");
-            let outcome = advance_isolation(&mut worker).unwrap_or(BatchOutcome::Rejected);
+            let outcome = retry_isolation(&mut worker, true);
             worker.submit.rejected_combos.insert(fp);
             tracing::warn!(
                 target: LOG_TARGET,
@@ -544,7 +570,7 @@ where
         }
         DryRunGate::Skip(RpcError::Conflict(m)) => {
             let mut worker = state.lock().expect("process worker state");
-            let outcome = isolate_conflict(&mut worker);
+            let outcome = retry_isolation(&mut worker, false);
             tracing::warn!(target: LOG_TARGET, event = "dry_run.conflict", error = %m);
             report.conflicts += 1;
             report.last_error = Some(format!("dry-run conflict: {m}"));
@@ -584,7 +610,7 @@ where
             }
         }
         Err(RpcError::Conflict(m)) => {
-            let outcome = isolate_conflict(&mut worker);
+            let outcome = retry_isolation(&mut worker, false);
             tracing::warn!(
                 target: LOG_TARGET,
                 event = "submit.conflict",
@@ -595,7 +621,7 @@ where
             (outcome, report)
         }
         Err(RpcError::SubmitRejected(m)) => {
-            let outcome = advance_isolation(&mut worker).unwrap_or(BatchOutcome::Rejected);
+            let outcome = retry_isolation(&mut worker, true);
             worker.submit.rejected_combos.insert(fp);
             tracing::warn!(
                 target: LOG_TARGET,
@@ -674,19 +700,23 @@ fn prepare_execution(
     Ok(skeleton)
 }
 
-/// Enumerate subsets within one tick. The digest loop redispatches the same
-/// window and rest when an isolated subset conflicts or is rejected.
+/// Enumerate subsets of the initial window and its remaining candidates.
 pub(crate) struct IsolationProbe {
     order: Vec<usize>,
+    min: usize,
     max: usize,
     indices: Option<Vec<usize>>,
+    preferred: Vec<Vec<usize>>,
+    next_preferred: usize,
+    live: Option<Vec<bool>>,
+    scan_number: u64,
 }
 
 impl IsolationProbe {
-    fn new(count: usize, min: usize, max: usize, scan_number: u64) -> Self {
+    fn new(count: usize, min: usize, max: usize, scan_number: u64, rejected: bool) -> Self {
         let mut order: Vec<_> = (0..count).collect();
-        // Keep nearby candidates first. For large searches, vary the rest
-        // with the scan number so a fixed prefix cannot claim every tick.
+        // Keep nearby candidates first. Vary the rest when a large search
+        // starts over so frequent arrivals cannot starve later candidates.
         if scan_number != 0 && exceeds_probe_budget(count, min, max) {
             order[(min + 1).min(count)..].sort_by_cached_key(|index| {
                 let mut hasher = DefaultHasher::new();
@@ -694,16 +724,31 @@ impl IsolationProbe {
                 hasher.finish()
             });
         }
-        let mut probe = Self {
-            order,
-            max,
-            indices: Some((0..min).collect()),
-        };
-        if max == min {
-            // The first subset is the original window and was already tried.
-            probe.advance();
+        // Rejected transactions try the smaller prefix and shifted window
+        // first, then use the same enumeration as assembly failures.
+        let mut preferred = Vec::new();
+        if rejected && max > 1 {
+            if max > min {
+                preferred.push((0..max - 1).collect());
+            }
+            if count > min {
+                preferred.push((1..(max + 1).min(count)).collect());
+            }
         }
-        probe
+        Self {
+            order,
+            min,
+            max,
+            indices: (count != min).then(|| (0..min).collect()),
+            preferred,
+            next_preferred: 0,
+            live: None,
+            scan_number,
+        }
+    }
+
+    fn matches_shape(&self, count: usize, min: usize, max: usize) -> bool {
+        self.order.len() == count && self.min == min && self.max == max
     }
 
     fn has_work(&self) -> bool {
@@ -717,13 +762,25 @@ impl IsolationProbe {
         attempt: &mut impl FnMut(&[ScannedIntention]) -> Result<Option<T>, SsriError>,
     ) -> Result<Option<(Vec<ScannedIntention>, T)>, SsriError> {
         while let Some(indices) = self.indices.as_ref().filter(|_| budget.remaining > 0) {
+            let positions = if let Some(preferred) = self.preferred.get(self.next_preferred) {
+                preferred.clone()
+            } else {
+                let mut positions: Vec<_> = indices.iter().map(|&i| self.order[i]).collect();
+                positions.sort_unstable(); // Preserve the candidate order within each batch.
+                let initial =
+                    positions.len() == self.max && positions.iter().copied().eq(0..self.max);
+                if initial || self.preferred.contains(&positions) {
+                    self.advance();
+                    continue;
+                }
+                positions
+            };
             budget.remaining -= 1;
-            let mut positions: Vec<_> = indices.iter().map(|&i| self.order[i]).collect();
-            positions.sort_unstable(); // Preserve the candidate order within each batch.
+            let live = self.live.as_ref().expect("subset liveness checked");
             let mut locks = HashSet::new();
             if positions
                 .iter()
-                .all(|&i| locks.insert(candidates[i].lock_group_key()))
+                .all(|&i| live[i] && locks.insert(candidates[i].lock_group_key()))
             {
                 let items: Vec<_> = positions.iter().map(|&i| candidates[i].clone()).collect();
                 if let Some(assembled) = attempt(&items)? {
@@ -736,6 +793,10 @@ impl IsolationProbe {
     }
 
     fn advance(&mut self) {
+        if self.next_preferred < self.preferred.len() {
+            self.next_preferred += 1;
+            return;
+        }
         let indices = self.indices.as_mut().expect("active subset search");
         // Exhaust nearby subsets before including a later candidate.
         for i in 0..indices.len() {
@@ -769,17 +830,6 @@ fn exceeds_probe_budget(count: usize, min: usize, max: usize) -> bool {
         remaining = next;
     }
     false
-}
-
-fn advance_isolation(worker: &mut ProcessWorkerState) -> Option<BatchOutcome> {
-    let probe = worker.isolation_probe.as_mut()?;
-    probe.advance();
-    if probe.has_work() {
-        Some(BatchOutcome::RetryIsolation)
-    } else {
-        worker.isolation_probe = None;
-        Some(BatchOutcome::IsolationExhausted)
-    }
 }
 
 fn mark_process_unhealthy(
@@ -1065,7 +1115,7 @@ fn record_invalid_assembled_reject(
     process: &ResolvedProcess,
     execution_code_key: &[u8],
     report: &mut BatchReportDelta,
-) -> (BatchOutcome, BatchReportDelta) {
+) {
     let intent_ops: Vec<_> = batch.iter().map(|i| i.out_point.clone()).collect();
     let fp = combo_fingerprint(
         &intent_ops,
@@ -1074,5 +1124,4 @@ fn record_invalid_assembled_reject(
     );
     worker.submit.rejected_combos.insert(fp);
     report.skipped += batch.len();
-    (BatchOutcome::Rejected, report.clone())
 }

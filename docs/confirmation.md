@@ -58,9 +58,8 @@ if these checks fail or the refund returns to the pool before settlement.
 | Status, tip, or block hash RPC unavailable | Keep occupancy until reconciliation succeeds. |
 
 Exit 41 quarantines a Process state/code pair. A replacement pair can run
-independently. The worker retains the old quarantine for the configured
-confirmation window after it first observes a replacement, so the fault still
-blocks assembly and filter refunds if the pair returns in a reorg.
+independently. The worker retains the old quarantine for its lifetime, so the
+fault still blocks assembly and filter refunds if the pair returns in a reorg.
 
 After a restart there is no pending set, so a still-mempool tx may be submitted
 again (same as v0 D6). Cells already consumed surface as `Conflict`.
@@ -89,31 +88,29 @@ written to `rejected`.
 
 **Combo isolation.** A rejected digest fingerprint includes the ordered
 Intention outpoints, the spent Process state outpoint, and the execution code
-identity. The worker splits the window into legal `[min, max]` sub-batches
-(shrink prefix or drop the first item) so a valid sibling can still submit.
+identity. The worker tries smaller or shifted windows and searches the
+remaining legal subsets, including noncontiguous batches.
 A rejected filter refund fingerprints the singleton Intention, the authorizing
 Process state dependency, and the execution code identity, with a tag for the
 refund path. A replacement state has a different outpoint, so the worker can
 reconsider the refund after a fresh filter verdict of 4–7 and matching node
 snapshots for the Intention, replacement state, and code.
 
-Each Process can dispatch at most 64 assembly worker jobs per tick. A separate
-cap of 256 cached splits bounds expansion of rejected windows. Each rejected
-window fingerprint is expanded at most once per tick. A cache hit skips
-assembly and submission while still allowing the window to split. The worker
-uses the ELF from the registered Process code cell and verifies the indexed
-Process state against the node before filtering or assembly.
+Each Process can dispatch at most 64 assembly worker jobs and consider at
+most 64 subset probes per tick. A cache hit skips assembly and submission
+for that combination. The worker uses the ELF from the registered Process
+code cell and verifies the indexed Process state against the node before
+filtering or assembly.
 
-Assembly failures also share a budget of 64 subset probes per Process per
-tick. Window expansion and subset probing start fresh with each tick's
-accepted candidates, including Intentions revived by a reorg. Probe order varies
-between ticks for large candidate sets. Windows and probes select at most one input per full CID lock script. Probes skip non-live
-Intentions and subsets with non-live guest-added funding inputs. An unavailable
-funding lookup defers the search to the next tick. A conflict at dry-run or
-submission starts or advances isolation within the tick if alternatives and
-budget remain. A structurally invalid transaction advances the search during
-a deferred refund’s assembly check. The refund stays deferred if the budget
-runs out before that check completes.
+An unfinished search resumes only if the indexed candidates, their node
+liveness, and the Process snapshot match. An arrival, removal, or revival
+starts a fresh search. Large searches vary candidate order when restarting.
+Windows and probes select at most one input per full CID lock script. Probes
+skip non-live Intentions and subsets with non-live guest-added funding inputs.
+An unavailable liveness lookup defers the search to the next tick. A
+structurally invalid transaction advances the search during a deferred
+refund’s assembly check. The refund stays deferred if the budget runs out
+before that check completes.
 
 For the audited v0.1.4 example ELF, exit 37 on a Process state with zero fee
 headroom pauses assembly until the state or Process code changes. Other guests

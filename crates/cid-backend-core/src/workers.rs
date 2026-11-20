@@ -14,7 +14,7 @@ use crate::ssri::SsriHost;
 use crate::submit::SubmitState;
 use crate::worker_commands::WorkerCommands;
 use ckb_types::packed::{CellDep, OutPoint};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -38,6 +38,20 @@ fn process_snapshot(process: &ResolvedProcess) -> (OutPoint, Option<OutPoint>) {
     )
 }
 
+/// Inputs that must match before a worker can resume across ticks.
+#[derive(PartialEq, Eq)]
+pub(crate) struct IsolationContext {
+    pub(crate) indexed: Vec<OutPoint>,
+    pub(crate) accepted: Vec<OutPoint>,
+    pub(crate) process: OutPoint,
+    pub(crate) guest_hash: [u8; 32],
+    pub(crate) code_key: Vec<u8>,
+    pub(crate) deps: Vec<CellDep>,
+    pub(crate) cid_locks: Arc<[CidLockIdentity]>,
+    pub(crate) max_tx_bytes: usize,
+    pub(crate) mode: BatchMode,
+}
+
 /// Per-Process mutable state (digest thread and worker thread via lock).
 pub struct ProcessWorkerState {
     pub entry: ProcessEntry,
@@ -48,14 +62,14 @@ pub struct ProcessWorkerState {
     pub(crate) refund_assembly_checked: bool,
     /// State dependencies of submitted filter refunds, keyed by transaction.
     pub(crate) refund_state_deps: HashMap<Vec<u8>, OutPoint>,
-    /// Subset progress for follow-up worker jobs within the current tick.
+    isolation_context: Option<IsolationContext>,
+    /// Unfinished subset search for the current candidate and Process snapshot.
     pub(crate) isolation_probe: Option<IsolationProbe>,
     unfunded_process: Option<(OutPoint, Option<OutPoint>)>,
     pub(crate) probe_budget: ProbeBudget,
     pub generation: u64,
-    /// Exit 41 quarantines a state/code pair. The height is the first tip
-    /// where a replacement was observed, if the pair is no longer current.
-    quarantines: HashMap<(OutPoint, Option<OutPoint>), Option<u64>>,
+    /// Exit 41 quarantines a state/code pair for the lifetime of the worker.
+    quarantines: HashSet<(OutPoint, Option<OutPoint>)>,
     pub(crate) filter_missing_logged: bool,
     last_process_code: Option<OutPoint>,
 }
@@ -75,11 +89,12 @@ impl ProcessWorkerState {
             filter_refund_deferred: false,
             refund_assembly_checked: false,
             refund_state_deps: HashMap::new(),
+            isolation_context: None,
             isolation_probe: None,
             unfunded_process: None,
             probe_budget: ProbeBudget::default(),
             generation,
-            quarantines: HashMap::new(),
+            quarantines: HashSet::new(),
             filter_missing_logged: false,
             last_process_code: None,
         }
@@ -98,31 +113,18 @@ impl ProcessWorkerState {
     }
 
     pub(crate) fn quarantine_process(&mut self, process: &ResolvedProcess) {
-        self.quarantines.insert(process_snapshot(process), None);
+        self.quarantines.insert(process_snapshot(process));
     }
 
     pub(crate) fn is_process_quarantined(&self, process: &ResolvedProcess) -> bool {
-        self.quarantines.contains_key(&process_snapshot(process))
+        self.quarantines.contains(&process_snapshot(process))
     }
 
-    pub(crate) fn refresh_quarantines(
-        &mut self,
-        process: &ResolvedProcess,
-        tip: Option<u64>,
-        depth: u64,
-    ) {
-        let current = process_snapshot(process);
-        // An unavailable code lookup does not establish a replacement.
-        let tip = tip.filter(|_| process.code_cell.is_some());
-        self.quarantines.retain(|snapshot, replaced_at| {
-            if snapshot == &current {
-                *replaced_at = None;
-            } else if let Some(tip) = tip {
-                let height = *replaced_at.get_or_insert(tip);
-                return tip.saturating_sub(height) < depth.max(1);
-            }
-            true
-        });
+    pub(crate) fn set_isolation_context(&mut self, context: Option<IsolationContext>) {
+        if self.isolation_context != context {
+            self.isolation_probe = None;
+            self.isolation_context = context;
+        }
     }
 
     pub(crate) fn mark_process_unfunded(&mut self, process: &ResolvedProcess) {
@@ -175,12 +177,8 @@ enum ProcessWorkerJob {
 
 struct PendingBatch {
     reply: Receiver<(BatchOutcome, BatchReportDelta)>,
-    /// Isolate window fingerprint for the outstanding batch (digest loop).
-    window_fp: Vec<u8>,
-    /// Window + rest + min so Rejected can push the sync drop_first/shrink frames.
     window: Vec<ScannedIntention>,
     rest: Arc<[ScannedIntention]>,
-    min: u32,
     mode: BatchMode,
 }
 
@@ -188,10 +186,8 @@ struct PendingBatch {
 pub struct PolledBatch {
     pub outcome: BatchOutcome,
     pub delta: BatchReportDelta,
-    pub window_fp: Vec<u8>,
     pub window: Vec<ScannedIntention>,
     pub rest: Arc<[ScannedIntention]>,
-    pub min: u32,
     pub mode: BatchMode,
 }
 
@@ -253,10 +249,8 @@ impl ProcessWorker {
                 Some(PolledBatch {
                     outcome: result.0,
                     delta: result.1,
-                    window_fp: pending.window_fp,
                     window: pending.window,
                     rest: pending.rest,
-                    min: pending.min,
                     mode: pending.mode,
                 })
             }
@@ -270,10 +264,8 @@ impl ProcessWorker {
                         last_error: Some("worker dead: RunBatch reply channel closed".into()),
                         ..BatchReportDelta::default()
                     },
-                    window_fp: pending.window_fp,
                     window: pending.window,
                     rest: pending.rest,
-                    min: pending.min,
                     mode: pending.mode,
                 })
             }
@@ -294,7 +286,6 @@ impl ProcessWorker {
         cid_locks: Arc<[CidLockIdentity]>,
         refund_policy: RefundPolicy,
         max_assembled_tx_bytes: usize,
-        window_fp: Vec<u8>,
         rest: Vec<ScannedIntention>,
         min: u32,
         mode: BatchMode,
@@ -335,10 +326,8 @@ impl ProcessWorker {
         let mut slot = self.pending.lock().expect("pending batch");
         *slot = Some(PendingBatch {
             reply: reply_rx,
-            window_fp,
             window: batch,
             rest,
-            min,
             mode,
         });
         Ok(())

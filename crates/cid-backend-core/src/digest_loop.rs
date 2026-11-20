@@ -7,16 +7,16 @@ use crate::process_busy::ProcessBusyMap;
 use crate::rpc::{out_point_key, Rpc, RpcError, TxStatus};
 use crate::scan::{bucket_by_process_type_hash, scan_intentions_multi, ScannedIntention};
 use crate::ssri::{filter_intentions, SsriError, SsriHost};
-use crate::submit::{combo_fingerprint, execution_code_key, SubmitState};
+use crate::submit::{execution_code_key, SubmitState};
 use crate::type_id::TypeIdCodeDep;
 pub use crate::worker_commands::{WorkerCommand, WorkerCommands};
-use crate::workers::{WorkerPool, WorkerRemoveError};
+use crate::workers::{IsolationContext, WorkerPool, WorkerRemoveError};
 use cid_intention_filter::{
     FILTER_ACCEPTED, FILTER_DEPOSIT_BELOW_MINIMUM, FILTER_MALFORMED_DIGEST,
     FILTER_UNSUPPORTED_ACTION, FILTER_UNSUPPORTED_ASSET,
 };
 use ckb_types::core::ScriptHashType;
-use ckb_types::packed::{Byte32, CellDep};
+use ckb_types::packed::{Byte32, CellDep, CellOutput, OutPoint};
 use ckb_types::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -96,21 +96,20 @@ pub struct TickReport {
     pub scan_ok: bool,
     /// Last scan/submit error on this tick, if any.
     pub last_error: Option<String>,
-    /// Isolate windows considered this tick (including cached splits).
+    /// Assembly windows dispatched this tick.
     pub isolate_windows: usize,
 }
 
 struct FilteredBucket {
+    indexed: Vec<OutPoint>,
     process: ResolvedProcess,
     accepted: Vec<ScannedIntention>,
     refunds: Vec<ScannedIntention>,
 }
 
-/// Window expansion lives only as long as the current scan.
 struct WindowSearch {
-    pending: Vec<Vec<ScannedIntention>>,
-    expanded: HashSet<Vec<u8>>,
-    cached_splits: usize,
+    pending: Option<Vec<ScannedIntention>>,
+    mode: BatchMode,
 }
 
 pub trait Clock {
@@ -443,6 +442,7 @@ where
                 );
                 report.last_error = Some(format!("code deps: {e}"));
                 self.clear_worker_tick_code();
+                self.clear_isolation_contexts();
                 self.tick_cell_deps.clear();
                 self.sync_busy_map();
                 return report;
@@ -488,6 +488,7 @@ where
                 report.last_error = Some(format!("scan unavailable: {m}"));
                 self.tick_cell_deps.clear();
                 self.clear_worker_tick_code();
+                self.clear_isolation_contexts();
                 self.sync_busy_map();
                 return report;
             }
@@ -500,6 +501,7 @@ where
                 report.last_error = Some(format!("scan error: {e}"));
                 self.tick_cell_deps.clear();
                 self.clear_worker_tick_code();
+                self.clear_isolation_contexts();
                 self.sync_busy_map();
                 return report;
             }
@@ -549,6 +551,7 @@ where
                     report.skipped += bucket.len();
                     return None;
                 }
+                let indexed = bucket.iter().map(|item| item.out_point.clone()).collect();
                 worker.with_state(|state| {
                     let pending = state.submit.pending_occupied_keys();
                     bucket.retain(|item| {
@@ -561,22 +564,54 @@ where
                 if bucket.is_empty() {
                     return None;
                 }
-                self.prepare_bucket(hash, bucket, tip.and(self.last_tip), &mut report)
+                self.prepare_bucket(hash, bucket, indexed, &mut report)
             })
             .collect();
         let mut searches: HashMap<_, _> = buckets
             .iter()
             .map(|bucket| {
+                let process = &bucket.process;
+                let worker = self.workers.get(&process.type_hash).expect("bucket worker");
+                let mode = worker.with_state_mut(|state| {
+                    let mode = if !bucket.refunds.is_empty() && state.filter_refund_deferred {
+                        BatchMode::CheckAssembly
+                    } else {
+                        BatchMode::Assemble
+                    };
+                    state.set_isolation_context(Some(IsolationContext {
+                        indexed: bucket.indexed.clone(),
+                        accepted: bucket
+                            .accepted
+                            .iter()
+                            .map(|item| item.out_point.clone())
+                            .collect(),
+                        process: process.live_cell.out_point.clone(),
+                        guest_hash: CellOutput::calc_data_hash(&process.binary).unpack(),
+                        code_key: self.batch_code_key(process),
+                        deps: self.tick_cell_deps.clone(),
+                        cid_locks: self.tick_cid_locks.clone(),
+                        max_tx_bytes: self.config.max_assembled_tx_bytes,
+                        mode,
+                    }));
+                    mode
+                });
                 (
-                    bucket.process.type_hash,
+                    process.type_hash,
                     WindowSearch {
-                        pending: vec![bucket.accepted.clone()],
-                        expanded: HashSet::new(),
-                        cached_splits: 0,
+                        pending: Some(bucket.accepted.clone()),
+                        mode,
                     },
                 )
             })
             .collect();
+        self.workers.for_each_mut(|worker| {
+            worker.with_state_mut(|state| {
+                if !searches.contains_key(&state.process_type_hash()) {
+                    state.set_isolation_context(None);
+                }
+            });
+        });
+
         // Give each Process one worker job per round, then handle its result.
         for _ in 0..64 {
             let mut started = false;
@@ -586,27 +621,16 @@ where
                     continue;
                 };
                 let search = searches.get_mut(hash).expect("scan window search");
-                if search.pending.is_empty() {
-                    continue;
+                if search.pending.is_some() {
+                    self.process_bucket(&bucket.process, search, &mut report);
+                    started |= worker.batch_outstanding();
                 }
-                let mode = if !bucket.refunds.is_empty()
-                    && worker.with_state(|state| state.filter_refund_deferred)
-                {
-                    BatchMode::CheckAssembly
-                } else {
-                    BatchMode::Assemble
-                };
-                self.process_bucket(&bucket.process, search, mode, &mut report);
-                started |= worker.batch_outstanding();
             }
             if !started {
                 break;
             }
             self.wait_all_batches(&mut report, &mut searches);
         }
-        self.workers.for_each_mut(|worker| {
-            worker.with_state_mut(|state| state.isolation_probe = None);
-        });
 
         // Wait for assembly to finish first. A Process state fault discovered
         // by assemble must also stop refunds authorized by its filter.
@@ -640,31 +664,6 @@ where
         report
     }
 
-    /// Sync Rejected/CachedRejected stack frames: drop_first(+rest) then shrink.
-    /// Returns frames in push order (shrink is last / popped first) and skipped.
-    fn reject_isolate_frames(
-        window: &[ScannedIntention],
-        rest: &[ScannedIntention],
-        min: u32,
-    ) -> (Vec<Vec<ScannedIntention>>, usize) {
-        let mut drop_first = window[1..].to_vec();
-        drop_first.extend_from_slice(rest);
-        let mut frames = Vec::new();
-        let mut skipped = 0usize;
-        if window.len() > min as usize {
-            if !drop_first.is_empty() {
-                frames.push(drop_first);
-            }
-            frames.push(window[..window.len() - 1].to_vec());
-        } else {
-            skipped = 1;
-            if !drop_first.is_empty() {
-                frames.push(drop_first);
-            }
-        }
-        (frames, skipped)
-    }
-
     fn apply_polled_batch(
         worker: &crate::workers::ProcessWorker,
         report: &mut TickReport,
@@ -676,40 +675,34 @@ where
             return;
         }
         let search = search.expect("scan window search");
-        match polled.outcome {
+        search.pending = match polled.outcome {
             BatchOutcome::RetryIsolation => {
                 let mut items = polled.window;
                 items.extend_from_slice(&polled.rest);
-                search.pending.push(items);
+                Some(items)
             }
-            BatchOutcome::Rejected | BatchOutcome::CachedRejected => {
-                let (frames, skipped) =
-                    Self::reject_isolate_frames(&polled.window, &polled.rest, polled.min);
-                report.skipped += skipped;
-                search.expanded.insert(polled.window_fp);
-                search.pending.extend(frames);
-            }
-            BatchOutcome::IsolationExhausted => {}
-            BatchOutcome::Submitted => {
-                if !polled.rest.is_empty() {
-                    search.pending.push(polled.rest.to_vec());
+            BatchOutcome::ProbePending => None,
+            outcome => {
+                worker.with_state_mut(|state| {
+                    state.isolation_probe = None;
+                    if outcome == BatchOutcome::AssemblyChecked {
+                        state.refund_assembly_checked = true;
+                    }
+                });
+                match outcome {
+                    BatchOutcome::Submitted => Some(polled.rest.to_vec()),
+                    BatchOutcome::Continue
+                        if polled.delta.conflicts == 0
+                            && polled.delta.last_error.is_none()
+                            && polled.delta.skipped > 0 =>
+                    {
+                        Some(polled.rest.to_vec())
+                    }
+                    _ => None,
                 }
+                .filter(|rest| !rest.is_empty())
             }
-            BatchOutcome::Continue
-                if polled.delta.conflicts == 0
-                    && polled.delta.last_error.is_none()
-                    && polled.delta.skipped > 0 =>
-            {
-                if !polled.rest.is_empty() {
-                    search.pending.push(polled.rest.to_vec());
-                }
-            }
-            BatchOutcome::AssemblyChecked => {
-                worker.with_state_mut(|state| state.refund_assembly_checked = true);
-                search.pending.clear();
-            }
-            _ => search.pending.clear(),
-        }
+        };
     }
 
     /// Block until every outstanding RunBatch has an ack.
@@ -780,6 +773,12 @@ where
     fn clear_worker_tick_code(&mut self) {
         self.workers.for_each_mut(|w| {
             w.with_state_mut(|state| state.resolver.set_tick_process_code(None));
+        });
+    }
+
+    fn clear_isolation_contexts(&mut self) {
+        self.workers.for_each_mut(|worker| {
+            worker.with_state_mut(|state| state.set_isolation_context(None));
         });
     }
 
@@ -1005,7 +1004,7 @@ where
         &self,
         hash: [u8; 32],
         mut bucket: Vec<ScannedIntention>,
-        tip: Option<u64>,
+        indexed: Vec<OutPoint>,
         report: &mut TickReport,
     ) -> Option<FilteredBucket> {
         let worker = self.workers.get(&hash)?;
@@ -1021,9 +1020,6 @@ where
                 return None;
             }
         };
-        worker.with_state_mut(|state| {
-            state.refresh_quarantines(&process, tip, self.config.confirmation_depth)
-        });
         if !self.process_is_healthy(&process) {
             report.skipped += bucket.len();
             return None;
@@ -1104,6 +1100,7 @@ where
         }
 
         Some(FilteredBucket {
+            indexed,
             process,
             accepted,
             refunds,
@@ -1114,13 +1111,12 @@ where
         &self,
         process: &ResolvedProcess,
         search: &mut WindowSearch,
-        mode: BatchMode,
         report: &mut TickReport,
     ) {
-        if !self.process_is_healthy(process) {
-            search.pending.clear();
+        let Some(mut items) = search.pending.take() else {
             return;
-        }
+        };
+        let mode = search.mode;
         let hash = process.type_hash;
         let Some(worker) = self.workers.get(&hash) else {
             return;
@@ -1132,15 +1128,10 @@ where
                 }
                 return true;
             }
-            state.probe_budget.remaining == 0
-                || (mode == BatchMode::CheckAssembly && state.refund_assembly_checked)
+            state.probe_budget.remaining == 0 || state.is_process_quarantined(process)
         });
         if paused {
-            report.skipped += search
-                .pending
-                .drain(..)
-                .map(|frame| frame.len())
-                .sum::<usize>();
+            report.skipped += items.len();
             return;
         }
         let (min, max) = match self.ssri.get_batch_bounds(&process.binary) {
@@ -1152,11 +1143,8 @@ where
                     reason = "batch_bounds",
                     error = %e,
                 );
-                report.skipped += search
-                    .pending
-                    .drain(..)
-                    .map(|frame| frame.len())
-                    .sum::<usize>();
+                worker.with_state_mut(|state| state.isolation_probe = None);
+                report.skipped += items.len();
                 return;
             }
         };
@@ -1168,70 +1156,42 @@ where
                 min,
                 max,
             );
-            report.skipped += search
-                .pending
-                .drain(..)
-                .map(|frame| frame.len())
-                .sum::<usize>();
+            worker.with_state_mut(|state| state.isolation_probe = None);
+            report.skipped += items.len();
             return;
         }
 
-        while let Some(mut items) = search.pending.pop() {
-            worker.with_state(|s| {
-                items.retain(|item| !s.submit.in_flight.contains(&out_point_key(&item.out_point)));
+        worker.with_state(|state| {
+            items.retain(|item| {
+                !state
+                    .submit
+                    .in_flight
+                    .contains(&out_point_key(&item.out_point))
             });
-            let mut locks = HashSet::new();
-            let mut window = Vec::new();
-            let mut rest = Vec::new();
-            for item in &items {
-                if window.len() < max as usize && locks.insert(item.lock_group_key()) {
-                    window.push(item.clone());
-                } else {
-                    rest.push(item.clone());
-                }
+        });
+        let mut locks = HashSet::new();
+        let mut window = Vec::new();
+        let mut rest = Vec::new();
+        for item in &items {
+            if window.len() < max as usize && locks.insert(item.lock_group_key()) {
+                window.push(item.clone());
+            } else {
+                rest.push(item.clone());
             }
-            if window.len() < min as usize {
+        }
+        if window.len() < min as usize {
+            worker.with_state_mut(|state| {
+                state.isolation_probe = None;
                 if mode == BatchMode::CheckAssembly {
-                    worker.with_state_mut(|state| state.refund_assembly_checked = true);
+                    state.refund_assembly_checked = true;
                 }
-                report.skipped += window.len() + rest.len();
-                continue;
-            }
-
-            report.isolate_windows += 1;
-            let fp = self.window_fingerprint(&window, process);
-            let resuming_probe = worker.with_state(|state| state.isolation_probe.is_some());
-            if !resuming_probe && search.expanded.contains(&fp) {
-                continue;
-            }
-            if !resuming_probe
-                && mode != BatchMode::CheckAssembly
-                && self.window_combo_cached(&hash, &window, process)
-            {
-                const MAX_CACHED_SPLITS: usize = 256;
-                if search.cached_splits >= MAX_CACHED_SPLITS {
-                    tracing::warn!(target: LOG_TARGET, event = "tick.skip",
-                        reason = "cached_split_budget", cached_splits = search.cached_splits);
-                    report.skipped += window.len()
-                        + rest.len()
-                        + search
-                            .pending
-                            .drain(..)
-                            .map(|frame| frame.len())
-                            .sum::<usize>();
-                    return;
-                }
-                search.cached_splits += 1;
-                search.expanded.insert(fp);
-                let (frames, skipped) = Self::reject_isolate_frames(&window, &rest, min);
-                report.skipped += skipped;
-                search.pending.extend(frames);
-                continue;
-            }
-
-            self.dispatch_process_batch(hash, process, window, rest, min, report, mode);
+            });
+            report.skipped += window.len() + rest.len();
             return;
         }
+
+        report.isolate_windows += 1;
+        self.dispatch_process_batch(hash, process, window, rest, min, report, mode);
     }
 
     fn batch_code_key(&self, process: &ResolvedProcess) -> Vec<u8> {
@@ -1240,33 +1200,6 @@ where
             key.extend_from_slice(cell.out_point.as_slice());
         }
         key
-    }
-
-    fn window_fingerprint(&self, batch: &[ScannedIntention], process: &ResolvedProcess) -> Vec<u8> {
-        let ops: Vec<_> = batch.iter().map(|i| i.out_point.clone()).collect();
-        combo_fingerprint(
-            &ops,
-            Some(&process.live_cell.out_point),
-            &self.batch_code_key(process),
-        )
-    }
-
-    fn window_combo_cached(
-        &self,
-        hash: &[u8; 32],
-        batch: &[ScannedIntention],
-        process: &ResolvedProcess,
-    ) -> bool {
-        self.workers.get(hash).is_some_and(|w| {
-            w.with_state(|state| {
-                process_batch::window_combo_cached(
-                    state,
-                    batch,
-                    process,
-                    &self.batch_code_key(process),
-                )
-            })
-        })
     }
 
     fn apply_batch_report(report: &mut TickReport, delta: &BatchReportDelta) {
@@ -1305,7 +1238,6 @@ where
         } else {
             self.config.max_assembled_tx_bytes
         };
-        let window_fp = self.window_fingerprint(&batch, process);
         match worker.start_batch(
             process.clone(),
             batch,
@@ -1314,7 +1246,6 @@ where
             self.tick_cid_locks.clone(),
             self.config.refund_policy.clone(),
             max_size,
-            window_fp,
             rest,
             min,
             mode,

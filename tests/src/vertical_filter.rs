@@ -777,6 +777,141 @@ mod tests {
     }
 
     #[test]
+    fn deferred_filter_refund_resumes_after_more_than_one_tick_of_exit_32() {
+        let (rpc, _, ops) = chain(68);
+        rpc.defer_commit();
+        let refundable = ops[67].clone();
+        let digest_input = ops[0].clone();
+        let ssri = ScriptedSsri::mimic((1, 1))
+            .with_filter(|n| {
+                let mut reasons = vec![0; n];
+                // The refundable item is the last cell in the short second chunk.
+                if n < 64 {
+                    reasons[n - 1] = 5;
+                }
+                Ok(reasons)
+            })
+            .with_assembly_error(move |inputs, _| (!inputs.contains(&digest_input)).then_some(32));
+        let mut loop_ = loop_with_resolver(rpc, ssri, default_loop_config(), 1);
+        assert_eq!(loop_.tick().submitted, 1);
+        let digest = loop_.rpc().submitted()[0].hash();
+        loop_.rpc().commit_pending(&digest);
+
+        assert_eq!(loop_.tick().submitted, 0, "first 65 attempts fail assembly");
+        let report = loop_.tick();
+        assert_eq!(report.submitted, 1, "{report:?}");
+        assert_eq!(input_sets(loop_.rpc())[1], [refundable]);
+        assert!(ops[1..67].iter().all(|op| loop_.rpc().has_cell(op)));
+    }
+
+    #[test]
+    fn batch_search_resumes_after_failing_singletons_use_the_tick_budget() {
+        let (rpc, state, ops) = chain(80);
+        let viable = [ops[0].clone(), ops[1].clone()];
+        let expected = [viable[0].clone(), viable[1].clone(), state.out_point];
+        let ssri = ScriptedSsri::mimic((1, 3)).with_assembly_error(move |inputs, _| {
+            (inputs[..inputs.len() - 1] != viable).then_some(39)
+        });
+        let mut loop_ = loop_with_resolver(rpc, ssri, default_loop_config(), 1);
+        assert_eq!(loop_.tick().submitted, 0);
+        assert_eq!(loop_.ssri().seen_binaries.lock().unwrap().len(), 66);
+        assert_eq!(loop_.tick().submitted, 1);
+        assert_eq!(input_sets(loop_.rpc()), [expected]);
+    }
+
+    #[test]
+    fn node_liveness_change_restarts_an_unchanged_indexer_set() {
+        let (rpc, state, ops) = chain(80);
+        let revived = ops[1].clone();
+        rpc.mark_indexer_cell_stale(revived.clone());
+        let viable = [revived.clone(), ops[2].clone()];
+        let expected = [viable[0].clone(), viable[1].clone(), state.out_point];
+        let ssri = ScriptedSsri::mimic((2, 2))
+            .with_assembly_error(move |inputs, _| (inputs[..2] != viable).then_some(39));
+        let mut loop_ = loop_with_resolver(rpc, ssri, default_loop_config(), 1);
+        assert_eq!(loop_.tick().submitted, 0);
+        loop_.rpc().restore_indexer_cell_liveness(&revived);
+        assert_eq!(loop_.tick().submitted, 1);
+        assert_eq!(input_sets(loop_.rpc()), [expected]);
+    }
+
+    #[test]
+    fn a_replaced_candidate_or_process_state_restarts_the_search() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        for replace_state in [false, true] {
+            let (rpc, mut state, ops) = chain(80);
+            let viable = [ops[0].clone(), ops[1].clone()];
+            let changed = Arc::new(AtomicBool::new(false));
+            let observe_change = changed.clone();
+            let ssri = ScriptedSsri::mimic((2, 2)).with_assembly_error(move |inputs, _| {
+                (!observe_change.load(Ordering::Relaxed) || inputs[..2] != viable).then_some(39)
+            });
+            let mut loop_ = loop_with_resolver(rpc, ssri, default_loop_config(), 1);
+            assert_eq!(loop_.tick().submitted, 0);
+
+            if replace_state {
+                loop_.rpc().consume(&state.out_point);
+                state.out_point = out_point(0x51, 1);
+                loop_.rpc().insert_cell(state.clone());
+            } else {
+                // Keep the candidate count and every node liveness bit the same.
+                loop_.rpc().consume(&ops[79]);
+                loop_.rpc().insert_cell(filter_intention(81, 600_0000_0000));
+            }
+            changed.store(true, Ordering::Relaxed);
+            assert_eq!(loop_.tick().submitted, 1);
+            assert_eq!(
+                input_sets(loop_.rpc()),
+                [vec![ops[0].clone(), ops[1].clone(), state.out_point]]
+            );
+        }
+    }
+
+    #[test]
+    fn rejected_pairs_still_allow_noncontiguous_pairs() {
+        for stage in ["dry-run", "submit", "cached"] {
+            let (rpc, state, ops) = chain(3);
+            let mut loop_ =
+                loop_with_resolver(rpc, ScriptedSsri::mimic((2, 2)), default_loop_config(), 1);
+            match stage {
+                "dry-run" => loop_.rpc().reject_dry_run_when_consuming(ops[1].clone()),
+                "submit" => loop_.rpc().reject_when_consuming(&ops[1]),
+                _ => {
+                    // Let code discovery initialize the rejection cache first.
+                    loop_.rpc().inject_unavailable_dry_run_once();
+                    assert_eq!(loop_.tick().submitted, 0);
+                    let mut code_key = loop_.state().execution_code_key;
+                    code_key.extend_from_slice(out_point(0xA0, 0).as_slice());
+                    let worker = loop_.workers().get(&process_type_hash(1)).unwrap();
+                    worker.with_state_mut(|worker| {
+                        for pair in [&ops[..2], &ops[1..]] {
+                            worker.submit.rejected_combos.insert(
+                                cid_backend_core::submit::combo_fingerprint(
+                                    pair,
+                                    Some(&state.out_point),
+                                    &code_key,
+                                ),
+                            );
+                        }
+                    });
+                }
+            }
+            let before = loop_.rpc().dry_run_attempts();
+            assert_eq!(loop_.tick().submitted, 1, "{stage}");
+            assert_eq!(
+                loop_.rpc().dry_run_attempts() - before,
+                if stage == "cached" { 1 } else { 3 }
+            );
+            assert_eq!(
+                input_sets(loop_.rpc()),
+                [vec![ops[0].clone(), ops[2].clone(), state.out_point]]
+            );
+        }
+    }
+
+    #[test]
     fn rewind_between_refund_status_and_tip_keeps_digest_blocked() {
         for (start_tip, rewound_tip) in [(12, 8), (12, 11), (8, 8)] {
             let (rpc, state, ops) = chain(2);
@@ -1367,26 +1502,6 @@ mod tests {
     }
 
     #[test]
-    fn isolation_restarts_with_a_fresh_64_probe_budget_each_tick() {
-        let (rpc, _, ops) = chain(80);
-        let first = ops[1].clone();
-        let visits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let observed = visits.clone();
-        let ssri = ScriptedSsri::mimic((1, 4)).with_assembly_error(move |inputs, _| {
-            if inputs.len() == 2 && inputs.contains(&first) {
-                observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            Some(39)
-        });
-        let mut loop_ = loop_with_resolver(rpc, ssri, default_loop_config(), 1);
-        for tick in 1..=2 {
-            assert_eq!(loop_.tick().submitted, 0);
-            assert_eq!(loop_.ssri().seen_binaries.lock().unwrap().len(), tick * 66);
-            assert_eq!(visits.load(std::sync::atomic::Ordering::Relaxed), tick);
-        }
-    }
-
-    #[test]
     fn comparison_probe_cannot_use_an_indexed_but_dead_cell() {
         let (rpc, _, ops) = chain(3);
         rpc.defer_commit();
@@ -1533,6 +1648,41 @@ mod tests {
         loop_.rpc().set_tip(149);
         assert_eq!(loop_.tick().submitted, 0);
         assert_eq!(loop_.ssri().filter_requests.lock().unwrap().len(), 2);
+        assert!(loop_.rpc().has_cell(&ops[1]));
+    }
+
+    #[test]
+    fn unrelated_replacements_do_not_expire_a_faulted_state_code_pair() {
+        let (rpc, _, ops) = chain(2);
+        rpc.set_tip(100);
+        let faulted = rpc.get_live_cell(&out_point(0xA0, 0)).unwrap().unwrap();
+        let replacement_a = code_cell(0xA1, PROC_CODE_ARGS, [FIXTURE_ELF, &[1]].concat());
+        let replacement_b = code_cell(0xA2, PROC_CODE_ARGS, [FIXTURE_ELF, &[2]].concat());
+        let mut passes = [vec![0, 5], vec![1], vec![1], vec![5]].into_iter();
+        let ssri = ScriptedSsri::mimic((1, 4))
+            .with_filter(move |_| Ok(passes.next().unwrap()))
+            .with_intention_error(ops[0].clone(), 41);
+        let mut config = default_loop_config();
+        config.confirmation_depth = 24;
+        let mut loop_ = loop_with_resolver(rpc, ssri, config, 1);
+        assert!(loop_.tick().last_error.unwrap().contains("exit 41"));
+
+        loop_.rpc().consume(&ops[0]);
+        loop_.rpc().consume(&faulted.out_point);
+        loop_.rpc().insert_cell(replacement_a.clone());
+        loop_.rpc().set_tip(101);
+        assert_eq!(loop_.tick().submitted, 0);
+
+        loop_.rpc().consume(&replacement_a.out_point);
+        loop_.rpc().insert_cell(replacement_b.clone());
+        loop_.rpc().set_tip(125);
+        assert_eq!(loop_.tick().submitted, 0);
+
+        loop_.rpc().consume(&replacement_b.out_point);
+        loop_.rpc().insert_cell(faulted);
+        loop_.rpc().set_tip(124);
+        assert_eq!(loop_.tick().submitted, 0);
+        assert_eq!(loop_.ssri().filter_requests.lock().unwrap().len(), 3);
         assert!(loop_.rpc().has_cell(&ops[1]));
     }
 

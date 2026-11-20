@@ -15,6 +15,7 @@ struct Inner {
     fail_next_submit: bool,
     reject_next_submit: bool,
     reject_next_dry_run: bool,
+    reject_dry_run_input: Option<OutPoint>,
     spent_deps: HashSet<OutPoint>,
     replace_cell_on_submit: Option<(OutPoint, Option<LiveCell>)>,
     stale_indexer_cells: HashSet<OutPoint>,
@@ -212,6 +213,10 @@ impl FakeRpc {
     /// Next `dry_run_transaction` returns `SubmitRejected` (combo blacklist path).
     pub fn inject_dry_run_reject_once(&self) {
         self.inner.lock().unwrap().reject_next_dry_run = true;
+    }
+
+    pub fn reject_dry_run_when_consuming(&self, op: OutPoint) {
+        self.inner.lock().unwrap().reject_dry_run_input = Some(op);
     }
 
     /// The node rejects this dependency while the indexer still lists it.
@@ -540,6 +545,13 @@ impl Rpc for FakeRpc {
         }
         if std::mem::take(&mut inner.unavailable_next_dry_run) {
             return Err(RpcError::Unavailable("injected dry-run unavailable".into()));
+        }
+        if inner.reject_dry_run_input.as_ref().is_some_and(|op| {
+            tx.inputs()
+                .into_iter()
+                .any(|input| input.previous_output() == *op)
+        }) {
+            return Err(RpcError::SubmitRejected("injected input reject".into()));
         }
         if inner.reject_next_dry_run {
             inner.reject_next_dry_run = false;
