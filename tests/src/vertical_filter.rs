@@ -234,7 +234,7 @@ mod tests {
     fn minimum_fee_rejection_tries_smaller_batches_at_either_rpc_gate() {
         for dry_run in [true, false] {
             let (rpc, state, ops) = chain(2);
-            rpc.reject_fee_rate_at_input_count(3, dry_run);
+            rpc.reject_fee_rate_once_at_input_count(3, dry_run);
             let mut loop_ =
                 loop_with_resolver(rpc, ScriptedSsri::mimic((1, 4)), default_loop_config(), 1);
 
@@ -247,6 +247,25 @@ mod tests {
             let submit = loop_.state().submit.unwrap();
             assert!(submit.rejected_combos.is_empty());
             assert_eq!(submit.pending.len(), 1);
+        }
+    }
+
+    #[test]
+    fn minimum_fee_rejection_continues_refunds_and_retries_in_a_later_tick() {
+        for dry_run in [true, false] {
+            let (rpc, _, ops) = chain(2);
+            rpc.reject_fee_rate_once_at_input_count(1, dry_run);
+            let ssri = ScriptedSsri::mimic((1, 4)).with_filter(|n| Ok(vec![5; n]));
+            let mut loop_ = loop_with_resolver(rpc, ssri, default_loop_config(), 1);
+
+            assert_eq!(loop_.tick().submitted, 1);
+            assert_eq!(input_sets(loop_.rpc()), [vec![ops[1].clone()]]);
+            let submit = loop_.state().submit.unwrap();
+            assert!(submit.rejected_combos.is_empty());
+            assert_eq!(submit.pending.len(), 1);
+
+            assert_eq!(loop_.tick().submitted, 1);
+            assert_eq!(input_sets(loop_.rpc())[1], [ops[0].clone()]);
         }
     }
 
@@ -844,6 +863,36 @@ mod tests {
         loop_.rpc().clear_indexer_snapshot(&next_state);
         assert_eq!(loop_.tick().submitted, 1);
         assert_eq!(input_sets(loop_.rpc())[1], [ops[2].clone()]);
+    }
+
+    #[test]
+    fn ambiguous_priority_refund_keeps_its_turn_until_its_status_is_known() {
+        let (rpc, _, ops) = chain(3);
+        rpc.defer_commit();
+        let ssri = ScriptedSsri::mimic((1, 1)).with_filter(|n| {
+            let mut reasons = vec![0; n];
+            if n > 1 {
+                reasons[n - 1] = 5;
+            }
+            Ok(reasons)
+        });
+        let mut loop_ = loop_with_resolver(rpc, ssri, default_loop_config(), 1);
+
+        assert_eq!(loop_.tick().submitted, 1);
+        loop_
+            .rpc()
+            .commit_pending(&loop_.rpc().submitted()[0].hash());
+        loop_.rpc().lose_next_submit_response();
+        assert_eq!(loop_.tick().submitted, 0);
+        let refund = loop_.rpc().submitted()[1].hash();
+        assert_eq!(input_sets(loop_.rpc())[1], [ops[2].clone()]);
+
+        loop_.rpc().fail_status_queries();
+        assert_eq!(loop_.tick().submitted, 0);
+        loop_.rpc().restore_status_queries();
+        loop_.rpc().simulate_drop(&refund);
+        assert_eq!(loop_.tick().submitted, 1);
+        assert_eq!(input_sets(loop_.rpc())[2], [ops[2].clone()]);
     }
 
     #[test]

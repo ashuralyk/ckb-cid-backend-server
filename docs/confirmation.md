@@ -148,7 +148,7 @@ from a full indexer rescan.
 
 | Code | CKB error | Mapped to |
 |------|-----------|-----------|
-| `-301` | `TransactionFailedToResolve` | `Conflict` (also any message matching unknown-input / dead-cell / duplicate) |
+| `-301` | `TransactionFailedToResolve` | `Conflict` (unknown-input, dead-cell, and duplicate messages can also map to `Conflict`, subject to explicit code handling) |
 | `-1107` | `PoolRejectedDuplicatedTransaction` | `Unavailable` (the node may have already admitted the transaction, so the daemon tracks the local transaction hash and reconciles its status) |
 | `-302` | `TransactionFailedToVerify` | `SubmitRejected` |
 | `-1102` | `PoolRejectedTransactionByOutputsValidator` | `SubmitRejected` |

@@ -12,7 +12,7 @@ use crate::scan::ScannedIntention;
 use crate::ssri::SsriHost;
 use crate::submit::SubmitState;
 use crate::worker_commands::WorkerCommands;
-use ckb_types::packed::{CellDep, OutPoint};
+use ckb_types::packed::{Byte32, CellDep, OutPoint};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
@@ -37,6 +37,32 @@ fn process_snapshot(process: &ResolvedProcess) -> (OutPoint, Option<OutPoint>) {
     )
 }
 
+#[derive(Default, PartialEq, Eq)]
+pub(crate) enum RefundPriority {
+    #[default]
+    None,
+    Ready,
+    AwaitingStatus(Byte32),
+}
+
+impl RefundPriority {
+    pub(crate) fn grant(&mut self) {
+        if !matches!(self, Self::AwaitingStatus(_)) {
+            *self = Self::Ready;
+        }
+    }
+
+    pub(crate) fn is_awaiting(&self, tx_hash: &Byte32) -> bool {
+        matches!(self, Self::AwaitingStatus(pending) if pending == tx_hash)
+    }
+
+    pub(crate) fn confirm_admission(&mut self, tx_hash: &Byte32) {
+        if self.is_awaiting(tx_hash) {
+            *self = Self::None;
+        }
+    }
+}
+
 /// Per-Process mutable state (digest thread and worker thread via lock).
 pub struct ProcessWorkerState {
     pub entry: ProcessEntry,
@@ -45,7 +71,7 @@ pub struct ProcessWorkerState {
     /// State dependencies of submitted filter refunds, keyed by transaction.
     pub(crate) refund_state_deps: HashMap<Vec<u8>, OutPoint>,
     /// Give refunds the first opportunity after a digest releases Process state.
-    pub(crate) refund_priority: bool,
+    pub(crate) refund_priority: RefundPriority,
     unfunded_process: Option<(OutPoint, Option<OutPoint>)>,
     /// Shared across assembly jobs within a tick, cleared after all jobs finish.
     pub(crate) probe_budget: Option<ProbeBudget>,
@@ -68,7 +94,7 @@ impl ProcessWorkerState {
             resolver,
             submit: SubmitState::default(),
             refund_state_deps: HashMap::new(),
-            refund_priority: false,
+            refund_priority: RefundPriority::None,
             unfunded_process: None,
             probe_budget: None,
             generation,

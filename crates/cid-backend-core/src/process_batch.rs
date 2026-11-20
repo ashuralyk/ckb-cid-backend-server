@@ -17,7 +17,7 @@ use crate::ssri::{
 };
 use crate::submit::{combo_fingerprint, dry_run_gate, submit_execution, DryRunGate};
 use crate::worker_commands::{Submission, WorkerCommands};
-use crate::workers::ProcessWorkerState;
+use crate::workers::{ProcessWorkerState, RefundPriority};
 use cid_process_executor::AssembledTx;
 use cid_protocol::CidArgs;
 use ckb_types::packed::{CellDep, CellOutput, OutPoint};
@@ -1035,10 +1035,13 @@ fn submit_filter_refund<R: Rpc + HostQueryRpc>(
             hash.as_slice().to_vec(),
             authorizing_state.out_point.clone(),
         );
+        if result.is_err() && worker.refund_priority == RefundPriority::Ready {
+            worker.refund_priority = RefundPriority::AwaitingStatus(hash);
+        }
     }
     match result {
         Ok(tx_hash) => {
-            worker.refund_priority = false;
+            worker.refund_priority = RefundPriority::None;
             tracing::info!(target: LOG_TARGET, event = "submit.ok", tx_hash = %hex_pref(tx_hash.as_slice()));
             report.submitted += 1;
             BatchOutcome::Submitted

@@ -10,7 +10,7 @@ use crate::ssri::{filter_intentions, SsriError, SsriHost};
 use crate::submit::{execution_code_key, SubmitState};
 use crate::type_id::TypeIdCodeDep;
 pub use crate::worker_commands::{WorkerCommand, WorkerCommands};
-use crate::workers::{WorkerPool, WorkerRemoveError};
+use crate::workers::{RefundPriority, WorkerPool, WorkerRemoveError};
 use cid_intention_filter::{
     FILTER_ACCEPTED, FILTER_DEPOSIT_BELOW_MINIMUM, FILTER_MALFORMED_DIGEST,
     FILTER_UNSUPPORTED_ACTION, FILTER_UNSUPPORTED_ASSET,
@@ -580,9 +580,12 @@ where
             let Some(worker) = self.workers.get(&bucket.process.type_hash) else {
                 continue;
             };
+            if !worker.with_state(|state| state.refund_priority == RefundPriority::Ready) {
+                continue;
+            }
             if bucket.refunds.is_empty() {
-                worker.with_state_mut(|state| state.refund_priority = false);
-            } else if worker.with_state(|state| state.refund_priority) {
+                worker.with_state_mut(|state| state.refund_priority = RefundPriority::None);
+            } else {
                 self.dispatch_filter_refunds(bucket, &mut report);
             }
         }
@@ -805,8 +808,10 @@ where
                         }
                         worker.with_state_mut(|state| {
                             if let Some(p) = state.submit.pending.remove(&hash_bytes) {
-                                if !state.refund_state_deps.contains_key(&hash_bytes) {
-                                    state.refund_priority = true;
+                                if state.refund_priority.is_awaiting(&tx_hash) {
+                                    state.refund_priority = RefundPriority::Ready;
+                                } else if !state.refund_state_deps.contains_key(&hash_bytes) {
+                                    state.refund_priority.grant();
                                 }
                                 for k in p.consumed {
                                     state.submit.in_flight.remove(&k);
@@ -862,6 +867,18 @@ where
                             }
                         }
                         let confirmations = confirmation_count(fresh_tip, block_number);
+                        worker.with_state_mut(|state| {
+                            state.refund_priority.confirm_admission(&tx_hash);
+                            if confirmations >= depth {
+                                state.submit.pending.remove(&hash_bytes);
+                                if !state.refund_state_deps.contains_key(&hash_bytes) {
+                                    state.refund_priority.grant();
+                                }
+                            } else if let Some(pending) = state.submit.pending.get_mut(&hash_bytes)
+                            {
+                                pending.currently_committed = true;
+                            }
+                        });
                         if confirmations >= depth {
                             tracing::info!(
                                 target: LOG_TARGET,
@@ -870,18 +887,7 @@ where
                                 confirmations,
                                 depth,
                             );
-                            worker.with_state_mut(|state| {
-                                state.submit.pending.remove(&hash_bytes);
-                                if !state.refund_state_deps.contains_key(&hash_bytes) {
-                                    state.refund_priority = true;
-                                }
-                            });
                         } else {
-                            worker.with_state_mut(|state| {
-                                if let Some(pending) = state.submit.pending.get_mut(&hash_bytes) {
-                                    pending.currently_committed = true;
-                                }
-                            });
                             tracing::debug!(
                                 target: LOG_TARGET,
                                 event = "pending.confirming",
@@ -893,7 +899,13 @@ where
                             );
                         }
                     }
-                    Ok(TxStatus::Pending) => {}
+                    Ok(TxStatus::Pending) => {
+                        if let Some(worker) = self.workers.get(&process_hash) {
+                            worker.with_state_mut(|state| {
+                                state.refund_priority.confirm_admission(&tx_hash);
+                            });
+                        }
+                    }
                     Err(e) => {
                         tracing::warn!(
                             target: LOG_TARGET,
