@@ -39,9 +39,10 @@ A filter-authorized User Lock refund spends the Intention and uses the live
 Process state and code as cell dependencies. The worker defers the refund while
 a pending digest consumes its authorizing state. In the other direction, a
 pending refund blocks digest submissions that would consume its state dependency.
-The worker lifts that dependency interlock when it observes the refund as
-committed. If the refund returns to the pool before settlement, or its status
-becomes unavailable, the worker holds the interlock again.
+The worker lifts that dependency interlock after the node reports the refund
+committed and a fresh tip read places the tip at or above the commit height
+without a rewind during reconciliation. The worker holds the interlock again
+if these checks fail or the refund returns to the pool before settlement.
 
 ## Reorg recovery
 
@@ -52,6 +53,11 @@ becomes unavailable, the worker holds the interlock again.
 | Confirming refund returns to `Pending` | Keep the Intention occupied and block digests that would spend the refund's Process state dependency. |
 | Confirming or committed tx becomes `Dropped` | Log `pending.reorg` (if we had seen Committed) or `pending.dropped`. Release occupancy. If cells are live, the next tick retries. |
 | Status or tip RPC unavailable | Keep occupancy. Do not settle. |
+
+Exit 41 quarantines a Process state/code pair. A replacement pair can run
+independently. The worker retains the old quarantine for the configured
+confirmation window after it first observes a replacement, so the fault still
+blocks assembly and filter refunds if the pair returns in a reorg.
 
 After a restart there is no pending set, so a still-mempool tx may be submitted
 again (same as v0 D6). Cells already consumed surface as `Conflict`.
@@ -73,9 +79,9 @@ written to `rejected`.
 |---------|--------|-----------|
 | `Dropped` (pool eviction / reorg) | yes, next tick if cells live | released |
 | RPC/indexer `Unavailable` | yes | held if already pending; not taken on a failed submit |
-| `Conflict` | yes, next tick if cells live | not taken (`failed` is informational) |
+| `Conflict` | yes. During assembly isolation, try later subsets and reconsider conflicts on the next search. | not taken (`failed` is informational) |
 | `SubmitRejected` (positively identified permanent send failure of this tx) | isolate / skip that **combo** this process lifetime | not taken; Process outpoint is not blacklisted |
-| `Process.assemble` error | log and try another batch, or quarantine state on exit 41 | affected cells stay live |
+| `Process.assemble` error | log and try another batch, or quarantine the state/code pair on exit 41 | affected cells stay live |
 | `Process.filter` reasons 4–7 | User Lock refund after matching node snapshots | Intention input occupied on successful submit |
 
 **Combo isolation.** A rejected digest fingerprint includes the ordered
@@ -104,8 +110,9 @@ candidate window. A cache hit skips assembly and submission while the window
 can still be split to reach later Intentions. Isolation is iterative.
 
 A subset whose guest-added funding input is no longer live is skipped. A
-funding lookup error leaves that subset at the probe cursor for retry. When
-the search runs out of subsets, the worker leaves the Intentions live and
+funding lookup error leaves that subset at the probe cursor for retry. A
+conflict at dry-run or submission advances the cursor. When the search runs
+out of subsets, the worker leaves the Intentions live and
 skips the same candidate set for the next three successful scans. A change
 to the candidate set, Process state, or execution code reopens the search.
 

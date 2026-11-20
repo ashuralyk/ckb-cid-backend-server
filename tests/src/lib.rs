@@ -49,3 +49,24 @@ fn contract_builders_default_to_the_workspace_revision() {
         );
     }
 }
+
+#[test]
+fn observability_guide_lists_the_refund_events_emitted_by_the_worker() {
+    use std::collections::BTreeSet;
+
+    let guide = include_str!("../../docs/observability.md");
+    let worker = include_str!("../../crates/cid-backend-core/src/process_batch.rs");
+    let documented: BTreeSet<_> = guide
+        .lines()
+        .filter_map(|line| line.strip_prefix("| `refund."))
+        .filter_map(|row| row.split_once('`').map(|(event, _)| event))
+        .collect();
+    let emitted: BTreeSet<_> = worker
+        .match_indices("event = \"refund.")
+        .filter_map(|(start, prefix)| worker[start + prefix.len()..].split_once('"'))
+        .map(|(event, _)| event)
+        .collect();
+
+    assert_eq!(documented, emitted);
+    assert!(!guide.contains("refund_fee_unaffordable"));
+}

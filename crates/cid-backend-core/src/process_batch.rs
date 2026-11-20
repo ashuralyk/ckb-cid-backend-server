@@ -192,7 +192,7 @@ where
     // Narrow lock: cache / occupancy prechecks only.
     {
         let worker = state.lock().expect("process worker state");
-        if worker.unhealthy_state.as_ref() == Some(&process.live_cell.out_point) {
+        if worker.is_process_quarantined(process) {
             report.skipped += batch.len();
             return (BatchOutcome::Continue, report);
         }
@@ -479,6 +479,14 @@ where
             report.last_error = Some(format!("dry-run rejected: {m}"));
             return (BatchOutcome::Rejected, report);
         }
+        DryRunGate::Skip(RpcError::Conflict(m)) => {
+            let mut worker = state.lock().expect("process worker state");
+            worker.advance_conflicting_probe();
+            tracing::warn!(target: LOG_TARGET, event = "dry_run.conflict", error = %m);
+            report.conflicts += 1;
+            report.last_error = Some(format!("dry-run conflict: {m}"));
+            return (BatchOutcome::Continue, report);
+        }
         DryRunGate::Skip(m) => {
             tracing::warn!(
                 target: LOG_TARGET,
@@ -513,6 +521,7 @@ where
             }
         }
         Err(RpcError::Conflict(m)) => {
+            worker.advance_conflicting_probe();
             tracing::warn!(
                 target: LOG_TARGET,
                 event = "submit.conflict",
@@ -643,6 +652,7 @@ pub(crate) struct IsolationProbe {
     max: usize,
     older: SubsetSearch,
     arrivals: VecDeque<SubsetSearch>,
+    selected_from_arrivals: Option<bool>,
 }
 
 struct SubsetSearch {
@@ -676,6 +686,7 @@ impl IsolationProbe {
             max,
             older,
             arrivals: VecDeque::new(),
+            selected_from_arrivals: None,
         }
     }
 
@@ -685,6 +696,20 @@ impl IsolationProbe {
 
     fn has_work(&self) -> bool {
         self.older.has_work() || !self.arrivals.is_empty()
+    }
+
+    pub(crate) fn advance_after_conflict(&mut self) {
+        match self.selected_from_arrivals.take() {
+            Some(true) => {
+                let group = self.arrivals.back_mut().expect("selected arrival group");
+                group.advance(self.max);
+                if !group.has_work() {
+                    self.arrivals.pop_back();
+                }
+            }
+            Some(false) => self.older.advance(self.max),
+            None => {}
+        }
     }
 
     fn include_arrivals<'a>(&mut self, current: impl Iterator<Item = &'a ScannedIntention>) {
@@ -710,6 +735,7 @@ impl IsolationProbe {
         budget: &mut ProbeBudget,
         attempt: &mut impl FnMut(&[ScannedIntention]) -> Result<Option<T>, SsriError>,
     ) -> Result<Option<(Vec<ScannedIntention>, T)>, SsriError> {
+        self.selected_from_arrivals = None;
         let snapshot: Vec<_> = self
             .candidates
             .iter()
@@ -733,11 +759,17 @@ impl IsolationProbe {
                 self.arrivals.push_back(group);
             }
             if let Some(found) = result? {
+                self.selected_from_arrivals = Some(true);
                 return Ok(Some(found));
             }
         }
-        self.older
-            .search(&snapshot, self.max, &mut budget.remaining, attempt)
+        let result = self
+            .older
+            .search(&snapshot, self.max, &mut budget.remaining, attempt)?;
+        if result.is_some() {
+            self.selected_from_arrivals = Some(false);
+        }
+        Ok(result)
     }
 }
 
@@ -774,8 +806,8 @@ impl SubsetSearch {
             };
             if let Some(items) = items {
                 if let Some(assembled) = attempt(&items)? {
-                    // Keep this position until submission. A cached transaction
-                    // rejection skips the subset when the search resumes.
+                    // Keep this position for transient RPC errors. A conflict
+                    // advances it and a cached rejection skips it on resume.
                     return Ok(Some((items, assembled)));
                 }
             }
@@ -825,7 +857,7 @@ fn mark_process_unhealthy(
         process_type_hash = %hex_pref(&hash), out_point = ?process.live_cell.out_point,
         code = PROCESS_LOCK_ARGS_INVALID, reason = "ProcessLockArgsInvalid");
     let mut worker = state.lock().expect("process worker state");
-    worker.unhealthy_state = Some(process.live_cell.out_point.clone());
+    worker.quarantine_process(process);
     worker.isolate_pending.clear();
     worker.isolate_resume = None;
     worker.isolation_probe = None;
@@ -880,7 +912,7 @@ fn refund_filter_rejections<R: Rpc + HostQueryRpc>(
     let authorizing_state = &params.process.live_cell;
     let cursor = {
         let mut worker = params.state.lock().expect("process worker state");
-        if worker.unhealthy_state.as_ref() == Some(&authorizing_state.out_point) {
+        if worker.is_process_quarantined(params.process) {
             report.skipped = params.batch.len();
             return (BatchOutcome::Continue, report);
         }

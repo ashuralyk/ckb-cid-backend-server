@@ -554,7 +554,7 @@ where
                 if bucket.is_empty() {
                     return None;
                 }
-                self.prepare_bucket(hash, bucket, &mut report)
+                self.prepare_bucket(hash, bucket, tip.and(self.last_tip), &mut report)
             })
             .collect();
         // Multi-round only for reject-isolate expansions. Transient Continue /
@@ -832,8 +832,7 @@ where
                 if let Some(worker) = self.workers.get(&process_hash) {
                     worker.with_state_mut(|state| {
                         if let Some(pending) = state.submit.pending.get_mut(&hash_bytes) {
-                            pending.currently_committed =
-                                matches!(status, Ok(TxStatus::Committed { .. }));
+                            pending.currently_committed = false;
                             if let Ok(TxStatus::Committed { block_number }) = status {
                                 if !pending.seen_committed {
                                     pending.seen_committed = true;
@@ -926,6 +925,11 @@ where
                                 state.submit.pending.remove(&hash_bytes);
                             });
                         } else {
+                            worker.with_state_mut(|state| {
+                                if let Some(pending) = state.submit.pending.get_mut(&hash_bytes) {
+                                    pending.currently_committed = true;
+                                }
+                            });
                             tracing::debug!(
                                 target: LOG_TARGET,
                                 event = "pending.confirming",
@@ -979,17 +983,16 @@ where
     }
 
     fn process_is_healthy(&self, process: &ResolvedProcess) -> bool {
-        self.workers.get(&process.type_hash).is_some_and(|worker| {
-            worker.with_state(|state| {
-                state.unhealthy_state.as_ref() != Some(&process.live_cell.out_point)
-            })
-        })
+        self.workers
+            .get(&process.type_hash)
+            .is_some_and(|worker| worker.with_state(|state| !state.is_process_quarantined(process)))
     }
 
     fn prepare_bucket(
         &self,
         hash: [u8; 32],
         mut bucket: Vec<ScannedIntention>,
+        tip: Option<u64>,
         report: &mut TickReport,
     ) -> Option<FilteredBucket> {
         let worker = self.workers.get(&hash)?;
@@ -1005,6 +1008,9 @@ where
                 return None;
             }
         };
+        worker.with_state_mut(|state| {
+            state.refresh_quarantines(&process, tip, self.config.confirmation_depth)
+        });
         if !self.process_is_healthy(&process) {
             report.skipped += bucket.len();
             return None;

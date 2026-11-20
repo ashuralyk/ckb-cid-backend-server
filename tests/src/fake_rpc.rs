@@ -23,6 +23,8 @@ struct Inner {
     unavailable_live_cell_once: Option<OutPoint>,
     unavailable_next_dry_run: bool,
     reject_inputs: HashSet<Vec<u8>>,
+    conflict_input: Option<(OutPoint, bool)>,
+    cid_lock_groups: Option<([u8; 32], ScriptHashType)>,
     submit_attempts: usize,
     dry_run_attempts: usize,
     unavailable_next_submit: bool,
@@ -56,6 +58,23 @@ pub struct FakeRpc {
     after_submit: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
+fn check_injected_conflict(
+    inner: &Inner,
+    tx: &TransactionView,
+    dry_run: bool,
+) -> Result<(), RpcError> {
+    if inner.conflict_input.as_ref().is_some_and(|(op, stage)| {
+        *stage == dry_run
+            && tx
+                .inputs()
+                .into_iter()
+                .any(|input| input.previous_output() == *op)
+    }) {
+        return Err(RpcError::Conflict("injected unresolved dependency".into()));
+    }
+    Ok(())
+}
+
 impl FakeRpc {
     pub fn new() -> Self {
         Self {
@@ -66,6 +85,18 @@ impl FakeRpc {
 
     pub fn after_next_submit(&self, callback: impl FnOnce() + Send + 'static) {
         *self.after_submit.lock().unwrap() = Some(Box::new(callback));
+    }
+
+    pub fn conflict_on_input(&self, op: Option<OutPoint>, dry_run: bool) {
+        self.inner.lock().unwrap().conflict_input = op.map(|op| (op, dry_run));
+    }
+
+    pub fn enforce_single_input_cid_lock_groups(
+        &self,
+        code_hash: [u8; 32],
+        hash_type: ScriptHashType,
+    ) {
+        self.inner.lock().unwrap().cid_lock_groups = Some((code_hash, hash_type));
     }
 
     pub fn insert_cell(&self, cell: LiveCell) {
@@ -471,9 +502,24 @@ impl Rpc for FakeRpc {
         Ok(out)
     }
 
-    fn dry_run_transaction(&self, _tx: &TransactionView) -> Result<(), RpcError> {
+    fn dry_run_transaction(&self, tx: &TransactionView) -> Result<(), RpcError> {
         let mut inner = self.inner.lock().unwrap();
         inner.dry_run_attempts += 1;
+        check_injected_conflict(&inner, tx, true)?;
+        if let Some((code_hash, hash_type)) = inner.cid_lock_groups {
+            let mut groups = HashSet::new();
+            for input in tx.inputs() {
+                if let Some(cell) = inner.cells.get(input.previous_output().as_slice()) {
+                    let lock = cell.lock();
+                    if lock.code_hash().as_slice() == code_hash
+                        && lock.hash_type() == hash_type.into()
+                        && !groups.insert(lock)
+                    {
+                        return Err(RpcError::SubmitRejected("CID PartialDigest".into()));
+                    }
+                }
+            }
+        }
         if std::mem::take(&mut inner.unavailable_next_dry_run) {
             return Err(RpcError::Unavailable("injected dry-run unavailable".into()));
         }
@@ -487,6 +533,7 @@ impl Rpc for FakeRpc {
     fn submit_transaction(&self, tx: &TransactionView) -> Result<Byte32, RpcError> {
         let mut inner = self.inner.lock().unwrap();
         inner.submit_attempts += 1;
+        check_injected_conflict(&inner, tx, false)?;
         if let Some((op, replacement)) = inner.replace_cell_on_submit.take() {
             inner.cells.remove(&out_point_key(&op));
             inner.spent_deps.insert(op);

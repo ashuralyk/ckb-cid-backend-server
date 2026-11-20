@@ -28,6 +28,16 @@ fn process_thread_name(hash: &[u8; 32]) -> String {
     )
 }
 
+fn process_snapshot(process: &ResolvedProcess) -> (OutPoint, Option<OutPoint>) {
+    (
+        process.live_cell.out_point.clone(),
+        process
+            .code_cell
+            .as_ref()
+            .map(|cell| cell.out_point.clone()),
+    )
+}
+
 /// Per-Process mutable state (digest thread and worker thread via lock).
 pub struct ProcessWorkerState {
     pub entry: ProcessEntry,
@@ -47,8 +57,9 @@ pub struct ProcessWorkerState {
     pub(crate) exhausted_isolation: Option<ExhaustedIsolation>,
     pub(crate) probe_budget: ProbeBudget,
     pub generation: u64,
-    /// State out point quarantined after Process.assemble exit 41.
-    pub unhealthy_state: Option<OutPoint>,
+    /// Exit 41 quarantines a state/code pair. The height is the first tip
+    /// where a replacement was observed, if the pair is no longer current.
+    quarantines: HashMap<(OutPoint, Option<OutPoint>), Option<u64>>,
     pub(crate) filter_missing_logged: bool,
     last_process_code: Option<OutPoint>,
 }
@@ -74,7 +85,7 @@ impl ProcessWorkerState {
             exhausted_isolation: None,
             probe_budget: ProbeBudget::default(),
             generation,
-            unhealthy_state: None,
+            quarantines: HashMap::new(),
             filter_missing_logged: false,
             last_process_code: None,
         }
@@ -84,12 +95,45 @@ impl ProcessWorkerState {
         if let Some(cell) = cell {
             if self.last_process_code.as_ref() != Some(&cell.out_point) {
                 self.last_process_code = Some(cell.out_point.clone());
-                self.unhealthy_state = None;
                 self.filter_missing_logged = false;
                 self.clear_execution_rejections();
             }
         }
         self.resolver.set_tick_process_code(cell);
+    }
+
+    pub(crate) fn quarantine_process(&mut self, process: &ResolvedProcess) {
+        self.quarantines.insert(process_snapshot(process), None);
+    }
+
+    pub(crate) fn is_process_quarantined(&self, process: &ResolvedProcess) -> bool {
+        self.quarantines.contains_key(&process_snapshot(process))
+    }
+
+    pub(crate) fn refresh_quarantines(
+        &mut self,
+        process: &ResolvedProcess,
+        tip: Option<u64>,
+        depth: u64,
+    ) {
+        let current = process_snapshot(process);
+        // An unavailable code lookup does not establish a replacement.
+        let tip = tip.filter(|_| process.code_cell.is_some());
+        self.quarantines.retain(|snapshot, replaced_at| {
+            if snapshot == &current {
+                *replaced_at = None;
+            } else if let Some(tip) = tip {
+                let height = *replaced_at.get_or_insert(tip);
+                return tip.saturating_sub(height) < depth.max(1);
+            }
+            true
+        });
+    }
+
+    pub(crate) fn advance_conflicting_probe(&mut self) {
+        if let Some(probe) = &mut self.isolation_probe {
+            probe.advance_after_conflict();
+        }
     }
 
     pub(crate) fn clear_execution_rejections(&mut self) {
@@ -554,7 +598,6 @@ where
                     state.resolver = ProcessResolver::for_entry(entry);
                     if code_changed {
                         state.last_process_code = None;
-                        state.unhealthy_state = None;
                         state.filter_missing_logged = false;
                         state.clear_execution_rejections();
                     }

@@ -23,14 +23,13 @@ Stable field `event` (target `cid_backend`):
 | `process.resolve_miss` | No usable live Process binary |
 | `assemble.batch_failed` | Assembly error and attempted Intention outpoints |
 | `assemble.batch_isolated` | Working subset found during isolation |
-| `process.unhealthy` | Exit 41 quarantined the state and paused its filter refunds |
+| `process.unhealthy` | Exit 41 quarantined the Process state/code pair and paused its filter refunds |
 | `ssri.filter_failed` | Filter error deferred the Process bucket |
 | `refund.process_state_pending` | Refund deferred while a pending digest spends its state dependency |
-| `refund.path` | User Lock refund construction (`path=user_lock`, `out_point`, `fee`) |
-| `refund.partition` | DigestIncompatible refunds split by lock identity (Exact vs Bounded kept separate; no mixed-identity Bounded tx) |
-| `refund.zero_fee` | Legacy exact Incompatible refund submitted with fee 0 (public-net gap vs `min_fee_rate`; default when allowlist empty / lock not listed) |
-| `tick.skip` (`reason=fee_unaffordable`) | Process recreate cannot fund fee for this window; isolate/shrink (non-permanent) |
-| `tick.skip` (`reason=refund_fee_unaffordable`) | Bounded refund budgets cannot cover miner fee; isolate/shrink like fee_unaffordable (non-permanent) |
+| `refund.snapshot_mismatch` | Node re-read disagrees with the Intention, Process state, or code snapshot |
+| `refund.path` | Singleton User Lock refund built (`path=user_lock`, `out_point`, `fee`) or unbuildable (`path=unbuildable`, `error`) |
+| `refund.fee_unaffordable` | The singleton bounded refund cannot cover the fee and its Intention stays live |
+| `dry_run.conflict` | Digest dry-run mapped to Conflict |
 | `submit.ok` | `tx_hash` |
 | `submit.conflict` | Submit mapped as Conflict |
 | `submit.rejected` | Transaction-level submit rejection (`TransactionFailedToVerify` / malformed / outputs-validator); that combo is skipped, not every consumed outpoint |
