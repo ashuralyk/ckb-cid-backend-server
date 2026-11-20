@@ -389,6 +389,38 @@ mod tests {
     }
 
     #[test]
+    fn unaudited_refund_cannot_submit_if_process_state_is_replaced_at_submission() {
+        let (rpc, state, ops) = chain(1);
+        let mut replacement = state.clone();
+        replacement.out_point = out_point(0x51, 0);
+        let lock = state
+            .lock()
+            .as_builder()
+            .code_hash([0x52; 32].pack())
+            .build();
+        replacement.output = replacement.output.as_builder().lock(lock).build();
+        rpc.replace_cell_on_next_submit(state.out_point.clone(), replacement.clone());
+        let ssri = ScriptedSsri::mimic((1, 4)).with_filter(|n| Ok(vec![5; n]));
+        let mut loop_ = loop_with_resolver(rpc, ssri, default_loop_config(), 1);
+
+        let report = loop_.tick();
+        assert_eq!(loop_.rpc().submit_attempts(), 1);
+        assert!(loop_.rpc().has_cell(&out_point(0xA0, 0)));
+        assert!(loop_
+            .rpc()
+            .get_live_cell(&state.out_point)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            loop_.rpc().get_live_cell(&replacement.out_point).unwrap(),
+            Some(replacement)
+        );
+        assert_eq!(report.submitted, 0);
+        assert_eq!(report.conflicts, 1);
+        assert!(loop_.rpc().has_cell(&ops[0]));
+    }
+
+    #[test]
     fn stale_assemble_verdict_cannot_submit_a_refund() {
         let (rpc, _, ops) = chain(1);
         set_below_minimum_deposit(&rpc, &ops[0]);
@@ -631,6 +663,29 @@ mod tests {
     }
 
     #[test]
+    fn recombined_exits_39_and_40_submit_the_successful_control_without_refunds() {
+        for code in [39, 40] {
+            let (rpc, state, ops) = chain(3);
+            let peers = ops[..2].to_vec();
+            let ssri = ScriptedSsri::mimic((1, 3))
+                .with_intention_error(ops[2].clone(), 39)
+                .with_assembly_error(move |inputs, _| {
+                    (inputs.len() == 3 && peers.iter().all(|op| inputs.contains(op)))
+                        .then_some(code)
+                });
+            let mut loop_ = loop_with_resolver(rpc, ssri, default_loop_config(), 1);
+
+            assert_eq!(loop_.tick().submitted, 1, "recombined exit {code}");
+            assert_eq!(
+                input_sets(loop_.rpc()),
+                [vec![ops[0].clone(), state.out_point]]
+            );
+            assert!(loop_.rpc().has_cell(&ops[1]));
+            assert!(loop_.rpc().has_cell(&ops[2]));
+        }
+    }
+
+    #[test]
     fn unaudited_singleton_is_reconsidered_when_external_policy_changes() {
         let (rpc, state, ops) = chain(1);
         let tip = rpc.tip();
@@ -755,8 +810,26 @@ mod tests {
         assert_eq!(first.submitted, 3, "{first:?}");
         let inputs = input_sets(loop_.rpc());
         assert!(inputs.contains(&vec![ops[0].clone()]));
-        assert!(inputs.contains(&vec![ops[1].clone(), ops[3].clone(), state.out_point]));
+        assert!(inputs.contains(&vec![
+            ops[1].clone(),
+            ops[3].clone(),
+            state.out_point.clone()
+        ]));
         assert!(inputs.contains(&vec![ops[2].clone()]));
+        for refund in loop_
+            .rpc()
+            .submitted()
+            .iter()
+            .filter(|tx| tx.inputs().len() == 1)
+        {
+            let deps: Vec<_> = refund
+                .cell_deps()
+                .into_iter()
+                .map(|dep| dep.out_point())
+                .collect();
+            assert!(deps.contains(&out_point(0xA0, 0)));
+            assert!(!deps.contains(&state.out_point));
+        }
     }
 
     #[test]
@@ -901,6 +974,38 @@ mod tests {
         let mut loop_ = loop_with_resolver(rpc, ssri, default_loop_config(), 1);
         assert_eq!(loop_.tick().submitted, 0);
         assert!(loop_.rpc().submitted().is_empty());
+    }
+
+    #[test]
+    fn exhausted_isolation_resumes_at_the_next_window_after_a_cell_returns() {
+        use std::sync::{Arc, Mutex};
+
+        let (rpc, state, ops) = chain(3);
+        rpc.mark_indexer_cell_stale(ops[2].clone());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&calls);
+        let ssri = ScriptedSsri::mimic((2, 2))
+            .with_assembly_error(move |inputs, _| {
+                observed.lock().unwrap().push(inputs.to_vec());
+                None
+            })
+            .with_intention_error(ops[0].clone(), 39);
+        let mut loop_ = loop_with_resolver(rpc, ssri, default_loop_config(), 1);
+
+        assert_eq!(loop_.tick().submitted, 0);
+        calls.lock().unwrap().clear();
+        // A reorg revives C at the node without changing the indexer results.
+        loop_.rpc().restore_indexer_cell_liveness(&ops[2]);
+        assert_eq!(loop_.tick().submitted, 1);
+        assert_eq!(
+            calls.lock().unwrap()[0][..2],
+            [ops[2].clone(), ops[0].clone()]
+        );
+        assert_eq!(
+            input_sets(loop_.rpc()),
+            [vec![ops[2].clone(), ops[1].clone(), state.out_point]]
+        );
+        assert!(loop_.rpc().has_cell(&ops[0]));
     }
 
     #[test]

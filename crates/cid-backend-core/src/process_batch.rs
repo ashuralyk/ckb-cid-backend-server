@@ -256,7 +256,7 @@ where
     };
     // A resumed search already has its trigger. Re-assembling the changed
     // window could restart isolation before the saved comparisons run.
-    let resuming = probe.as_ref().is_some_and(|saved| saved.indices.is_some());
+    let resuming = probe.is_some();
     let initial = (!resuming).then(|| attempt(&batch));
     let original_code = match &initial {
         Some(Err(SsriError::Incompatible(code @ (DEPOSIT_BELOW_MINIMUM | CID_LOCK_MISMATCH)))) => {
@@ -350,7 +350,10 @@ where
         if matches!(
             remaining,
             Some(Err(SsriError::Incompatible(
-                INCOMPATIBLE_BATCH | STATE_CAPACITY_INSUFFICIENT
+                INCOMPATIBLE_BATCH
+                    | STATE_CAPACITY_INSUFFICIENT
+                    | DEPOSIT_BELOW_MINIMUM
+                    | CID_LOCK_MISMATCH
             )))
         ) && !control.is_empty()
             && !control
@@ -693,7 +696,7 @@ pub(crate) struct IsolationProbe {
     candidates: Vec<OutPoint>,
     window_len: usize,
     min: usize,
-    indices: Option<Vec<usize>>,
+    indices: Vec<usize>,
     // While substituting, `indices` identifies the successful control.
     substitution: Option<SubstitutionProbe>,
 }
@@ -707,12 +710,6 @@ impl IsolationProbe {
     ) -> bool {
         if self.process != *process || self.min != min {
             return false;
-        }
-        if self.indices.is_none() {
-            return self
-                .candidates
-                .iter()
-                .eq(bucket.iter().map(|item| &item.out_point));
         }
         let positions: HashMap<_, _> = self
             .candidates
@@ -802,12 +799,10 @@ fn isolate_intentions<T>(
             .collect(),
         window_len: batch.len(),
         min,
-        indices: Some((0..min).collect()),
+        indices: (0..min).collect(),
         substitution: None,
     });
-    let Some(indices) = &mut saved.indices else {
-        return Ok(Some(IsolatedIntentions::default()));
-    };
+    let indices = &mut saved.indices;
     let snapshot: Vec<_> = saved
         .candidates
         .iter()
@@ -845,7 +840,7 @@ fn isolate_intentions<T>(
             _ => saved.substitution = None,
         }
         if !advance_probe_indices(indices, snapshot.len()) {
-            saved.indices = None;
+            *probe = None;
             return Ok(Some(IsolatedIntentions::default()));
         }
     };
@@ -1014,23 +1009,29 @@ fn refund_policy_rejections<R: Rpc + HostQueryRpc>(
     {
         return (outcome, report);
     }
-    // The filter is stateless and the audited example preserves its state lock.
-    // Check the live state just before submit without competing with a pending digest.
-    let deps = match merge_cell_deps(&[cell_dep_code(&code.out_point)], params.tick_cell_deps) {
+    let (cursor, audited) = {
+        let worker = params.state.lock().expect("process worker state");
+        if worker.unhealthy_state.as_ref() == Some(&params.process.live_cell.out_point) {
+            report.skipped = params.batch.len();
+            return (BatchOutcome::Continue, report);
+        }
+        let audited = worker.audited_policy_lock.as_ref() == Some(&params.process.live_cell.lock());
+        (worker.refund_cursor.clone(), audited)
+    };
+    let mut verdict_deps = vec![cell_dep_code(&code.out_point)];
+    // The audited example preserves its state lock. Using only its code dep
+    // lets a refund proceed while a digest spends and recreates the state.
+    // Other guests need a state dep to enforce liveness through submission.
+    if !audited {
+        verdict_deps.push(cell_dep_code(&params.process.live_cell.out_point));
+    }
+    let deps = match merge_cell_deps(&verdict_deps, params.tick_cell_deps) {
         Ok(deps) => deps,
         Err(error) => {
             report.skipped = params.batch.len();
             report.last_error = Some(format!("policy refund: {error}"));
             return (BatchOutcome::Continue, report);
         }
-    };
-    let cursor = {
-        let worker = params.state.lock().expect("process worker state");
-        if worker.unhealthy_state.as_ref() == Some(&params.process.live_cell.out_point) {
-            report.skipped = params.batch.len();
-            return (BatchOutcome::Continue, report);
-        }
-        worker.refund_cursor.clone()
     };
     params
         .batch
@@ -1080,7 +1081,11 @@ fn submit_policy_refund<R: Rpc + HostQueryRpc>(
     let state = &params.state;
     let authorizing_state = &params.process.live_cell;
     let consumed = std::slice::from_ref(&item.out_point);
-    let fp = combo_fingerprint(consumed, None, params.execution_code_key);
+    let state_dep = deps
+        .iter()
+        .find(|dep| dep.out_point() == authorizing_state.out_point)
+        .map(|_| &authorizing_state.out_point);
+    let fp = combo_fingerprint(consumed, state_dep, params.execution_code_key);
     {
         let worker = state.lock().expect("process worker state");
         if worker.submit.pending_occupies(&item.out_point)

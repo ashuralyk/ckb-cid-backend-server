@@ -11,7 +11,7 @@ Process-as-lock / full-tx SSRI cutover.
 
 Missing `Process.filter` defers the window by default. `loop.allow_missing_filter = true` (or `CID_ALLOW_MISSING_FILTER=true`) enables fallback on the explicit method-missing exit. The daemon logs this once per Process code-cell version.
 
-Refunds require the verdict-producing live Process ELF and state. Each refund includes the code cell as a dependency, and the worker checks the state against the node immediately before submitting. The sweep considers up to 16 singleton refunds per Process per tick, advances past the last attempt, and stops on RPC unavailability.
+Refunds require the verdict-producing live Process ELF and state. Each refund includes the code cell as a dependency, and the worker checks the state against the node immediately before submitting. For unaudited guests, the refund also includes the authorizing state outpoint as a cell dependency so CKB enforces its liveness. A pending digest that spends that state can delay the refund until the worker resolves the recreated state and obtains a fresh verdict. Audited example guests preserve the state lock, so their refunds can use the code dependency alone and proceed while a digest is pending. The sweep considers up to 16 singleton refunds per Process per tick, advances past the last attempt, and stops on RPC unavailability.
 
 No private keys, no signing, no `.env`, no contract `deployment/` writes.
 
@@ -56,7 +56,7 @@ The contract pin is `b2d01e0a5a9760c8ee627633365aa98dd7a99859`. These are the co
 | CID lock | `0x48ee645be85d43c1b531b43c857c2792ea275c471df58a51066e0adddf7a9e73` | `0x816d279f64d00533c61a5c851ed5ce5c6285c5dcc8b3253505432d05aa11e2a4` |
 | Example Process | `0x3b9d86096d5be14cd560e2dd161845d9b4773171695629053d0bafaf6a7dcc4d` | `0x2374e455d8cdcae5d5387257ec0d5b33114d3b5338d823d5e388b5a0a767f226` |
 
-When the live ELF matches the pinned example data hash, the backend checks accepted Intentions for a beneficiary that uses the live Process lock code hash. A match follows the reason-6 malformed digest refund path.
+The pinned `Process.filter` runs without Process state and accepts an otherwise valid Intention whose beneficiary uses the Process lock code hash. `Process.assemble` reads the state and rejects that beneficiary with exit 32. The worker isolates the cell and considers a refund only when the audited example policy confirms the per-cell rejection against the live Process state.
 
 Send this JSON to `POST http://127.0.0.1:9101/v1/processes`. Replace the state placeholder with the 32-byte TYPE_ID args of your live Process instance.
 
@@ -100,7 +100,7 @@ Pinned `cid_process_example` pays fee from Process state and **rejects extra
 funding inputs** with `UnsupportedFundingLock` (38). Do not pass funding cells
 to the example guest / calculator submit helper. Exit 21 leaves the cells live. It can report a batch-level mismatch.
 
-Exits 39 (deposit below minimum) and 40 (CID lock mismatch) trigger diagnostic assembly. Exit 32 (invalid beneficiary) also triggers it for audited example ELF hashes. If the guest requires more than one Intention, the worker shares a budget of 64 probes per Process per tick between finding a working batch and substituting candidates into it. It resumes both phases on later ticks for the same candidate set and Process snapshot. When a recombined batch hits exit 21 or 37, the worker rebuilds and validates the successful control subset. Substitution failures exclude candidates from the current batch. Only audited example ELF hashes can qualify those candidates for refunds, and each retry rechecks the per-cell verdict against the current Process state. Unaudited assembly failures leave Intentions live for later assembly attempts.
+Exits 39 (deposit below minimum) and 40 (CID lock mismatch) trigger diagnostic assembly. Exit 32 (invalid beneficiary) also triggers it for audited example ELF hashes. If the guest requires more than one Intention, the worker shares a budget of 64 probes per Process per tick between finding a working batch and substituting candidates into it. It resumes unfinished searches on later ticks for the same Process snapshot and advances to the next window when the search is exhausted. When a recombined batch hits exit 21, 37, 39, or 40, the worker rebuilds and validates the successful control subset. Substitution failures exclude candidates from the current batch. Only audited example ELF hashes can qualify those candidates for refunds, and each retry rechecks the per-cell verdict against the current Process state. Unaudited assembly failures leave Intentions live for later assembly attempts.
 
 Exit 41 (invalid Process state lock args) logs `process.unhealthy` and pauses assembly and refunds for that state and Process code version. Host query failures (36) are retried. Insufficient state capacity (37) leaves Intentions live and the comparison search advances to the next subset, which may need a smaller fee.
 

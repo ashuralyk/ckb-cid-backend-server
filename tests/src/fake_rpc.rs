@@ -16,7 +16,7 @@ struct Inner {
     reject_next_submit: bool,
     reject_next_dry_run: bool,
     spent_deps: HashSet<OutPoint>,
-    spend_dep_on_submit: Option<OutPoint>,
+    replace_cell_on_submit: Option<(OutPoint, Option<LiveCell>)>,
     stale_indexer_cells: HashSet<OutPoint>,
     indexer_snapshots: HashMap<OutPoint, Option<LiveCell>>,
     unavailable_submit_inputs: HashSet<OutPoint>,
@@ -171,6 +171,10 @@ impl FakeRpc {
         self.inner.lock().unwrap().stale_indexer_cells.insert(op);
     }
 
+    pub fn restore_indexer_cell_liveness(&self, op: &OutPoint) {
+        self.inner.lock().unwrap().stale_indexer_cells.remove(op);
+    }
+
     pub fn set_indexer_snapshot(&self, op: OutPoint, cell: Option<LiveCell>) {
         self.inner
             .lock()
@@ -188,7 +192,11 @@ impl FakeRpc {
     }
 
     pub fn spend_dep_on_next_submit(&self, op: OutPoint) {
-        self.inner.lock().unwrap().spend_dep_on_submit = Some(op);
+        self.inner.lock().unwrap().replace_cell_on_submit = Some((op, None));
+    }
+
+    pub fn replace_cell_on_next_submit(&self, op: OutPoint, replacement: LiveCell) {
+        self.inner.lock().unwrap().replace_cell_on_submit = Some((op, Some(replacement)));
     }
 
     pub fn inject_unavailable_refund_once(&self, op: OutPoint) {
@@ -465,9 +473,13 @@ impl Rpc for FakeRpc {
     fn submit_transaction(&self, tx: &TransactionView) -> Result<Byte32, RpcError> {
         let mut inner = self.inner.lock().unwrap();
         inner.submit_attempts += 1;
-        if let Some(op) = inner.spend_dep_on_submit.take() {
+        if let Some((op, replacement)) = inner.replace_cell_on_submit.take() {
             inner.cells.remove(&out_point_key(&op));
             inner.spent_deps.insert(op);
+            if let Some(cell) = replacement {
+                inner.order.push(cell.out_point.clone());
+                inner.cells.insert(out_point_key(&cell.out_point), cell);
+            }
         }
         if tx
             .cell_deps()

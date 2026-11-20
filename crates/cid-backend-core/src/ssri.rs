@@ -457,7 +457,11 @@ mod tests {
             .out_point(code_cell.out_point.clone())
             .dep_type(ckb_types::core::DepType::Code.into())
             .build();
-        let draft = build_batch_draft(std::slice::from_ref(&intent), &resolved, &[code_dep]);
+        let draft = build_batch_draft(
+            std::slice::from_ref(&intent),
+            &resolved,
+            std::slice::from_ref(&code_dep),
+        );
         let tip = (0u64, [0xAB; 32]);
         let host = seed_mock_host_from_live_cells(
             &[
@@ -485,7 +489,7 @@ mod tests {
         );
 
         let assembled = EmbeddedSsri
-            .assemble(&bin, &draft, host)
+            .assemble(&bin, &draft, host.clone())
             .expect("Process.assemble n=1 via ckb-vm");
         assert_eq!(assembled.outputs.len(), 2, "process recreate + beneficiary");
         assert_eq!(assembled.witnesses.len(), assembled.inputs.len());
@@ -497,6 +501,27 @@ mod tests {
         );
         let ben_cap: u64 = assembled.outputs[1].capacity().unpack();
         assert_eq!(ben_cap, 600_0000_0000);
+
+        let mut process_beneficiary = intent;
+        process_beneficiary.args.entry.payload = Payload::from_script(&CidScript {
+            code_hash,
+            hash_type: 1,
+            args: vec![],
+        })
+        .unwrap();
+        process_beneficiary.lock_args = process_beneficiary.args.encode().unwrap();
+        let items = std::slice::from_ref(&process_beneficiary);
+        assert_eq!(
+            filter_intentions(&EmbeddedSsri, &bin, items).unwrap(),
+            [Some(cid_intention_filter::FILTER_ACCEPTED)]
+        );
+        let draft_cell = intention_draft_cell(&process_beneficiary);
+        host.insert_cell(draft_cell.out_point, draft_cell.output, draft_cell.data);
+        let draft = build_batch_draft(items, &resolved, &[code_dep]);
+        assert!(matches!(
+            EmbeddedSsri.assemble(&bin, &draft, host),
+            Err(SsriError::Incompatible(BENEFICIARY_MISSING))
+        ));
 
         // CI gate greps this exact banner under `--nocapture` (do not weaken).
         eprintln!("real SSRI guest executed: Process.filter=[0,5] Process.batch=({min},{max}) Process.assemble n=1 ok");
