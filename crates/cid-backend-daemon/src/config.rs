@@ -46,7 +46,6 @@ pub struct DaemonConfig {
     pub registry_max_entries: usize,
     /// Confirmation depth for submitted execution txs. Default 24.
     pub confirmation_depth: u64,
-    pub allow_missing_filter: bool,
     /// Fee rate for allowlisted bounded refunds. The guest sets DigestOk fees.
     pub fee_rate: u64,
     /// Audited CID lock identities that may use bounded refund fee mode.
@@ -220,7 +219,7 @@ pub fn usage() -> &'static str {
      Routing uses cid_lock.type_id_args (+ optional type_id full hash).\n\
      Register Process state and code Type IDs through the HTTP API.\n\
      Type-ID CellDeps refresh each tick. Static [[cell_deps]] supply extras.\n\
-     loop.allow_missing_filter defaults to false.\n"
+     Process.filter is required for processing.\n"
 }
 
 #[derive(Default, Deserialize)]
@@ -346,8 +345,6 @@ struct LoopSection {
     poll_interval_secs: Option<u64>,
     #[serde(default)]
     confirmation_depth: Option<u64>,
-    #[serde(default)]
-    allow_missing_filter: bool,
     #[serde(default)]
     fee_rate: Option<u64>,
 }
@@ -777,10 +774,6 @@ fn merge<F: Fn(&str) -> Option<String>>(
         ));
     }
 
-    let allow_missing_filter = match nonempty(&get, "CID_ALLOW_MISSING_FILTER") {
-        Some(s) => parse_bool_flag(&s, "CID_ALLOW_MISSING_FILTER")?,
-        None => digest.allow_missing_filter,
-    };
     Ok(DaemonConfig {
         node_url,
         indexer_url,
@@ -796,7 +789,6 @@ fn merge<F: Fn(&str) -> Option<String>>(
         registry_path,
         registry_max_entries,
         confirmation_depth,
-        allow_missing_filter,
         fee_rate,
         bounded_refund_locks,
         extra_scan_locks,
@@ -1988,6 +1980,15 @@ poll_interval_secs = 1
     }
 
     #[test]
+    fn obsolete_missing_filter_setting_is_rejected() {
+        let example = include_str!("../../../examples/cid.testnet.toml");
+        let config = example.replace("[loop]\n", "[loop]\nallow_missing_filter = true\n");
+        let path = write_toml(&config);
+        let error = DaemonConfig::from_file_and_vars(Some(&path), |_| None).unwrap_err();
+        assert!(error.to_string().contains("unknown field"), "{error}");
+    }
+
+    #[test]
     fn testnet_v014_example_loads_with_current_cid_type_id() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/cid.testnet.toml");
         let cfg = DaemonConfig::from_file_and_vars(Some(&path), |_| None).unwrap();
@@ -2001,7 +2002,6 @@ poll_interval_secs = 1
         let index: u32 = xudt.out_point().index().unpack();
         assert_eq!(index, 0);
         assert!(cfg.validate_genesis);
-        assert!(!cfg.allow_missing_filter);
         assert_eq!(
             hex::encode(cfg.cid_lock_code_hash),
             "f3f8a56c2594030f99f05b09ff1b6a1b07e6e07ed04309c1c4e246561faad326"
@@ -2014,11 +2014,6 @@ poll_interval_secs = 1
                 ScriptHashType::Type
             )]
         );
-        let cfg = DaemonConfig::from_file_and_vars(Some(&path), |key| {
-            (key == "CID_ALLOW_MISSING_FILTER").then(|| "true".into())
-        })
-        .unwrap();
-        assert!(cfg.allow_missing_filter);
     }
 
     #[test]

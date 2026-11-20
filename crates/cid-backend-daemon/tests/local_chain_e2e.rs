@@ -652,7 +652,6 @@ fn scan_resolve_ssri_submit_confirms_on_local_dev_chain() {
         registry_path: std::env::temp_dir().join("cid-local-e2e-registry.json"),
         registry_max_entries: 64,
         confirmation_depth: 1,
-        allow_missing_filter: false,
         fee_rate: cid_backend_core::DEFAULT_FEE_RATE,
         bounded_refund_locks: vec![],
         extra_scan_locks: vec![],

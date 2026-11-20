@@ -31,7 +31,6 @@ max_entries = 64
 poll_interval_secs = 5
 confirmation_depth = 24
 fee_rate = 1000
-allow_missing_filter = false
 
 [observe]
 api_bind = "127.0.0.1:9101"

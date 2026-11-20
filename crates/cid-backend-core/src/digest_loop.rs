@@ -134,7 +134,6 @@ where
     clock: C,
     ssri: Arc<S>,
     config: LoopConfig,
-    allow_missing_filter: bool,
     workers: WorkerPool<R, S>,
     /// Optional shared command queue for live registry API updates.
     worker_cmds: Option<Arc<WorkerCommands>>,
@@ -176,7 +175,6 @@ where
             clock,
             ssri,
             config,
-            allow_missing_filter: false,
             workers,
             worker_cmds,
             busy: None,
@@ -204,12 +202,6 @@ where
 
     pub fn with_busy_map(mut self, busy: ProcessBusyMap) -> Self {
         self.busy = Some(busy);
-        self
-    }
-
-    /// Opt in to assembly for guests that explicitly lack Process.filter.
-    pub fn with_missing_filter_fallback(mut self, allow: bool) -> Self {
-        self.allow_missing_filter = allow;
         self
     }
 
@@ -427,7 +419,7 @@ where
         self.drain_worker_commands();
         let mut report = TickReport::default();
         let tip = self.refresh_tip();
-        let released_digests = self.reconcile_pending(tip);
+        self.reconcile_pending(tip);
 
         let resolved = match self.refresh_cell_deps() {
             Ok(deps) => deps,
@@ -582,10 +574,15 @@ where
             })
             .collect();
 
-        // Let an eligible refund use the state just released by a pending
-        // digest before another digest can occupy it.
+        // The priority survives ticks where the indexer cannot locate the
+        // released Process state or a fresh filter pass cannot finish.
         for bucket in &mut buckets {
-            if released_digests.contains(&bucket.process.type_hash) {
+            let Some(worker) = self.workers.get(&bucket.process.type_hash) else {
+                continue;
+            };
+            if bucket.refunds.is_empty() {
+                worker.with_state_mut(|state| state.refund_priority = false);
+            } else if worker.with_state(|state| state.refund_priority) {
                 self.dispatch_filter_refunds(bucket, &mut report);
             }
         }
@@ -739,8 +736,7 @@ where
         self.refresh_tip_only()
     }
 
-    fn reconcile_pending(&mut self, tip: Option<u64>) -> HashSet<[u8; 32]> {
-        let mut released_digests = HashSet::new();
+    fn reconcile_pending(&mut self, tip: Option<u64>) {
         let depth = self.config.confirmation_depth.max(1);
         let worker_hashes: Vec<[u8; 32]> = self.workers.hashes();
         for process_hash in worker_hashes {
@@ -810,7 +806,7 @@ where
                         worker.with_state_mut(|state| {
                             if let Some(p) = state.submit.pending.remove(&hash_bytes) {
                                 if !state.refund_state_deps.contains_key(&hash_bytes) {
-                                    released_digests.insert(process_hash);
+                                    state.refund_priority = true;
                                 }
                                 for k in p.consumed {
                                     state.submit.in_flight.remove(&k);
@@ -877,7 +873,7 @@ where
                             worker.with_state_mut(|state| {
                                 state.submit.pending.remove(&hash_bytes);
                                 if !state.refund_state_deps.contains_key(&hash_bytes) {
-                                    released_digests.insert(process_hash);
+                                    state.refund_priority = true;
                                 }
                             });
                         } else {
@@ -909,7 +905,6 @@ where
                 }
             }
         }
-        released_digests
     }
 
     fn refresh_tip_only(&mut self) -> Option<u64> {
@@ -1022,17 +1017,13 @@ where
                 worker.with_state_mut(|state| {
                     if !state.filter_missing_logged {
                         tracing::warn!(target: LOG_TARGET, event = "ssri.filter_missing",
-                            process_type_hash = %hex_pref(&hash),
-                            fallback = self.allow_missing_filter);
+                            process_type_hash = %hex_pref(&hash));
                         state.filter_missing_logged = true;
                     }
                 });
-                if !self.allow_missing_filter {
-                    report.skipped += bucket.len();
-                    report.last_error = Some("Process.filter is missing".into());
-                    return None;
-                }
-                accepted = bucket;
+                report.skipped += bucket.len();
+                report.last_error = Some("Process.filter is missing".into());
+                return None;
             }
             Err(error) => {
                 tracing::warn!(target: LOG_TARGET, event = "ssri.filter_failed",

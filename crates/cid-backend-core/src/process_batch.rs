@@ -500,6 +500,11 @@ fn submit_digest<R: Rpc>(
             report.last_error = Some(format!("dry-run conflict: {m}"));
             return None;
         }
+        DryRunGate::Skip(RpcError::FeeRateRejected(m)) => {
+            tracing::warn!(target: LOG_TARGET, event = "dry_run.fee_rate_rejected", error = %m);
+            report.last_error = Some(format!("dry-run minimum fee rate rejected: {m}"));
+            return None;
+        }
         DryRunGate::Skip(m) => {
             tracing::warn!(
                 target: LOG_TARGET,
@@ -552,6 +557,11 @@ fn submit_digest<R: Rpc>(
                 n = batch.len(),
             );
             report.last_error = Some(format!("submit rejected: {m}"));
+            None
+        }
+        Err(RpcError::FeeRateRejected(m)) => {
+            tracing::warn!(target: LOG_TARGET, event = "submit.fee_rate_rejected", error = %m);
+            report.last_error = Some(format!("submit minimum fee rate rejected: {m}"));
             None
         }
         Err(e) => {
@@ -987,6 +997,12 @@ fn submit_filter_refund<R: Rpc + HostQueryRpc>(
             report.skipped += 1;
             return BatchOutcome::Continue;
         }
+        DryRunGate::Skip(RpcError::FeeRateRejected(error)) => {
+            tracing::warn!(target: LOG_TARGET, event = "dry_run.fee_rate_rejected", %error);
+            report.last_error = Some(format!("dry-run minimum fee rate rejected: {error}"));
+            report.skipped += 1;
+            return BatchOutcome::Continue;
+        }
         DryRunGate::Skip(error) => {
             tracing::warn!(target: LOG_TARGET, event = "tick.skip",
                 reason = "dry_run_unavailable", %error);
@@ -1022,6 +1038,7 @@ fn submit_filter_refund<R: Rpc + HostQueryRpc>(
     }
     match result {
         Ok(tx_hash) => {
+            worker.refund_priority = false;
             tracing::info!(target: LOG_TARGET, event = "submit.ok", tx_hash = %hex_pref(tx_hash.as_slice()));
             report.submitted += 1;
             BatchOutcome::Submitted
@@ -1036,6 +1053,12 @@ fn submit_filter_refund<R: Rpc + HostQueryRpc>(
             worker.submit.rejected_combos.insert(fp);
             tracing::warn!(target: LOG_TARGET, event = "submit.rejected", %error);
             report.last_error = Some(format!("submit rejected: {error}"));
+            report.skipped += 1;
+            BatchOutcome::Continue
+        }
+        Err(RpcError::FeeRateRejected(error)) => {
+            tracing::warn!(target: LOG_TARGET, event = "submit.fee_rate_rejected", %error);
+            report.last_error = Some(format!("submit minimum fee rate rejected: {error}"));
             report.skipped += 1;
             BatchOutcome::Continue
         }

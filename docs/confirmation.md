@@ -149,13 +149,13 @@ from a full indexer rescan.
 | Code | CKB error | Mapped to |
 |------|-----------|-----------|
 | `-301` | `TransactionFailedToResolve` | `Conflict` (also any message matching unknown-input / dead-cell / duplicate) |
-| `-1107` | `PoolRejectedDuplicatedTransaction` | `Conflict` |
+| `-1107` | `PoolRejectedDuplicatedTransaction` | `Unavailable` (the node may have already admitted the transaction, so the daemon tracks the local transaction hash and reconciles its status) |
 | `-302` | `TransactionFailedToVerify` | `SubmitRejected` |
 | `-1102` | `PoolRejectedTransactionByOutputsValidator` | `SubmitRejected` |
 | `-1108` | `PoolRejectedMalformedTransaction` | `SubmitRejected` |
 | `-1106` | `PoolIsFull` | `Unavailable` (retry) |
 | `-1105` | `PoolRejectedTransactionByMaxAncestorsCountLimit` | `Unavailable` (retry) |
-| `-1104` | `PoolRejectedTransactionByMinFeeRate` | `Unavailable` (node policy; same tx may succeed if the node config changes) |
+| `-1104` | `PoolRejectedTransactionByMinFeeRate` | `FeeRateRejected` (keep scanning other combinations in the current tick and allow the same combination to be retried in a later tick) |
 | other / missing code | — | `Unavailable` (do **not** blacklist an Intention on an unclassified error) |
 
 A committed execution tx with a **known** `tx_status.block_number` of `0` is

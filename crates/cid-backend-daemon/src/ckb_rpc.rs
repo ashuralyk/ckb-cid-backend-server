@@ -667,8 +667,6 @@ const TX_FAILED_TO_RESOLVE: i64 = -301;
 const TX_FAILED_TO_VERIFY: i64 = -302;
 const POOL_REJECTED_BY_OUTPUTS_VALIDATOR: i64 = -1102;
 const POOL_REJECTED_BY_MIN_FEE_RATE: i64 = -1104;
-const POOL_REJECTED_BY_MAX_ANCESTORS: i64 = -1105;
-const POOL_IS_FULL: i64 = -1106;
 const POOL_REJECTED_DUPLICATED: i64 = -1107;
 const POOL_REJECTED_MALFORMED: i64 = -1108;
 
@@ -682,6 +680,9 @@ fn json_rpc_code(err: &Value) -> Option<i64> {
 const JSON_RPC_METHOD_NOT_FOUND: i64 = -32601;
 
 fn map_verify_rpc_error(method: &str, code: Option<i64>, msg: &str) -> RpcError {
+    if code == Some(POOL_REJECTED_BY_MIN_FEE_RATE) {
+        return RpcError::FeeRateRejected(msg.into());
+    }
     if is_conflict(msg) {
         return RpcError::Conflict(msg.into());
     }
@@ -692,11 +693,6 @@ fn map_verify_rpc_error(method: &str, code: Option<i64>, msg: &str) -> RpcError 
         Some(TX_FAILED_TO_VERIFY)
         | Some(POOL_REJECTED_BY_OUTPUTS_VALIDATOR)
         | Some(POOL_REJECTED_MALFORMED) => RpcError::SubmitRejected(msg.into()),
-        Some(POOL_IS_FULL)
-        | Some(POOL_REJECTED_BY_MAX_ANCESTORS)
-        | Some(POOL_REJECTED_BY_MIN_FEE_RATE) => {
-            RpcError::Unavailable(format!("{method} {code:?}: {msg}"))
-        }
         _ => RpcError::Unavailable(format!("{method} {code:?}: {msg}")),
     }
 }
@@ -717,6 +713,9 @@ fn map_rpc_error(method: &str, code: Option<i64>, msg: &str) -> RpcError {
 fn dry_run_should_fallback(code: Option<i64>, msg: &str) -> bool {
     if code == Some(JSON_RPC_METHOD_NOT_FOUND) {
         return true;
+    }
+    if code == Some(POOL_REJECTED_BY_MIN_FEE_RATE) {
+        return false;
     }
     let m = msg.to_ascii_lowercase();
     m.contains("method not found") || m.contains("test_tx_pool_accept")
@@ -1690,6 +1689,27 @@ mod tests {
                 rpc.submit_transaction(&tx),
                 Err(RpcError::Unavailable(_))
             ));
+        }
+    }
+
+    #[test]
+    fn minimum_fee_rate_rejection_is_transaction_specific() {
+        for method in ["test_tx_pool_accept", "send_transaction"] {
+            let url = spawn_mock(Arc::new(move |actual, _| {
+                assert_eq!(actual, method);
+                Err((
+                    -1104,
+                    format!("{method}: PoolRejectedTransactionByMinFeeRate"),
+                ))
+            }));
+            let rpc = CkbRpc::new(&url, &url);
+            let tx = ckb_types::core::TransactionBuilder::default().build();
+            let error = if method == "test_tx_pool_accept" {
+                rpc.dry_run_transaction(&tx).unwrap_err()
+            } else {
+                rpc.submit_transaction(&tx).unwrap_err()
+            };
+            assert!(matches!(error, RpcError::FeeRateRejected(_)), "{error:?}");
         }
     }
 

@@ -44,6 +44,8 @@ pub struct ProcessWorkerState {
     pub submit: SubmitState,
     /// State dependencies of submitted filter refunds, keyed by transaction.
     pub(crate) refund_state_deps: HashMap<Vec<u8>, OutPoint>,
+    /// Give refunds the first opportunity after a digest releases Process state.
+    pub(crate) refund_priority: bool,
     unfunded_process: Option<(OutPoint, Option<OutPoint>)>,
     /// Shared across assembly jobs within a tick, cleared after all jobs finish.
     pub(crate) probe_budget: Option<ProbeBudget>,
@@ -66,6 +68,7 @@ impl ProcessWorkerState {
             resolver,
             submit: SubmitState::default(),
             refund_state_deps: HashMap::new(),
+            refund_priority: false,
             unfunded_process: None,
             probe_budget: None,
             generation,

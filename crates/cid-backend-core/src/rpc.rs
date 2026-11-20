@@ -40,6 +40,8 @@ pub enum TxStatus {
 pub enum RpcError {
     Unavailable(String),
     SubmitRejected(String),
+    /// The node declined this transaction at its current minimum fee rate.
+    FeeRateRejected(String),
     Conflict(String),
 }
 
@@ -48,6 +50,7 @@ impl fmt::Display for RpcError {
         match self {
             RpcError::Unavailable(m) => write!(f, "rpc unavailable: {m}"),
             RpcError::SubmitRejected(m) => write!(f, "submit rejected: {m}"),
+            RpcError::FeeRateRejected(m) => write!(f, "minimum fee rate rejected: {m}"),
             RpcError::Conflict(m) => write!(f, "submit conflict: {m}"),
         }
     }

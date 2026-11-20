@@ -26,6 +26,7 @@ struct Inner {
     unavailable_next_dry_run: bool,
     reject_inputs: HashSet<Vec<u8>>,
     conflict_input: Option<(OutPoint, bool)>,
+    fee_rate_rejected_input_count: Option<(usize, bool)>,
     cid_lock_groups: Option<([u8; 32], ScriptHashType)>,
     submit_attempts: usize,
     dry_run_attempts: usize,
@@ -108,6 +109,10 @@ impl FakeRpc {
 
     pub fn conflict_on_input(&self, op: Option<OutPoint>, dry_run: bool) {
         self.inner.lock().unwrap().conflict_input = op.map(|op| (op, dry_run));
+    }
+
+    pub fn reject_fee_rate_at_input_count(&self, count: usize, dry_run: bool) {
+        self.inner.lock().unwrap().fee_rate_rejected_input_count = Some((count, dry_run));
     }
 
     pub fn enforce_single_input_cid_lock_groups(
@@ -540,6 +545,11 @@ impl Rpc for FakeRpc {
         let mut inner = self.inner.lock().unwrap();
         inner.dry_run_attempts += 1;
         check_injected_conflict(&inner, tx, true)?;
+        if inner.fee_rate_rejected_input_count == Some((tx.inputs().len(), true)) {
+            return Err(RpcError::FeeRateRejected(
+                "injected minimum fee rate".into(),
+            ));
+        }
         if let Some((code_hash, hash_type)) = inner.cid_lock_groups {
             let mut groups = HashSet::new();
             for input in tx.inputs() {
@@ -575,6 +585,11 @@ impl Rpc for FakeRpc {
         let mut inner = self.inner.lock().unwrap();
         inner.submit_attempts += 1;
         check_injected_conflict(&inner, tx, false)?;
+        if inner.fee_rate_rejected_input_count == Some((tx.inputs().len(), false)) {
+            return Err(RpcError::FeeRateRejected(
+                "injected minimum fee rate".into(),
+            ));
+        }
         if let Some((op, replacement)) = inner.replace_cell_on_submit.take() {
             inner.cells.remove(&out_point_key(&op));
             inner.spent_deps.insert(op);

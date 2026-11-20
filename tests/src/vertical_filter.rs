@@ -231,6 +231,26 @@ mod tests {
     }
 
     #[test]
+    fn minimum_fee_rejection_tries_smaller_batches_at_either_rpc_gate() {
+        for dry_run in [true, false] {
+            let (rpc, state, ops) = chain(2);
+            rpc.reject_fee_rate_at_input_count(3, dry_run);
+            let mut loop_ =
+                loop_with_resolver(rpc, ScriptedSsri::mimic((1, 4)), default_loop_config(), 1);
+
+            let report = loop_.tick();
+            assert_eq!(report.submitted, 1, "{report:?}");
+            let inputs = &input_sets(loop_.rpc())[0];
+            assert_eq!(inputs.len(), 2);
+            assert!(ops.contains(&inputs[0]));
+            assert_eq!(inputs[1], state.out_point);
+            let submit = loop_.state().submit.unwrap();
+            assert!(submit.rejected_combos.is_empty());
+            assert_eq!(submit.pending.len(), 1);
+        }
+    }
+
+    #[test]
     fn assembly_isolation_retries_conflicts_next_tick() {
         let (rpc, state, ops) = chain(2);
         rpc.conflict_on_input(Some(ops[1].clone()), false);
@@ -803,6 +823,30 @@ mod tests {
     }
 
     #[test]
+    fn filter_refund_keeps_priority_while_indexer_lags_after_digest_settlement() {
+        let (rpc, _, ops) = chain(3);
+        rpc.defer_commit();
+        let ssri = ScriptedSsri::mimic((1, 1)).with_filter(|n| {
+            let mut reasons = vec![0; n];
+            reasons[n - 1] = 5;
+            Ok(reasons)
+        });
+        let mut loop_ = loop_with_resolver(rpc, ssri, default_loop_config(), 1);
+
+        assert_eq!(loop_.tick().submitted, 1);
+        let digest = &loop_.rpc().submitted()[0];
+        let next_state = OutPoint::new(digest.hash(), 0);
+        loop_.rpc().commit_pending(&digest.hash());
+        loop_.rpc().set_indexer_snapshot(next_state.clone(), None);
+        assert_eq!(loop_.tick().submitted, 0);
+        assert!(loop_.state().submit.unwrap().pending.is_empty());
+
+        loop_.rpc().clear_indexer_snapshot(&next_state);
+        assert_eq!(loop_.tick().submitted, 1);
+        assert_eq!(input_sets(loop_.rpc())[1], [ops[2].clone()]);
+    }
+
+    #[test]
     fn filter_refund_proceeds_after_peer_settlement_despite_a_capped_search() {
         let (rpc, _, ops) = chain(68);
         rpc.defer_commit();
@@ -1142,20 +1186,19 @@ mod tests {
     }
 
     #[test]
-    fn method_missing_falls_back_only_with_opt_in() {
-        for allow in [false, true] {
-            let (rpc, _, _) = chain(1);
-            let ssri = ScriptedSsri::mimic((1, 4)).with_filter(|_| Err(SsriError::MethodNotFound));
-            let mut loop_ = loop_with_resolver(rpc, ssri, default_loop_config(), 1)
-                .with_missing_filter_fallback(allow);
-            assert_eq!(loop_.tick().submitted, usize::from(allow));
-        }
-        let (rpc, _, _) = chain(1);
-        let ssri = ScriptedSsri::mimic((1, 4))
-            .with_filter(|_| Err(SsriError::Unusable("guest crash".into())));
-        let mut loop_ = loop_with_resolver(rpc, ssri, default_loop_config(), 1)
-            .with_missing_filter_fallback(true);
-        assert_eq!(loop_.tick().submitted, 0);
+    fn method_missing_defers_the_whole_bucket() {
+        let (rpc, _, ops) = chain(1);
+        let ssri = ScriptedSsri::mimic((1, 4)).with_filter(|_| Err(SsriError::MethodNotFound));
+        let mut loop_ = loop_with_resolver(rpc, ssri, default_loop_config(), 1);
+
+        let report = loop_.tick();
+        assert_eq!(
+            report.last_error.as_deref(),
+            Some("Process.filter is missing")
+        );
+        assert_eq!(report.submitted, 0);
+        assert_eq!(loop_.rpc().dry_run_attempts(), 0);
+        assert!(loop_.rpc().has_cell(&ops[0]));
     }
 
     #[test]
