@@ -240,7 +240,7 @@ pub fn assemble_digest_incompatible(
     )
 }
 
-/// Build a refund for one lock identity. The caller partitions batches before fee selection.
+/// Build a refund for one lock identity using its configured fee mode.
 pub(crate) fn assemble_refund_with_policy(
     intentions: &[ScannedIntention],
     cell_deps: &[CellDep],

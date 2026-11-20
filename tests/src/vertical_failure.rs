@@ -604,9 +604,14 @@ mod tests {
     #[test]
     fn unbuildable_refund_prefix_does_not_starve_later_refundable_intention() {
         let rpc = FakeRpc::new();
+        rpc.insert_cell(crate::helpers::code_cell(
+            0xA0,
+            crate::helpers::PROC_CODE_ARGS,
+            crate::helpers::FIXTURE_ELF.to_vec(),
+        ));
         let ts = process_type_script(34);
         let hash = script_hash32(&ts);
-        const POISON: u8 = 64;
+        const POISON: u8 = 16;
         let mut poison = Vec::new();
         for fill in 1..=POISON {
             let cell = unbuildable_intention(fill, hash);
@@ -619,13 +624,13 @@ mod tests {
         rpc.insert_cell(proc.clone());
         let mut loop_ = loop_with_resolver(
             rpc,
-            ScriptedSsri::ok_then_incompatible((1, 1), 0, 21),
+            ScriptedSsri::mimic((1, 1)).with_filter(|n| Ok(vec![6; n])),
             cfg(),
             34,
         );
 
         let first = loop_.tick();
-        assert_eq!(first.submitted, 0, "budget stops at 64 unbuildable refunds");
+        assert_eq!(first.submitted, 0, "budget stops at 16 unbuildable refunds");
         assert_eq!(
             loop_.rpc().submit_attempts(),
             0,

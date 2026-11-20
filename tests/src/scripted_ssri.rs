@@ -9,12 +9,14 @@ use ckb_types::packed::{CellInput, CellOutput, OutPoint, RawTransaction, Script,
 use ckb_types::prelude::*;
 
 type FilterScript = Box<dyn FnMut(usize) -> Result<Vec<i8>, SsriError> + Send>;
+type AssemblyErrorScript = Box<dyn Fn(&[OutPoint], &MockHost) -> Option<i8> + Send + Sync>;
 
 pub struct ScriptedSsri {
     filter_script: Mutex<Option<FilterScript>>,
     pub filter_requests: Mutex<Vec<Vec<u8>>>,
     intention_errors: Vec<(OutPoint, i8, Option<u64>)>,
     pair_error: Option<(OutPoint, i8)>,
+    assembly_error: Option<AssemblyErrorScript>,
     additional_input: Option<OutPoint>,
     pub bounds: (u32, u32),
     pub mode: Mode,
@@ -26,10 +28,6 @@ pub enum Mode {
     MimicExample,
     AlwaysIncompatible(i8),
     Unusable,
-    OkThenIncompatible {
-        remaining_ok: Mutex<u32>,
-        code: i8,
-    },
     /// Digest_ok beneficiary output capacity (independent of Intention capacity).
     FixedBeneficiary(u64),
 }
@@ -41,6 +39,7 @@ impl ScriptedSsri {
             filter_requests: Mutex::new(Vec::new()),
             intention_errors: Vec::new(),
             pair_error: None,
+            assembly_error: None,
             additional_input: None,
             bounds,
             mode,
@@ -58,16 +57,6 @@ impl ScriptedSsri {
 
     pub fn unusable() -> Self {
         Self::base((1, 4), Mode::Unusable)
-    }
-
-    pub fn ok_then_incompatible(bounds: (u32, u32), ok_calls: u32, code: i8) -> Self {
-        Self::base(
-            bounds,
-            Mode::OkThenIncompatible {
-                remaining_ok: Mutex::new(ok_calls),
-                code,
-            },
-        )
     }
 
     pub fn fixed_beneficiary(bounds: (u32, u32), capacity: u64) -> Self {
@@ -89,6 +78,14 @@ impl ScriptedSsri {
 
     pub fn with_pair_error(mut self, op: OutPoint, code: i8) -> Self {
         self.pair_error = Some((op, code));
+        self
+    }
+
+    pub fn with_assembly_error(
+        mut self,
+        error: impl Fn(&[OutPoint], &MockHost) -> Option<i8> + Send + Sync + 'static,
+    ) -> Self {
+        self.assembly_error = Some(Box::new(error));
         self
     }
 
@@ -140,29 +137,38 @@ impl SsriHost for ScriptedSsri {
         host: MockHost,
     ) -> Result<AssembledTx, SsriError> {
         self.note_binary(binary);
-        if !self.intention_errors.is_empty() || self.pair_error.is_some() {
+        if self.assembly_error.is_some()
+            || !self.intention_errors.is_empty()
+            || self.pair_error.is_some()
+        {
             let inputs: Vec<_> = Transaction::from_slice(draft_tx)
                 .unwrap()
                 .raw()
                 .inputs()
                 .into_iter()
+                .map(|input| input.previous_output())
                 .collect();
+            if let Some(code) = self
+                .assembly_error
+                .as_ref()
+                .and_then(|error| error(&inputs, &host))
+            {
+                return Err(SsriError::Incompatible(code));
+            }
             if let Some((op, code)) = &self.pair_error {
-                if inputs.len() == 3 && inputs.iter().any(|input| input.previous_output() == *op) {
+                if inputs.len() == 3 && inputs.contains(op) {
                     return Err(SsriError::Incompatible(*code));
                 }
             }
-            for input in &inputs {
-                let op = input.previous_output();
+            for op in &inputs {
                 for (bad, code, state_cap) in &self.intention_errors {
-                    if *bad == op
+                    if bad == op
                         && state_cap.is_none_or(|cap| {
                             inputs.iter().any(|input| {
-                                host.get_cell(input.previous_output().as_slice())
-                                    .is_some_and(|cell| {
-                                        let capacity: u64 = cell.output.capacity().unpack();
-                                        is_process_state(&cell) && capacity == cap
-                                    })
+                                host.get_cell(input.as_slice()).is_some_and(|cell| {
+                                    let capacity: u64 = cell.output.capacity().unpack();
+                                    is_process_state(&cell) && capacity == cap
+                                })
                             })
                         })
                     {
@@ -190,15 +196,6 @@ impl SsriHost for ScriptedSsri {
                     .map_err(|error| SsriError::Unusable(error.to_string()))
             }
             Mode::FixedBeneficiary(cap) => mimic_assemble(draft_tx, host, Some(*cap)),
-            Mode::OkThenIncompatible { remaining_ok, code } => {
-                let mut n = remaining_ok.lock().unwrap();
-                if *n > 0 {
-                    *n -= 1;
-                    mimic_assemble(draft_tx, host, None)
-                } else {
-                    Err(SsriError::Incompatible(*code))
-                }
-            }
         }
     }
 }

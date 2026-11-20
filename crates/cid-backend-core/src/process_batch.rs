@@ -8,7 +8,7 @@ const DEFAULT_MAX_ASSEMBLED_TX_BYTES: usize = 512 * 1024;
 use crate::fee::{CidLockIdentity, RefundPolicy};
 use crate::host_query::HostQueryRpc;
 use crate::process::ResolvedProcess;
-use crate::rpc::{out_point_key, LiveCell, Rpc, RpcError};
+use crate::rpc::{LiveCell, Rpc, RpcError};
 use crate::scan::ScannedIntention;
 use crate::ssri::{
     build_batch_draft, draft_cell_deps_for_batch, draft_cells_for_batch, intention_draft_cell,
@@ -18,9 +18,11 @@ use crate::ssri::{
 };
 use crate::submit::{combo_fingerprint, dry_run_gate, submit_execution, DryRunGate};
 use crate::worker_commands::{Submission, WorkerCommands};
-use crate::workers::{IsolatedRefundScope, ProcessWorkerState};
+use crate::workers::ProcessWorkerState;
+use cid_intention_filter::{FILTER_DEPOSIT_BELOW_MINIMUM, FILTER_MALFORMED_DIGEST};
+use cid_process_example_policy::{classify_intention_excluding_process_lock, ProcessLockArgs};
 use cid_protocol::CidArgs;
-use ckb_types::packed::{CellDep, OutPoint};
+use ckb_types::packed::{CellDep, OutPoint, Script};
 use ckb_types::prelude::{Entity, Unpack};
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -65,14 +67,7 @@ pub struct BatchReportDelta {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BatchMode {
     Assemble,
-    RetryRefund,
     PolicyRefund,
-}
-
-impl BatchMode {
-    pub(crate) fn refund_only(self) -> bool {
-        self != Self::Assemble
-    }
 }
 
 pub struct ProcessBatchParams<'a> {
@@ -142,17 +137,6 @@ pub fn window_combo_cached(
     worker.submit.rejected_combos.contains(&fp)
 }
 
-/// Refund txs fingerprint with `process = None` (see assemble_and_submit_refund).
-pub fn refund_combo_cached(
-    worker: &ProcessWorkerState,
-    batch: &[ScannedIntention],
-    execution_code_key: &[u8],
-) -> bool {
-    let ops: Vec<_> = batch.iter().map(|i| i.out_point.clone()).collect();
-    let fp = combo_fingerprint(&ops, None, execution_code_key);
-    worker.submit.rejected_combos.contains(&fp)
-}
-
 pub fn run_process_batch<R, S>(
     rpc: Arc<R>,
     ssri: &S,
@@ -174,15 +158,14 @@ where
         execution_code_key,
         tick_cell_deps,
         cid_locks,
-        refund_policy,
+        refund_policy: _,
         max_assembled_tx_bytes,
         job_epoch,
         epoch,
         min,
-        mode,
+        mode: _,
         commands,
     } = params;
-    let refund_only = mode.refund_only();
     let lease = BatchLease {
         epoch: &epoch,
         job_epoch,
@@ -198,7 +181,7 @@ where
             report.skipped += batch.len();
             return (BatchOutcome::Continue, report);
         }
-        if !refund_only && window_combo_cached(&worker, &batch, process, execution_code_key) {
+        if window_combo_cached(&worker, &batch, process, execution_code_key) {
             tracing::debug!(
                 target: LOG_TARGET,
                 event = "submit.rejected_combo",
@@ -218,27 +201,6 @@ where
     }
 
     let cell_deps = draft_cell_deps_for_batch(process, tick_cell_deps);
-    if refund_only {
-        tracing::info!(
-            target: LOG_TARGET,
-            event = "refund.below_min_retry",
-            n = batch.len(),
-        );
-        return handle_incompatible_refunds(
-            rpc.as_ref(),
-            process,
-            &state,
-            &batch,
-            INCOMPATIBLE_BATCH,
-            execution_code_key,
-            &cell_deps,
-            refund_policy,
-            &mut report,
-            true,
-            &lease,
-        );
-    }
-
     if cell_deps.is_empty() {
         tracing::warn!(
             target: LOG_TARGET,
@@ -283,9 +245,14 @@ where
         let cells = draft_cells_for_batch(items, process);
         ssri.assemble_live(rpc.clone(), &process.binary, &draft, &cells, tip)
     };
-    let (mut probe, mut probes_left) = {
+    let lock = process.live_cell.lock();
+    let (mut probe, mut probes_left, audited) = {
         let mut worker = state.lock().expect("process worker state");
-        (worker.isolation_probe.take(), worker.comparison_probes_left)
+        (
+            worker.isolation_probe.take(),
+            worker.comparison_probes_left,
+            worker.audited_policy_lock.as_ref() == Some(&lock),
+        )
     };
     // A resumed search already has its trigger. Re-assembling the changed
     // window could restart isolation before the saved comparisons run.
@@ -294,6 +261,9 @@ where
     let original_code = match &initial {
         Some(Err(SsriError::Incompatible(code @ (DEPOSIT_BELOW_MINIMUM | CID_LOCK_MISMATCH)))) => {
             Some(*code)
+        }
+        Some(Err(SsriError::Incompatible(BENEFICIARY_MISSING))) if audited => {
+            Some(BENEFICIARY_MISSING)
         }
         _ => None,
     };
@@ -344,7 +314,11 @@ where
             worker.isolation_probe = probe;
             worker.comparison_probes_left = probes_left;
         }
-        let (good, bad) = match result {
+        let IsolatedIntentions {
+            accepted,
+            rejected,
+            control,
+        } = match result {
             Ok(Some(result)) => result,
             Ok(None) => {
                 report.skipped += batch.len();
@@ -364,29 +338,41 @@ where
                 );
             }
         };
-        if bad.is_empty() {
+        if accepted.is_empty() && rejected.is_empty() {
             report.last_error = Some("assemble: could not isolate an Intention".into());
             report.skipped += batch.len();
             return (BatchOutcome::RetryLater, report);
         }
         // Check the remaining group before issuing any refunds. Exit 41 at
         // any point invalidates the state snapshot and all pending refunds.
-        batch = good;
-        let remaining = (batch.len() >= min as usize).then(|| attempt(&batch));
+        batch = accepted;
+        let mut remaining = (batch.len() >= min as usize).then(|| attempt(&batch));
+        if matches!(
+            remaining,
+            Some(Err(SsriError::Incompatible(
+                INCOMPATIBLE_BATCH | STATE_CAPACITY_INSUFFICIENT
+            )))
+        ) && !control.is_empty()
+            && !control
+                .iter()
+                .map(|item| &item.out_point)
+                .eq(batch.iter().map(|item| &item.out_point))
+        {
+            tracing::info!(target: LOG_TARGET, event = "assemble.retry_control",
+                batch_size = batch.len(), control_size = control.len());
+            batch = control;
+            remaining = Some(attempt(&batch));
+        }
         if matches!(
             remaining,
             Some(Err(SsriError::Incompatible(PROCESS_LOCK_ARGS_INVALID)))
         ) {
-            return mark_process_unhealthy(hash, process, &state, batch.len() + bad.len());
+            return mark_process_unhealthy(hash, process, &state, batch.len() + rejected.len());
         }
-        if process.verdict_code_cell().is_some() && !lease.cancelled() {
+        if !lease.cancelled() {
             let mut worker = state.lock().expect("process worker state");
-            let can_refund = min == 1
-                || matches!(
-                    worker.isolated_refund_scope,
-                    Some(IsolatedRefundScope::Example(_))
-                );
-            for (item, code) in bad {
+            for (item, code) in rejected {
+                let can_refund = audited && audited_isolation_matches(&item, code, &lock);
                 tracing::warn!(target: LOG_TARGET, event = "assemble.intention_isolated",
                     process_type_hash = %hex_pref(&hash), out_point = ?item.out_point, code, can_refund);
                 if can_refund {
@@ -492,27 +478,6 @@ where
                 process,
                 execution_code_key,
                 &mut report,
-            );
-        }
-        Err(SsriError::Incompatible(code)) if code == INCOMPATIBLE_BATCH => {
-            tracing::info!(
-                target: LOG_TARGET,
-                event = "ssri.incompatible",
-                code,
-            );
-            // Refund path: unlock around dry-run + submit like digest_ok (P2).
-            return handle_incompatible_refunds(
-                rpc.as_ref(),
-                process,
-                &state,
-                &batch,
-                code,
-                execution_code_key,
-                &cell_deps,
-                refund_policy,
-                &mut report,
-                false,
-                &lease,
             );
         }
         Err(SsriError::Incompatible(code)) => {
@@ -694,7 +659,12 @@ fn find_unselected_intention<R: HostQueryRpc>(
     Ok(None)
 }
 
-type IsolatedIntentions = (Vec<ScannedIntention>, Vec<(ScannedIntention, i8)>);
+#[derive(Default)]
+struct IsolatedIntentions {
+    accepted: Vec<ScannedIntention>,
+    rejected: Vec<(ScannedIntention, i8)>,
+    control: Vec<ScannedIntention>,
+}
 
 enum ProbeVerdict {
     Accepted,
@@ -702,10 +672,10 @@ enum ProbeVerdict {
 }
 
 impl ProbeVerdict {
-    fn record(self, item: &ScannedIntention, (good, bad): &mut IsolatedIntentions) {
+    fn record(self, item: &ScannedIntention, isolated: &mut IsolatedIntentions) {
         match self {
-            Self::Accepted => good.push(item.clone()),
-            Self::Rejected(code) => bad.push((item.clone(), code)),
+            Self::Accepted => isolated.accepted.push(item.clone()),
+            Self::Rejected(code) => isolated.rejected.push((item.clone(), code)),
         }
     }
 }
@@ -771,9 +741,9 @@ fn classify_probe(
     match result {
         Ok(true) => Ok(Some(ProbeVerdict::Accepted)),
         Ok(false) => Ok(None),
-        Err(SsriError::Incompatible(code @ (DEPOSIT_BELOW_MINIMUM | CID_LOCK_MISMATCH))) => {
-            Ok(Some(ProbeVerdict::Rejected(code)))
-        }
+        Err(SsriError::Incompatible(
+            code @ (BENEFICIARY_MISSING | DEPOSIT_BELOW_MINIMUM | CID_LOCK_MISMATCH),
+        )) => Ok(Some(ProbeVerdict::Rejected(code))),
         Err(error @ SsriError::Incompatible(PROCESS_LOCK_ARGS_INVALID)) => Err(error),
         Err(error) => {
             tracing::debug!(target: LOG_TARGET, event = "assemble.isolation_skipped",
@@ -814,6 +784,7 @@ fn isolate_intentions<T>(
                 verdict.record(item, &mut isolated);
             }
         }
+        isolated.control.extend(isolated.accepted.first().cloned());
         return Ok(Some(isolated));
     }
 
@@ -914,13 +885,16 @@ fn isolate_intentions<T>(
         }
         substitution.next = index + 1;
     }
-    let mut isolated = IsolatedIntentions::default();
+    let mut isolated = IsolatedIntentions {
+        control,
+        ..IsolatedIntentions::default()
+    };
     for (index, verdict) in std::mem::take(&mut substitution.verdicts) {
         if let Some(item) = snapshot[index] {
             verdict.record(item, &mut isolated);
         }
     }
-    isolated.0.truncate(batch.len());
+    isolated.accepted.truncate(batch.len());
     *probe = None;
     Ok(Some(isolated))
 }
@@ -975,6 +949,32 @@ fn intention_snapshot(item: &ScannedIntention) -> LiveCell {
     }
 }
 
+/// Reproduce the audited example's per-cell assembly checks from this snapshot.
+pub(crate) fn audited_isolation_matches(item: &ScannedIntention, code: i8, lock: &Script) -> bool {
+    let Ok(args) = ProcessLockArgs::decode(&lock.args().raw_data()) else {
+        return false;
+    };
+    if !args.matches_intention_lock(&item.lock_code_hash, item.lock_hash_type as u8) {
+        return code == CID_LOCK_MISMATCH;
+    }
+    let expected_reason = match code {
+        BENEFICIARY_MISSING => FILTER_MALFORMED_DIGEST,
+        DEPOSIT_BELOW_MINIMUM => FILTER_DEPOSIT_BELOW_MINIMUM,
+        _ => return false,
+    };
+    let asset = item
+        .type_script
+        .as_ref()
+        .map(|typ| (typ.code_hash().unpack(), typ.hash_type().into()));
+    classify_intention_excluding_process_lock(
+        &item.protocol_lock(),
+        item.capacity,
+        asset.as_ref().map(|(hash, kind)| (hash, *kind)),
+        &item.data,
+        Some(&lock.code_hash().unpack()),
+    ) == expected_reason
+}
+
 fn verify_refund_cell(
     rpc: &impl HostQueryRpc,
     snapshot: &LiveCell,
@@ -1014,6 +1014,8 @@ fn refund_policy_rejections<R: Rpc + HostQueryRpc>(
     {
         return (outcome, report);
     }
+    // The filter is stateless and the audited example preserves its state lock.
+    // Check the live state just before submit without competing with a pending digest.
     let deps = match merge_cell_deps(&[cell_dep_code(&code.out_point)], params.tick_cell_deps) {
         Ok(deps) => deps,
         Err(error) => {
@@ -1049,37 +1051,12 @@ fn refund_policy_rejections<R: Rpc + HostQueryRpc>(
         if lease.cancelled() {
             break;
         }
-        let (code, state_scoped) = {
-            let mut worker = params.state.lock().expect("process worker state");
-            worker.refund_cursor = Some(item.out_point.clone());
-            match (
-                worker.isolated_refunds.get(&item.out_point),
-                &worker.isolated_refund_scope,
-            ) {
-                (Some(&code), Some(IsolatedRefundScope::State(op)))
-                    if *op == params.process.live_cell.out_point =>
-                {
-                    (code, true)
-                }
-                (Some(&code), Some(IsolatedRefundScope::Example(_))) => (code, false),
-                (None, _) => (INCOMPATIBLE_BATCH, false),
-                (Some(_), _) => continue,
-            }
-        };
-        let outcome = assemble_and_submit_refund(
-            rpc,
-            &params.state,
-            std::slice::from_ref(item),
-            code,
-            params.execution_code_key,
-            &deps,
-            params.refund_policy,
-            &mut report,
-            BatchMode::PolicyRefund,
-            &params.process.live_cell,
-            state_scoped,
-            &lease,
-        );
+        params
+            .state
+            .lock()
+            .expect("process worker state")
+            .refund_cursor = Some(item.out_point.clone());
+        let outcome = submit_policy_refund(rpc, &params, item, &deps, &mut report, &lease);
         if outcome == BatchOutcome::RpcUnavailable {
             break;
         }
@@ -1092,264 +1069,86 @@ fn refund_policy_rejections<R: Rpc + HostQueryRpc>(
     (outcome, report)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn handle_incompatible_refunds<R: Rpc + HostQueryRpc>(
+fn submit_policy_refund<R: Rpc + HostQueryRpc>(
     rpc: &R,
-    process: &ResolvedProcess,
-    state: &Arc<Mutex<ProcessWorkerState>>,
-    batch: &[ScannedIntention],
-    code: i8,
-    execution_code_key: &[u8],
-    tick_cell_deps: &[CellDep],
-    refund_policy: &RefundPolicy,
+    params: &ProcessBatchParams<'_>,
+    item: &ScannedIntention,
+    deps: &[CellDep],
     report: &mut BatchReportDelta,
-    refund_only: bool,
-    lease: &BatchLease<'_>,
-) -> (BatchOutcome, BatchReportDelta) {
-    if let Some(code) = process.verdict_code_cell() {
-        if let Err(outcome) = verify_refund_cell(rpc, code, "Process code", batch.len(), report) {
-            return (outcome, report.clone());
-        }
-    }
-    let mut by_identity: Vec<(CidLockIdentity, Vec<ScannedIntention>)> = Vec::new();
-    for item in batch {
-        let id = item.lock_identity();
-        if let Some((_, group)) = by_identity.iter_mut().find(|(existing, _)| *existing == id) {
-            group.push(item.clone());
-        } else {
-            by_identity.push((id, vec![item.clone()]));
-        }
-    }
-
-    if by_identity.len() > 1 {
-        tracing::info!(
-            target: LOG_TARGET,
-            event = "refund.partition",
-            code,
-            groups = by_identity.len(),
-        );
-    }
-
-    let mut submitted = false;
-    let mut retry_later = false;
-    let mut rejection = None;
-    for (_id, group) in by_identity {
-        if group.is_empty() {
-            continue;
-        }
-        let outcome = assemble_and_submit_refund(
-            rpc,
-            state,
-            &group,
-            code,
-            execution_code_key,
-            tick_cell_deps,
-            refund_policy,
-            report,
-            if refund_only {
-                BatchMode::RetryRefund
-            } else {
-                BatchMode::Assemble
-            },
-            &process.live_cell,
-            false,
-            lease,
-        );
-        match outcome {
-            BatchOutcome::Submitted => submitted = true,
-            BatchOutcome::RetryLater => retry_later = true,
-            BatchOutcome::Rejected => rejection = Some(outcome),
-            BatchOutcome::CachedRejected => {
-                rejection.get_or_insert(outcome);
-            }
-            _ => {}
-        }
-    }
-
-    // Each group was authorized by the same guest result. Finish independent
-    // refunds even when another identity has to be split and retried.
-    // Fee-unaffordable groups stay marked pending; digest_loop strips them from
-    // drop_first/shrink when a sibling identity is Rejected (P3).
-    let outcome = rejection.unwrap_or(if retry_later {
-        BatchOutcome::RetryLater
-    } else if submitted {
-        BatchOutcome::Submitted
-    } else {
-        BatchOutcome::Continue
-    });
-    (outcome, report.clone())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn assemble_and_submit_refund<R: Rpc + HostQueryRpc>(
-    rpc: &R,
-    state: &Arc<Mutex<ProcessWorkerState>>,
-    group: &[ScannedIntention],
-    code: i8,
-    execution_code_key: &[u8],
-    tick_cell_deps: &[CellDep],
-    refund_policy: &RefundPolicy,
-    report: &mut BatchReportDelta,
-    attempt_mode: BatchMode,
-    authorizing_state: &LiveCell,
-    state_scoped: bool,
     lease: &BatchLease<'_>,
 ) -> BatchOutcome {
-    let refund_only = attempt_mode.refund_only();
-    if lease.cancelled() {
-        report.skipped += group.len();
-        return BatchOutcome::Continue;
-    }
+    let state = &params.state;
+    let authorizing_state = &params.process.live_cell;
+    let consumed = std::slice::from_ref(&item.out_point);
+    let fp = combo_fingerprint(consumed, None, params.execution_code_key);
     {
         let worker = state.lock().expect("process worker state");
-        if group
-            .iter()
-            .any(|item| worker.submit.pending_occupies(&item.out_point))
+        if worker.submit.pending_occupies(&item.out_point)
+            || worker.submit.rejected_combos.contains(&fp)
         {
-            report.skipped += group.len();
+            report.skipped += 1;
             return BatchOutcome::Continue;
         }
     }
     // The CID refund verifies assets and fees, so dry-run cannot validate the
     // Intention data and lock args that were used to obtain the policy verdict.
-    for item in group {
-        if let Err(outcome) = verify_refund_cell(
-            rpc,
-            &intention_snapshot(item),
-            "Intention",
-            group.len(),
-            report,
-        ) {
-            return outcome;
-        }
-    }
-    let state_deps;
-    let tick_cell_deps = if state_scoped {
-        // Consensus must still see this state as live when the refund commits.
-        state_deps = match merge_cell_deps(
-            &[cell_dep_code(&authorizing_state.out_point)],
-            tick_cell_deps,
-        ) {
-            Ok(deps) => deps,
-            Err(error) => {
-                report.last_error = Some(format!("policy refund: {error}"));
-                report.skipped += group.len();
-                return BatchOutcome::Continue;
-            }
-        };
-        &state_deps
-    } else {
-        tick_cell_deps
-    };
-    let mode = refund_policy.mode_for(&group[0].lock_identity());
-    let skeleton =
-        match assemble_refund_with_policy(group, tick_cell_deps, mode, refund_policy.fee_rate) {
-            Ok(s) => {
-                let out_sum: u64 =
-                    s.tx.outputs()
-                        .into_iter()
-                        .map(|o| {
-                            let c: u64 = o.capacity().unpack();
-                            c
-                        })
-                        .sum();
-                let in_sum: u64 = group.iter().map(|i| i.capacity).sum();
-                let fee = in_sum.saturating_sub(out_sum);
-                if fee == 0 {
-                    tracing::debug!(target: LOG_TARGET, event = "refund.zero_fee", n = group.len());
-                }
-                tracing::info!(
-                    target: LOG_TARGET,
-                    event = "refund.path",
-                    code,
-                    path = "user_lock",
-                    fee,
-                    n = group.len(),
-                );
-                s
-            }
-            Err(e @ AssembleError::RefundFeeUnaffordable { .. }) => {
-                tracing::warn!(target: LOG_TARGET, event = "refund.fee_unaffordable", error = %e);
-                // Non-permanent: do not cache rejected_combos and do not isolate-split
-                // (shrinking cannot raise fee budget). Mark for below-min retry.
-                report.last_error = Some(e.to_string());
-                // A filter rejection is always retried using a fresh verdict.
-                if attempt_mode != BatchMode::PolicyRefund {
-                    let mut worker = state.lock().expect("process worker state");
-                    for item in group {
-                        worker
-                            .pending_incompatible_refund
-                            .insert(out_point_key(&item.out_point));
-                    }
-                }
-                return BatchOutcome::RetryLater;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    target: LOG_TARGET,
-                    event = "refund.path",
-                    code,
-                    path = "unbuildable",
-                    error = %e,
-                );
-                report.skipped += group.len();
-                return BatchOutcome::Continue;
-            }
-        };
-
-    let intent_ops: Vec<_> = group.iter().map(|i| i.out_point.clone()).collect();
-    let mut fp = combo_fingerprint(&intent_ops, None, execution_code_key);
-    if state_scoped {
-        fp.extend_from_slice(authorizing_state.out_point.as_slice());
-    }
+    if let Err(outcome) = verify_refund_cell(rpc, &intention_snapshot(item), "Intention", 1, report)
     {
-        let worker = state.lock().expect("process worker state");
-        if worker.submit.rejected_combos.contains(&fp) {
-            // refund_only: cached permanent failure — soft skip, no isolate.
-            return if refund_only {
-                report.skipped += group.len();
-                BatchOutcome::Continue
-            } else {
-                BatchOutcome::CachedRejected
-            };
-        }
+        return outcome;
     }
-    let consumed: Vec<_> = skeleton
-        .tx
-        .inputs()
-        .into_iter()
-        .map(|i| i.previous_output())
-        .collect();
-    // Dry-run without holding the state mutex (P2).
-    match dry_run_gate(rpc, &skeleton.tx) {
-        DryRunGate::Rejected(m) => {
-            let mut worker = state.lock().expect("process worker state");
-            worker.submit.rejected_combos.insert(fp);
-            tracing::warn!(
-                target: LOG_TARGET,
-                event = "dry_run.rejected",
-                error = %m,
-                n = group.len(),
+    let mode = params.refund_policy.mode_for(&item.lock_identity());
+    let skeleton = match assemble_refund_with_policy(
+        std::slice::from_ref(item),
+        deps,
+        mode,
+        params.refund_policy.fee_rate,
+    ) {
+        Ok(skeleton) => {
+            let returned = skeleton
+                .tx
+                .outputs()
+                .get(0)
+                .expect("refund output")
+                .capacity()
+                .unpack();
+            let fee = item.capacity.saturating_sub(returned);
+            tracing::info!(
+                target: LOG_TARGET, event = "refund.path", path = "user_lock",
+                out_point = ?item.out_point, fee,
             );
-            report.last_error = Some(format!("dry-run rejected: {m}"));
-            // refund_only leftovers: cache combo, do not isolate-split (P3).
-            return if refund_only {
-                report.skipped += group.len();
-                BatchOutcome::Continue
-            } else {
-                BatchOutcome::Rejected
-            };
+            skeleton
         }
-        DryRunGate::Skip(m) => {
-            tracing::warn!(
-                target: LOG_TARGET,
-                event = "tick.skip",
-                reason = "dry_run_unavailable",
-                error = %m,
-            );
-            report.last_error = Some(format!("dry-run: {m}"));
-            report.skipped += group.len();
-            return if matches!(m, RpcError::Unavailable(_)) {
+        Err(error @ AssembleError::RefundFeeUnaffordable { .. }) => {
+            tracing::warn!(target: LOG_TARGET, event = "refund.fee_unaffordable", %error);
+            report.last_error = Some(error.to_string());
+            return BatchOutcome::RetryLater;
+        }
+        Err(error) => {
+            tracing::warn!(target: LOG_TARGET, event = "refund.path", path = "unbuildable", %error);
+            report.skipped += 1;
+            return BatchOutcome::Continue;
+        }
+    };
+
+    match dry_run_gate(rpc, &skeleton.tx) {
+        DryRunGate::Rejected(error) => {
+            state
+                .lock()
+                .expect("process worker state")
+                .submit
+                .rejected_combos
+                .insert(fp);
+            tracing::warn!(target: LOG_TARGET, event = "dry_run.rejected", %error);
+            report.last_error = Some(format!("dry-run rejected: {error}"));
+            report.skipped += 1;
+            return BatchOutcome::Continue;
+        }
+        DryRunGate::Skip(error) => {
+            tracing::warn!(target: LOG_TARGET, event = "tick.skip",
+                reason = "dry_run_unavailable", %error);
+            report.last_error = Some(format!("dry-run: {error}"));
+            report.skipped += 1;
+            return if matches!(error, RpcError::Unavailable(_)) {
                 BatchOutcome::RpcUnavailable
             } else {
                 BatchOutcome::Continue
@@ -1357,64 +1156,37 @@ fn assemble_and_submit_refund<R: Rpc + HostQueryRpc>(
         }
         DryRunGate::Proceed => {}
     }
-    if let Err(outcome) =
-        verify_refund_cell(rpc, authorizing_state, "Process state", group.len(), report)
-    {
+    if let Err(outcome) = verify_refund_cell(rpc, authorizing_state, "Process state", 1, report) {
         return outcome;
     }
     let mut worker = state.lock().expect("process worker state");
     let Ok(_submission) = lease.begin_submission() else {
-        report.skipped += group.len();
+        report.skipped += 1;
         return BatchOutcome::Continue;
     };
-    match submit_execution(rpc, &skeleton, &mut worker.submit, &consumed) {
+    match submit_execution(rpc, &skeleton, &mut worker.submit, consumed) {
         Ok(tx_hash) => {
-            tracing::info!(
-                target: LOG_TARGET,
-                event = "submit.ok",
-                tx_hash = %hex_pref(tx_hash.as_slice()),
-            );
-            // Keep pending_incompatible_refund until the out-point leaves
-            // live_keys / pending occupancy (Drop/reorg must still retry).
+            tracing::info!(target: LOG_TARGET, event = "submit.ok", tx_hash = %hex_pref(tx_hash.as_slice()));
             report.submitted += 1;
             BatchOutcome::Submitted
         }
-        Err(RpcError::Conflict(m)) => {
-            tracing::warn!(
-                target: LOG_TARGET,
-                event = "submit.conflict",
-                error = %m,
-            );
+        Err(RpcError::Conflict(error)) => {
+            tracing::warn!(target: LOG_TARGET, event = "submit.conflict", %error);
             report.conflicts += 1;
-            report.last_error = Some(format!("submit conflict: {m}"));
+            report.last_error = Some(format!("submit conflict: {error}"));
             BatchOutcome::Continue
         }
-        Err(RpcError::SubmitRejected(m)) => {
+        Err(RpcError::SubmitRejected(error)) => {
             worker.submit.rejected_combos.insert(fp);
-            tracing::warn!(
-                target: LOG_TARGET,
-                event = "submit.rejected",
-                error = %m,
-                n = group.len(),
-            );
-            report.last_error = Some(format!("submit rejected: {m}"));
-            // refund_only: cache the combo but do not isolate-split (P3).
-            if refund_only {
-                report.skipped += group.len();
-                BatchOutcome::Continue
-            } else {
-                BatchOutcome::Rejected
-            }
+            tracing::warn!(target: LOG_TARGET, event = "submit.rejected", %error);
+            report.last_error = Some(format!("submit rejected: {error}"));
+            report.skipped += 1;
+            BatchOutcome::Continue
         }
-        Err(e) => {
-            tracing::warn!(
-                target: LOG_TARGET,
-                event = "tick.skip",
-                reason = "submit_failed",
-                error = %e,
-            );
-            report.last_error = Some(format!("submit failed: {e}"));
-            report.skipped += group.len();
+        Err(error) => {
+            tracing::warn!(target: LOG_TARGET, event = "tick.skip", reason = "submit_failed", %error);
+            report.last_error = Some(format!("submit failed: {error}"));
+            report.skipped += 1;
             BatchOutcome::RpcUnavailable
         }
     }

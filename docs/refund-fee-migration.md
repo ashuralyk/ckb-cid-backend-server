@@ -15,9 +15,8 @@ at head **`9bc8193`** (or newer): per-Intention ceiling via
 `code_hash` + `hash_type` (not across deployments). DigestIncompatible
 now rejects **mixed CID identities** (`MixedCidLock`) even at zero
 shortfall — that on-chain rule is the real protocol defense against
-cross-version fee reuse. The daemon's per-`(code_hash, hash_type)`
-partition is defense-in-depth so an honest assembler never submits a
-mixed-identity tx. TimeoutBurn stays exact.
+cross-version fee reuse. The daemon builds one transaction per authorized
+Intention. TimeoutBurn stays exact.
 
 Do **not** treat undeployed candidate hashes as production defaults; do **not**
 replace current testnet `code_hash` with an undeployed binary. Operators
@@ -70,16 +69,12 @@ The v0.1.4 testnet example already includes the deployed CID Type ID in its boun
   `min(MAX_REFUND_FEE, capacity - occupied)`.
 - `sum(cuts) == fee` exactly — **no siphon outputs** (implies contract
   `F >= S` when there are no extra outputs).
-- Fail closed with soft `RetryLater` (`FeeUnaffordable`) if the budget is
-  insufficient (non-permanent, no `rejected_combos`, no isolate-shrink;
-  below-min leftovers retry refund once marked pending).
+- Leave the Intention live when `FeeUnaffordable` occurs and retry only after
+  a current per-cell refund verdict.
 - Intentions whose lock is **not** on the allowlist always use exact refunds.
 - **Never** mix allowlisted and legacy locks in one bounded refund tx.
 - **Never** co-bundle two different bounded-capable lock identities in one
-  Execution tx — the loop partitions DigestIncompatible assembly by
-  `(code_hash, hash_type)` (defense-in-depth; on-chain `MixedCidLock` is
-  the real defense). The allowlist may list multiple verified deployed
-  identities after migration, but they must not share a refund tx.
+  Execution tx. On-chain `MixedCidLock` enforces this restriction.
 - **Never** co-bundle fee-shaved Incompatible refunds with Process /
   DigestOk.
 - **TimeoutBurn** stays exact; this daemon does not assemble it.

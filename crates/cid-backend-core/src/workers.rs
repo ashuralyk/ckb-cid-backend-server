@@ -28,13 +28,6 @@ fn process_thread_name(hash: &[u8; 32]) -> String {
     )
 }
 
-#[derive(PartialEq, Eq)]
-pub(crate) enum IsolatedRefundScope {
-    State(OutPoint),
-    // The audited example classifies exit 39/40 from the Intention and state lock.
-    Example(Script),
-}
-
 /// Per-Process mutable state (digest thread and worker thread via lock).
 pub struct ProcessWorkerState {
     pub entry: ProcessEntry,
@@ -46,13 +39,9 @@ pub struct ProcessWorkerState {
     /// or leftover frames saved on ProcessOccupied. Consumed by the next
     /// `isolate_window` instead of re-deriving via `already`.
     pub isolate_pending: Vec<Vec<ScannedIntention>>,
-    /// Out-point keys that saw DigestIncompatible but could not refund yet
-    /// (e.g. fee unaffordable). Below-min leftovers retry refund without a
-    /// legal `[min,max]` assemble window.
-    pub pending_incompatible_refund: HashSet<Vec<u8>>,
-    /// Individually isolated exit-39/40 verdicts for the current code and scope.
+    /// Isolated assembly rejections for revalidation under the audited policy.
     pub(crate) isolated_refunds: BTreeMap<OutPoint, i8>,
-    pub(crate) isolated_refund_scope: Option<IsolatedRefundScope>,
+    pub(crate) audited_policy_lock: Option<Script>,
     pub(crate) isolated_prune_cursor: Option<OutPoint>,
     pub(crate) refund_cursor: Option<OutPoint>,
     pub(crate) isolation_probe: Option<IsolationProbe>,
@@ -78,9 +67,8 @@ impl ProcessWorkerState {
             isolate_resume: None,
             isolate_expanded: HashSet::new(),
             isolate_pending: Vec::new(),
-            pending_incompatible_refund: HashSet::new(),
             isolated_refunds: BTreeMap::new(),
-            isolated_refund_scope: None,
+            audited_policy_lock: None,
             isolated_prune_cursor: None,
             refund_cursor: None,
             isolation_probe: None,
@@ -109,9 +97,8 @@ impl ProcessWorkerState {
         self.isolate_expanded.clear();
         self.isolate_pending.clear();
         self.isolate_resume = None;
-        self.pending_incompatible_refund.clear();
         self.clear_isolated_refunds();
-        self.isolated_refund_scope = None;
+        self.audited_policy_lock = None;
         self.refund_cursor = None;
         self.isolation_probe = None;
     }
@@ -746,7 +733,7 @@ mod tests {
             w.isolate_expanded.insert(vec![0x02]);
             w.isolate_pending.push(Vec::new());
             w.isolate_resume = Some(vec![0x03]);
-            w.pending_incompatible_refund.insert(vec![0x04]);
+            w.isolated_refunds.insert(OutPoint::default(), 39);
         });
         assert!(!pool.register(entry([0x10; 32], [0x21; 32])).unwrap());
         pool.get(&hash).unwrap().with_state(|w| {
@@ -754,7 +741,7 @@ mod tests {
             assert!(w.isolate_expanded.is_empty());
             assert!(w.isolate_pending.is_empty());
             assert!(w.isolate_resume.is_none());
-            assert!(w.pending_incompatible_refund.is_empty());
+            assert!(w.isolated_refunds.is_empty());
         });
     }
 

@@ -1,4 +1,4 @@
-//! The guest pays DigestOk fees; the backend handles incompatible refunds.
+//! The guest pays DigestOk fees; the backend applies the configured fee policy to authorized refunds.
 
 #[cfg(test)]
 mod tests {
@@ -13,8 +13,9 @@ mod tests {
     use crate::scripted_ssri::ScriptedSsri;
 
     #[test]
-    fn incompatible_refund_keeps_exact_capacity_no_process_fee() {
+    fn filter_refund_keeps_exact_capacity_no_process_fee() {
         let rpc = FakeRpc::new();
+        rpc.insert_cell(code_cell(0xA0, PROC_CODE_ARGS, FIXTURE_ELF.to_vec()));
         let ts = process_type_script(3);
         let hash = script_hash32(&ts);
         let intent_cap = 200_0000_0000u64;
@@ -25,7 +26,7 @@ mod tests {
 
         let mut loop_ = loop_with_resolver(
             rpc,
-            ScriptedSsri::incompatible(21),
+            ScriptedSsri::mimic((2, 2)).with_filter(|n| Ok(vec![5; n])),
             default_loop_config(),
             3,
         );
@@ -78,13 +79,14 @@ mod tests {
     }
 
     #[test]
-    fn refunds_use_the_configured_cid_fee_mode_and_leave_legacy_cells_live() {
+    fn filter_refunds_use_the_configured_cid_fee_mode() {
         use crate::helpers::intention_cell_with_lock;
         use cid_backend_core::{fee_for_size, tx_size_in_block, CidLockIdentity};
         use ckb_types::core::ScriptHashType;
 
         for bounded in [false, true] {
             let rpc = FakeRpc::new();
+            rpc.insert_cell(code_cell(0xA0, PROC_CODE_ARGS, FIXTURE_ELF.to_vec()));
             let hash = script_hash32(&process_type_script(3));
             let capacity = 200_0000_0000;
             let legacy = CidLockIdentity::new([0xd1; 32], ScriptHashType::Data1);
@@ -104,7 +106,12 @@ mod tests {
                     .push(config.scan_lock_identities()[0]);
             }
             config.refund_policy.fee_rate = 2500;
-            let mut loop_ = loop_with_resolver(rpc, ScriptedSsri::incompatible(21), config, 3);
+            let mut loop_ = loop_with_resolver(
+                rpc,
+                ScriptedSsri::mimic((2, 2)).with_filter(|n| Ok(vec![5; n])),
+                config,
+                3,
+            );
 
             let report = loop_.tick();
             assert_eq!(report.scanned, 2);
@@ -167,7 +174,6 @@ mod tests {
         );
         assert!(loop_.rpc().has_cell(&expensive.out_point));
         loop_.workers().get(&hash).unwrap().with_state(|s| {
-            assert!(s.pending_incompatible_refund.is_empty());
             assert!(s.isolate_expanded.is_empty());
         });
 
@@ -179,9 +185,10 @@ mod tests {
 
     #[test]
     fn refund_fee_unaffordable_does_not_isolate_or_cache_reject() {
-        use cid_backend_core::{out_point_key, DEFAULT_FEE_RATE, MAX_FEE_RATE};
+        use cid_backend_core::{DEFAULT_FEE_RATE, MAX_FEE_RATE};
 
         let rpc = FakeRpc::new();
+        rpc.insert_cell(code_cell(0xA0, PROC_CODE_ARGS, FIXTURE_ELF.to_vec()));
         let hash = script_hash32(&process_type_script(3));
         let capacity = 200_0000_0000;
         let bounded = intention_cell(1, hash, capacity);
@@ -190,15 +197,17 @@ mod tests {
         let mut config = default_loop_config();
         config.refund_policy.bounded_locks = vec![config.scan_lock_identities()[0]];
         config.refund_policy.fee_rate = MAX_FEE_RATE;
-        let mut loop_ = loop_with_resolver(rpc, ScriptedSsri::incompatible(21), config, 3);
+        let mut loop_ = loop_with_resolver(
+            rpc,
+            ScriptedSsri::mimic((2, 2)).with_filter(|n| Ok(vec![5; n])),
+            config,
+            3,
+        );
 
         let report = loop_.tick();
         assert_eq!(report.submitted, 0, "{:?}", report.last_error);
         assert!(loop_.rpc().has_cell(&bounded.out_point));
         loop_.workers().get(&hash).unwrap().with_state(|s| {
-            assert!(s
-                .pending_incompatible_refund
-                .contains(&out_point_key(&bounded.out_point)));
             assert!(
                 s.isolate_expanded.is_empty(),
                 "FeeUnaffordable must not isolate-split"
@@ -216,10 +225,11 @@ mod tests {
     }
 
     #[test]
-    fn below_min_refund_drop_restores_pending_and_retries() {
-        use cid_backend_core::{out_point_key, DEFAULT_FEE_RATE, MAX_FEE_RATE};
+    fn below_min_filter_refund_refreshes_its_verdict_after_drop() {
+        use cid_backend_core::{DEFAULT_FEE_RATE, MAX_FEE_RATE};
 
         let rpc = FakeRpc::new();
+        rpc.insert_cell(code_cell(0xA0, PROC_CODE_ARGS, FIXTURE_ELF.to_vec()));
         let hash = script_hash32(&process_type_script(3));
         let capacity = 200_0000_0000;
         let bounded = intention_cell(1, hash, capacity);
@@ -230,7 +240,7 @@ mod tests {
         let mut config = default_loop_config();
         config.refund_policy.bounded_locks = vec![config.scan_lock_identities()[0]];
         config.refund_policy.fee_rate = MAX_FEE_RATE;
-        let ssri = ScriptedSsri::ok_then_incompatible((2, 2), 0, 21);
+        let ssri = ScriptedSsri::mimic((2, 2)).with_filter(|n| Ok([5, 0][..n].to_vec()));
         let mut loop_ = loop_with_resolver(rpc, ssri, config, 3);
 
         assert_eq!(loop_.tick().submitted, 0);
@@ -240,23 +250,14 @@ mod tests {
         loop_.rpc().defer_commit();
         let report2 = loop_.tick();
         assert_eq!(report2.submitted, 1, "{:?}", report2.last_error);
-        assert!(
-            loop_.workers().get(&hash).unwrap().with_state(|s| {
-                s.pending_incompatible_refund
-                    .contains(&out_point_key(&bounded.out_point))
-            }),
-            "mark must survive refund submit while tx is pending"
-        );
+        assert!(loop_
+            .state()
+            .submit
+            .unwrap()
+            .pending_occupies(&bounded.out_point));
         let tx_hash = loop_.rpc().submitted().last().unwrap().hash();
         loop_.rpc().simulate_drop(&tx_hash);
         assert!(loop_.rpc().has_cell(&bounded.out_point));
-        assert!(
-            loop_.workers().get(&hash).unwrap().with_state(|s| {
-                s.pending_incompatible_refund
-                    .contains(&out_point_key(&bounded.out_point))
-            }),
-            "mark must remain after drop so below-min refund_only can retry"
-        );
 
         let report3 = loop_.tick();
         assert_eq!(
@@ -272,59 +273,36 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .in_flight
-                .contains(&out_point_key(&bounded.out_point)),
+                .contains(&cid_backend_core::out_point_key(&bounded.out_point)),
             "retry submit must re-occupy the restored Intention"
         );
     }
 
     #[test]
-    fn below_min_mixed_frame_refunds_pending_subset_only() {
-        use cid_backend_core::{DEFAULT_FEE_RATE, MAX_FEE_RATE};
-
+    fn below_min_filter_refunds_only_the_rejected_cell() {
         let rpc = FakeRpc::new();
+        rpc.insert_cell(code_cell(0xA0, PROC_CODE_ARGS, FIXTURE_ELF.to_vec()));
         let hash = script_hash32(&process_type_script(3));
-        let capacity = 200_0000_0000;
-        let bounded = intention_cell(1, hash, capacity);
-        let companion = intention_cell(2, hash, capacity);
-        let other_companion = intention_cell(3, hash, capacity);
-        rpc.insert_cell(bounded.clone());
-        rpc.insert_cell(companion.clone());
-        rpc.insert_cell(other_companion.clone());
+        let rejected = intention_cell(1, hash, 200_0000_0000);
+        let peer = intention_cell(2, hash, 200_0000_0000);
+        rpc.insert_cell(rejected.clone());
+        rpc.insert_cell(peer.clone());
         rpc.insert_cell(process_cell(3, 200_0000_0000, vec![]));
-        let mut config = default_loop_config();
-        config.refund_policy.bounded_locks = vec![config.scan_lock_identities()[0]];
-        config.refund_policy.fee_rate = MAX_FEE_RATE;
-        let ssri = ScriptedSsri::ok_then_incompatible((3, 3), 0, 21);
-        let mut loop_ = loop_with_resolver(rpc, ssri, config, 3);
+        let ssri = ScriptedSsri::mimic((3, 3)).with_filter(|_| Ok(vec![5, 0]));
+        let mut loop_ = loop_with_resolver(rpc, ssri, default_loop_config(), 3);
 
         let report = loop_.tick();
-        assert_eq!(report.submitted, 0);
-        loop_.rpc().consume(&companion.out_point);
-        loop_.rpc().consume(&other_companion.out_point);
-        assert!(loop_.rpc().has_cell(&bounded.out_point));
-
-        // Non-pending peer joins the below-min bucket (2 < min=3).
-        let peer = intention_cell(4, hash, capacity);
-        loop_.rpc().insert_cell(peer.clone());
-        loop_.config_mut().refund_policy.fee_rate = DEFAULT_FEE_RATE;
-        let report2 = loop_.tick();
-        assert_eq!(
-            report2.submitted, 1,
-            "pending subset must refund despite non-pending peer; {:?}",
-            report2.last_error
-        );
-        assert!(!loop_.rpc().has_cell(&bounded.out_point));
-        assert!(
-            loop_.rpc().has_cell(&peer.out_point),
-            "non-pending peer must remain for a legal [min,max] window"
-        );
+        assert_eq!(report.submitted, 1, "{report:?}");
+        assert!(!loop_.rpc().has_cell(&rejected.out_point));
+        assert!(loop_.rpc().has_cell(&peer.out_point));
     }
 
     #[test]
-    fn refund_only_dry_run_reject_does_not_isolate_or_burn_attempts() {
+    fn filter_refund_dry_run_reject_does_not_isolate_or_repeat_dry_run() {
         use cid_backend_core::{DEFAULT_FEE_RATE, MAX_FEE_RATE};
 
         let rpc = FakeRpc::new();
+        rpc.insert_cell(code_cell(0xA0, PROC_CODE_ARGS, FIXTURE_ELF.to_vec()));
         let hash = script_hash32(&process_type_script(3));
         let capacity = 200_0000_0000;
         let bounded = intention_cell(1, hash, capacity);
@@ -335,7 +313,7 @@ mod tests {
         let mut config = default_loop_config();
         config.refund_policy.bounded_locks = vec![config.scan_lock_identities()[0]];
         config.refund_policy.fee_rate = MAX_FEE_RATE;
-        let ssri = ScriptedSsri::ok_then_incompatible((2, 2), 0, 21);
+        let ssri = ScriptedSsri::mimic((2, 2)).with_filter(|n| Ok([5, 0][..n].to_vec()));
         let mut loop_ = loop_with_resolver(rpc, ssri, config, 3);
 
         assert_eq!(loop_.tick().submitted, 0);
@@ -350,12 +328,12 @@ mod tests {
         assert_eq!(
             loop_.rpc().dry_run_attempts(),
             dry_before + 1,
-            "first refund_only attempt should dry-run once"
+            "first filter refund attempt should dry-run once"
         );
         loop_.workers().get(&hash).unwrap().with_state(|s| {
             assert!(
                 s.isolate_expanded.is_empty(),
-                "refund_only permanent reject must not isolate-split"
+                "filter refund permanent reject must not isolate-split"
             );
             assert!(
                 !s.submit.rejected_combos.is_empty(),
@@ -363,22 +341,21 @@ mod tests {
             );
         });
 
-        // Later ticks: soft-skip via process=None refund fingerprint — no
-        // isolate_windows, no further RunBatch/dry-run, no continue_round burn.
+        // A repeated verdict for the same state does not repeat a rejected dry-run.
         let dry_cached = loop_.rpc().dry_run_attempts();
         for _ in 0..3 {
             let r = loop_.tick();
             assert_eq!(r.submitted, 0);
             assert_eq!(
                 r.isolate_windows, 0,
-                "cached refund_only must soft-skip before isolate_windows"
+                "cached filter refund must soft-skip before isolate_windows"
             );
             assert!(loop_.rpc().has_cell(&bounded.out_point));
         }
         assert_eq!(
             loop_.rpc().dry_run_attempts(),
             dry_cached,
-            "cached refund_only must not dispatch RunBatch / dry-run again"
+            "cached filter refund must not dry-run again"
         );
         assert!(loop_
             .workers()
