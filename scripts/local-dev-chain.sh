@@ -15,6 +15,7 @@ DATA_DIR="${CKB_DATA_DIR:-$CKB_DIR/dev}"
 RPC_URL="${CID_CKB_RPC_URL:-http://127.0.0.1:8114}"
 PIN="${CID_DISPATCHER_REV:-b2d01e0a5a9760c8ee627633365aa98dd7a99859}"
 CLANG="${CLANG:-clang-18}"
+BOUNDED_REFUNDS="${CID_LOCAL_CHAIN_BOUNDED_REFUNDS:-0}"
 
 # Genesis issued secp key from specs/dev.toml (dev chain only).
 BA_ARG="0xc8328aabcd9b9e8e64fbc566c4385c3bdeb219d7"
@@ -35,16 +36,18 @@ if [ ! -f "$DATA_DIR/ckb.toml" ]; then
     --ba-arg "$BA_ARG" --ba-hash-type type --ba-code-hash "$BA_CODE_HASH"
 fi
 
-python3 - "$DATA_DIR/ckb.toml" <<'PY'
+python3 - "$DATA_DIR/ckb.toml" "$BOUNDED_REFUNDS" <<'PY'
 from pathlib import Path
+import re
 import sys
 p = Path(sys.argv[1])
+min_fee_rate = {"0": 0, "1": 1000}[sys.argv[2]]
 t = p.read_text()
 t = t.replace(
     'modules = ["Net", "Pool", "Miner", "Chain", "Stats", "Subscription", "Experiment", "Debug"]',
     'modules = ["Net", "Pool", "Miner", "Chain", "Stats", "Subscription", "Experiment", "Debug", "Indexer"]',
 )
-t = t.replace("min_fee_rate = 1_000", "min_fee_rate = 0")
+t = re.sub(r"^min_fee_rate = [\d_]+", f"min_fee_rate = {min_fee_rate}", t, flags=re.M)
 t = t.replace("min_rbf_rate = 1_500", "min_rbf_rate = 0")
 p.write_text(t)
 print("patched", p)
@@ -98,6 +101,7 @@ fi
 export CID_CKB_RPC_URL="$RPC_URL"
 export CID_INDEXER_URL="$RPC_URL"
 export CID_LOCAL_CHAIN_E2E=1
+export CID_LOCAL_CHAIN_BOUNDED_REFUNDS="$BOUNDED_REFUNDS"
 export CID_ALWAYS_SUCCESS_PATH="$AS_OUT"
 cd "$ROOT"
 exec cargo test -p cid-backend-daemon --test local_chain_e2e -- --ignored --nocapture

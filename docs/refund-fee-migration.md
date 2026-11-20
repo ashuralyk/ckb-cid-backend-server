@@ -94,5 +94,7 @@ primary-CID Intentions drain and legacy CID Intentions remain untouched.
 
 ## Local / CI
 
-Local-dev chain keeps `min_fee_rate = 0` and an **empty** allowlist so the
-pinned lock fixture continues to clear exact refunds.
+The local dev fixture uses zero minimum fee and an empty allowlist by default.
+With `CID_LOCAL_CHAIN_BOUNDED_REFUNDS=1`, a fresh dev node uses a minimum fee
+of 1,000 shannons/KB and the fixture verifies an allowlisted xUDT refund on
+chain. See [local dev-chain setup](local-dev-chain.md).

@@ -37,7 +37,7 @@ Stable field `event` (target `cid_backend`):
 | `submit.ok` | `tx_hash` |
 | `submit.conflict` | Submit mapped as Conflict |
 | `submit.rejected` | Transaction-level submit rejection (`TransactionFailedToVerify` / malformed / outputs-validator); that combo is skipped, not every consumed outpoint |
-| `dry_run.fee_rate_rejected` / `submit.fee_rate_rejected` | The node rejected this transaction at its minimum fee rate. The worker can try a different combination in the same tick and retry this combination on a later tick. |
+| `dry_run.pool_policy_rejected` / `submit.pool_policy_rejected` | The node rejected this transaction under its minimum fee rate or transaction size limit. The worker can try a different combination in the same tick and retry this combination on a later tick. |
 | `submit.rejected_combo` | Isolation skipped a combo already in `rejected_combos` (no new `send_transaction`) |
 | `pending.admission_unknown` | An unanswered send still holds occupancy during the initial unknown-status grace period |
 | `pending.committed` | First sight of Committed (occupancy still held) |

@@ -8,7 +8,7 @@ use crate::code_deps::{cell_dep_code, merge_cell_deps};
 const DEFAULT_MAX_ASSEMBLED_TX_BYTES: usize = 512 * 1024;
 use crate::fee::{cell_occupied_capacity, CidLockIdentity, RefundPolicy};
 use crate::host_query::HostQueryRpc;
-use crate::process::ResolvedProcess;
+use crate::process::{validate_state_cid_binding, ResolvedProcess};
 use crate::rpc::{LiveCell, Rpc, RpcError};
 use crate::scan::ScannedIntention;
 use crate::ssri::{
@@ -16,10 +16,12 @@ use crate::ssri::{
     SsriError, SsriHost, PROCESS_LOCK_ARGS_INVALID, STATE_CAPACITY_INSUFFICIENT,
 };
 use crate::submit::{combo_fingerprint, dry_run_gate, submit_execution, DryRunGate};
+use crate::type_id::TYPE_ID_CODE_HASH;
 use crate::worker_commands::{Submission, WorkerCommands};
 use crate::workers::{ProcessWorkerState, RefundPriority};
 use cid_process_executor::AssembledTx;
 use cid_protocol::CidArgs;
+use ckb_types::core::ScriptHashType;
 use ckb_types::packed::{CellDep, CellOutput, OutPoint};
 use ckb_types::prelude::{Entity, Unpack};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -98,7 +100,6 @@ pub(crate) struct ProcessBatchParams<'a> {
     pub execution_code_key: &'a [u8],
     pub tick_cell_deps: &'a [CellDep],
     pub cid_locks: &'a [CidLockIdentity],
-    pub process_hashes: &'a HashSet<[u8; 32]>,
     pub refund_policy: &'a RefundPolicy,
     pub max_assembled_tx_bytes: usize,
     pub job_epoch: u64,
@@ -228,7 +229,6 @@ where
         execution_code_key,
         tick_cell_deps,
         cid_locks,
-        process_hashes,
         max_assembled_tx_bytes,
         min,
         ..
@@ -401,7 +401,6 @@ where
             process,
             max_tx_bytes,
             cid_locks,
-            process_hashes,
         ) {
             Ok(skeleton) => skeleton,
             Err(PreparationError::NonLiveInput(op)) => {
@@ -503,9 +502,9 @@ fn submit_digest<R: Rpc>(
             report.last_error = Some(format!("dry-run conflict: {m}"));
             return None;
         }
-        DryRunGate::Skip(RpcError::FeeRateRejected(m)) => {
-            tracing::warn!(target: LOG_TARGET, event = "dry_run.fee_rate_rejected", error = %m);
-            report.last_error = Some(format!("dry-run minimum fee rate rejected: {m}"));
+        DryRunGate::Skip(RpcError::PoolPolicyRejected(m)) => {
+            tracing::warn!(target: LOG_TARGET, event = "dry_run.pool_policy_rejected", error = %m);
+            report.last_error = Some(format!("dry-run pool policy rejected: {m}"));
             return None;
         }
         DryRunGate::Skip(m) => {
@@ -568,9 +567,9 @@ fn submit_digest<R: Rpc>(
             report.last_error = Some(format!("submit rejected: {m}"));
             None
         }
-        Err(RpcError::FeeRateRejected(m)) => {
-            tracing::warn!(target: LOG_TARGET, event = "submit.fee_rate_rejected", error = %m);
-            report.last_error = Some(format!("submit minimum fee rate rejected: {m}"));
+        Err(RpcError::PoolPolicyRejected(m)) => {
+            tracing::warn!(target: LOG_TARGET, event = "submit.pool_policy_rejected", error = %m);
+            report.last_error = Some(format!("submit pool policy rejected: {m}"));
             None
         }
         Err(e) => {
@@ -601,7 +600,6 @@ fn prepare_execution(
     process: &ResolvedProcess,
     max_size: usize,
     cid_locks: &[CidLockIdentity],
-    process_hashes: &HashSet<[u8; 32]>,
 ) -> Result<ExecutionSkeleton, PreparationError> {
     let skeleton = validate_assembled_tx(assembled, batch, process, max_size)
         .and_then(|()| execution_from_assembled(assembled))
@@ -629,15 +627,22 @@ fn prepare_execution(
                 process_type_hash = %hex_pref(&process.type_hash));
             return Err(PreparationError::NonLiveInput(op));
         };
-        if cell
-            .type_script()
-            .is_some_and(|script| process_hashes.contains(&crate::rpc::script_hash32(&script)))
-        {
+        // Protect state even if its registration arrives after this job starts.
+        let lock = cell.lock();
+        let is_process_state = lock.hash_type() == ScriptHashType::Type.into()
+            && cell.type_script().is_some_and(|script| {
+                script.code_hash().as_slice() == TYPE_ID_CODE_HASH
+                    && script.hash_type() == ScriptHashType::Type.into()
+                    && script.args().raw_data().len() == 32
+            })
+            && cid_locks
+                .first()
+                .is_some_and(|cid| validate_state_cid_binding(&cell, *cid).is_ok());
+        if is_process_state {
             tracing::warn!(target: LOG_TARGET, event = "assemble.invalid",
-                reason = "registered_process_funding_input", out_point = ?op);
+                reason = "process_state_funding_input", out_point = ?op);
             return Err(PreparationError::UnsafeFunding);
         }
-        let lock = cell.lock();
         let code_hash: [u8; 32] = lock.code_hash().unpack();
         if cid_locks.iter().any(|identity| {
             code_hash == identity.code_hash && lock.hash_type() == identity.hash_type.into()
@@ -1015,9 +1020,9 @@ fn submit_filter_refund<R: Rpc + HostQueryRpc>(
             report.skipped += 1;
             return BatchOutcome::Continue;
         }
-        DryRunGate::Skip(RpcError::FeeRateRejected(error)) => {
-            tracing::warn!(target: LOG_TARGET, event = "dry_run.fee_rate_rejected", %error);
-            report.last_error = Some(format!("dry-run minimum fee rate rejected: {error}"));
+        DryRunGate::Skip(RpcError::PoolPolicyRejected(error)) => {
+            tracing::warn!(target: LOG_TARGET, event = "dry_run.pool_policy_rejected", %error);
+            report.last_error = Some(format!("dry-run pool policy rejected: {error}"));
             report.skipped += 1;
             return BatchOutcome::Continue;
         }
@@ -1083,9 +1088,9 @@ fn submit_filter_refund<R: Rpc + HostQueryRpc>(
             report.skipped += 1;
             BatchOutcome::Continue
         }
-        Err(RpcError::FeeRateRejected(error)) => {
-            tracing::warn!(target: LOG_TARGET, event = "submit.fee_rate_rejected", %error);
-            report.last_error = Some(format!("submit minimum fee rate rejected: {error}"));
+        Err(RpcError::PoolPolicyRejected(error)) => {
+            tracing::warn!(target: LOG_TARGET, event = "submit.pool_policy_rejected", %error);
+            report.last_error = Some(format!("submit pool policy rejected: {error}"));
             report.skipped += 1;
             BatchOutcome::Continue
         }

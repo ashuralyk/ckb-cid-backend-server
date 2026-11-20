@@ -30,6 +30,12 @@ The script inits `dev` with genesis miner lock, sets **`min_fee_rate = 0`** (D8:
 
 Before signing setup, the ignored fixture requires a numeric loopback HTTP RPC URL and checks that the node reports `ckb_dev`. The fixture disables HTTP redirects and proxies. The fixture checks the committed beneficiary output, a committed xUDT refund that preserves trailing data, and the CID lock's rejection of an untyped Intention with nonempty data.
 
+To exercise bounded refunds at a nonzero pool fee, use a fresh dev data directory
+and run the same fixture with `CID_LOCAL_CHAIN_BOUNDED_REFUNDS=1`. The script
+sets the node minimum to 1,000 shannons/KB and only allowlists the fixture's
+deployed CID lock. The fixture checks the node's active fee setting and confirms
+the xUDT refund pays a positive fee.
+
 ## Daemon env (production / local)
 
 | Variable | Config parser | Meaning |
@@ -60,4 +66,4 @@ The daemon resolves the code CellDeps at every tick and uses the live Process co
 
 State is memory-only. Restarting the daemon drops in-flight occupancy and full-rescans indexer `asc`.
 
-The local node uses `min_fee_rate = 0`. The Process guest pays the execution fee from its recreated state cell. The fixture uses a 600 CKB Intention, the example Process minimum for CKB deposits.
+The default exact-refund fixture uses `min_fee_rate = 0`. The Process guest pays the execution fee from its recreated state cell. The fixture uses a 600 CKB Intention, the example Process minimum for CKB deposits.

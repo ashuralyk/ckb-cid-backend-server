@@ -122,7 +122,9 @@ can be used. An unavailable lookup defers the search.
 
 Windows and probes select at most one input per full CID lock script. Probes
 skip non-live Intentions and subsets with non-live guest-added funding inputs.
-Adding an unselected Intention or another registered Process state as funding rejects that attempt. The worker tries
+Adding an unselected Intention or another Process state bound to this CID deployment as funding rejects that attempt. Ordinary funding inputs shared across different Processes are validated by the
+CKB transaction pool, which decides which conflicting transaction can be
+admitted. The daemon's pending-input tracking is per Process. The worker tries
 another subset after a validation failure, dry-run or submit rejection, or
 conflict when budget remains.
 
@@ -157,7 +159,8 @@ from a full indexer rescan.
 | `-1108` | `PoolRejectedMalformedTransaction` | `SubmitRejected` |
 | `-1106` | `PoolIsFull` | `PoolUnavailable` (retry) |
 | `-1105` | `PoolRejectedTransactionByMaxAncestorsCountLimit` | `PoolUnavailable` (retry) |
-| `-1104` | `PoolRejectedTransactionByMinFeeRate` | `FeeRateRejected` (keep scanning other combinations in the current tick and allow the same combination to be retried in a later tick) |
+| `-1104` | `PoolRejectedTransactionByMinFeeRate` | `PoolPolicyRejected` (keep scanning other combinations in the current tick and allow the same combination to be retried in a later tick) |
+| `-1110` | `PoolRejectedTransactionBySizeLimit` | `PoolPolicyRejected` (try other combinations and allow later retries) |
 | other / missing code | — | `Unavailable` (do **not** blacklist an Intention on an unclassified error) |
 
 A committed execution tx with a **known** `tx_status.block_number` of `0` is

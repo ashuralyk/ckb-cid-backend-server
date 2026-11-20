@@ -252,6 +252,8 @@ fn register_process(
             return Ok(bad_request(format!("{e}\n").as_bytes()));
         }
     };
+    let hash = reg_entry.identity_type_hash();
+    let previous = state.registry.lock().map_err(|_| ())?.get(&hash).cloned();
     let cells = match (state.find_process_state)(&entry.identity.type_script()) {
         Ok(cells) => cells,
         Err(error) => return Ok(state_lookup_unavailable(&error)),
@@ -283,8 +285,15 @@ fn register_process(
     // submission admission. This also covers sends whose receipt is uncertain.
     let outcome = {
         let mut reg = state.registry.lock().map_err(|_| ())?;
-        let hash = reg_entry.identity_type_hash();
-        let require_idle = reg.get(&hash).is_none_or(|existing| {
+        if reg.get(&hash) != previous.as_ref() {
+            return Ok((
+                409,
+                "Conflict",
+                "text/plain; charset=utf-8",
+                b"process registration changed during validation; retry\n".to_vec(),
+            ));
+        }
+        let require_idle = previous.as_ref().is_none_or(|existing| {
             existing.code_type_id_args != reg_entry.code_type_id_args
                 || existing.code_type_id != reg_entry.code_type_id
         });
@@ -315,7 +324,6 @@ fn register_process(
             Err(RegistrationQueueError::Unavailable) => return Err(()),
         }
     };
-    let hash = reg_entry.identity_type_hash();
     tracing::info!(
         target: "cid_backend",
         event = "registry.api.register",
@@ -633,6 +641,40 @@ mod tests {
         assert_eq!(post(&state), 400);
         assert_eq!(state.worker_cmds.queued().len(), 1);
         assert_eq!(std::fs::read(&path).unwrap(), persisted);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn registry_rejects_a_stale_binding_after_a_concurrent_update() {
+        let (reg, path) = temp_registry();
+        let mut state = api_state(reg, [CID.code_hash.as_slice(), &[1]].concat());
+        let registry = state.registry.clone();
+        let find = state.find_process_state.clone();
+        state.find_process_state = Arc::new(move |script| {
+            registry
+                .lock()
+                .unwrap()
+                .register(ProcessRegistration {
+                    identity_type_id_args: [0x11; 32],
+                    identity_type_id: None,
+                    code_type_id_args: [0x33; 32],
+                    code_type_id: None,
+                })
+                .unwrap();
+            find(script)
+        });
+        let body = serde_json::json!({
+            "identity_type_id_args": hex_pref(&[0x11; 32]),
+            "code_type_id_args": hex_pref(&[0x22; 32]),
+        })
+        .to_string();
+
+        let response = route("POST", "/v1/processes", body.as_bytes(), &state).unwrap();
+        assert_eq!(response.0, 409);
+        assert!(state.worker_cmds.queued().is_empty());
+        let registry = state.registry.lock().unwrap();
+        let persisted = registry.get(&type_id_script_hash(&[0x11; 32])).unwrap();
+        assert_eq!(persisted.code_type_id_args, [0x33; 32]);
         std::fs::remove_file(path).unwrap();
     }
 

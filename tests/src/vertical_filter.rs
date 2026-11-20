@@ -497,14 +497,12 @@ mod tests {
     }
 
     #[test]
-    fn assembly_cannot_add_another_registered_process_state_as_funding() {
+    fn assembly_cannot_add_another_process_state_as_funding_before_registration() {
         let (rpc, _, ops) = chain(1);
         let other_state = process_cell(2, 1000_0000_0000, vec![]);
         rpc.insert_cell(other_state.clone());
         let ssri = ScriptedSsri::mimic((1, 4)).with_added_input(other_state.out_point.clone());
         let mut loop_ = loop_with_resolver(rpc, ssri, default_loop_config(), 1);
-        crate::helpers::register_fixture(&mut loop_, 2);
-
         assert_eq!(loop_.tick().submitted, 0);
         assert_eq!(loop_.rpc().dry_run_attempts(), 0);
         assert!(loop_.rpc().has_cell(&ops[0]));

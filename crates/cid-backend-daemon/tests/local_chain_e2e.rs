@@ -1,7 +1,7 @@
 //! Local isolated CKB *dev* chain closure (not HTTP-mock, not FakeRpc).
 //!
 //! Ignored by default. `scripts/local-dev-chain.sh` starts a pinned CKB v0.119.0
-//! dev node (min_fee_rate=0, Indexer on, no public network) and runs this test.
+//! dev node with Indexer enabled and runs this test in exact or bounded refund mode.
 //!
 //! Flow: deploy always-success + CID lock + Process ELF → Process state cell →
 //! Intention → `DigestLoop::tick` (real JSON-RPC + EmbeddedSsri ckb-vm) →
@@ -437,6 +437,19 @@ fn scan_resolve_ssri_submit_confirms_on_local_dev_chain() {
         .call_node("get_blockchain_info", json!([]))
         .expect("chain info");
     assert!(is_dev_chain(&info), "fixture requires ckb_dev");
+    let bounded_refunds = env::var("CID_LOCAL_CHAIN_BOUNDED_REFUNDS").as_deref() == Ok("1");
+    let fee_rate = cid_backend_core::DEFAULT_FEE_RATE;
+    let expected_min_fee = if bounded_refunds { fee_rate } else { 0 };
+    let pool_info = rpc.call_node("tx_pool_info", json!([])).expect("pool info");
+    let min_fee = pool_info["min_fee_rate"]
+        .as_str()
+        .and_then(|fee| fee.strip_prefix("0x"))
+        .and_then(|fee| u64::from_str_radix(fee, 16).ok());
+    assert_eq!(
+        min_fee,
+        Some(expected_min_fee),
+        "unexpected dev pool fee rate"
+    );
     let process_elf =
         std::fs::read(read_env_path("CID_PROCESS_EXAMPLE_PATH")).expect("process elf");
     let cid_elf = std::fs::read(read_env_path("CID_LOCK_ELF_PATH")).expect("cid elf");
@@ -617,7 +630,14 @@ fn scan_resolve_ssri_submit_confirms_on_local_dev_chain() {
     // rejects it at input asset validation (UnsupportedType, exit 29).
     let invalid = TransactionBuilder::default()
         .input(input(untyped_op.clone()))
-        .output(untyped.output.as_builder().lock(user_lock.clone()).build())
+        .output(
+            untyped
+                .output
+                .as_builder()
+                .lock(user_lock.clone())
+                .capacity((intent_cap - expected_min_fee).pack())
+                .build(),
+        )
         .output_data(untyped_data.as_slice().pack())
         .cell_deps(deps)
         .witness(Default::default())
@@ -652,8 +672,15 @@ fn scan_resolve_ssri_submit_confirms_on_local_dev_chain() {
         registry_path: std::env::temp_dir().join("cid-local-e2e-registry.json"),
         registry_max_entries: 64,
         confirmation_depth: 1,
-        fee_rate: cid_backend_core::DEFAULT_FEE_RATE,
-        bounded_refund_locks: vec![],
+        fee_rate,
+        bounded_refund_locks: if bounded_refunds {
+            vec![cid_backend_core::CidLockIdentity::new(
+                cid_code_hash,
+                ScriptHashType::Type,
+            )]
+        } else {
+            vec![]
+        },
         extra_scan_locks: vec![],
         network_name: Some("local-dev".into()),
         genesis_hash: None,
@@ -718,7 +745,14 @@ fn scan_resolve_ssri_submit_confirms_on_local_dev_chain() {
         .unwrap()
         .expect("xUDT payout");
     assert_eq!(refund.lock(), user_lock);
-    assert_eq!(refund.capacity(), intent_cap);
+    if bounded_refunds {
+        assert!(
+            refund.capacity() < intent_cap,
+            "bounded refund must pay a fee"
+        );
+    } else {
+        assert_eq!(refund.capacity(), intent_cap);
+    }
     assert_eq!(refund.type_script(), Some(xudt_type));
     assert_eq!(refund.data, xudt_data);
     assert!(loop_.rpc().get_live_cell(&xudt_op).unwrap().is_none());

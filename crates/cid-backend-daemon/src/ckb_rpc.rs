@@ -675,6 +675,7 @@ const POOL_REJECTED_BY_MAX_ANCESTORS: i64 = -1105;
 const POOL_IS_FULL: i64 = -1106;
 const POOL_REJECTED_DUPLICATED: i64 = -1107;
 const POOL_REJECTED_MALFORMED: i64 = -1108;
+const POOL_REJECTED_SIZE_LIMIT: i64 = -1110;
 
 fn json_rpc_code(err: &Value) -> Option<i64> {
     let c = err.get("code")?;
@@ -687,7 +688,9 @@ const JSON_RPC_METHOD_NOT_FOUND: i64 = -32601;
 
 fn map_verify_rpc_error(method: &str, code: Option<i64>, msg: &str) -> RpcError {
     match code {
-        Some(POOL_REJECTED_BY_MIN_FEE_RATE) => RpcError::FeeRateRejected(msg.into()),
+        Some(POOL_REJECTED_BY_MIN_FEE_RATE | POOL_REJECTED_SIZE_LIMIT) => {
+            RpcError::PoolPolicyRejected(msg.into())
+        }
         Some(POOL_REJECTED_BY_MAX_ANCESTORS | POOL_IS_FULL) => {
             RpcError::PoolUnavailable(msg.into())
         }
@@ -745,7 +748,12 @@ impl CkbRpc {
         let has_uint = |key: &str| {
             result
                 .get(key)
-                .is_some_and(|value| parse_uint(value).is_ok())
+                .and_then(Value::as_str)
+                .and_then(|value| value.strip_prefix("0x"))
+                .is_some_and(|digits| {
+                    digits.bytes().all(|byte| byte.is_ascii_hexdigit())
+                        && u64::from_str_radix(digits, 16).is_ok()
+                })
         };
         if has_uint("cycles") && (method != "test_tx_pool_accept" || has_uint("fee")) {
             Ok(())
@@ -1492,7 +1500,12 @@ mod tests {
 
     #[test]
     fn dry_run_refuses_unusable_rpc_success_results() {
-        for (pool_missing, result) in [(false, Value::Null), (true, json!({}))] {
+        for (pool_missing, result) in [
+            (false, Value::Null),
+            (false, json!({"cycles":"0x", "fee":""})),
+            (false, json!({"cycles":"0x1", "fee":""})),
+            (true, json!({})),
+        ] {
             let url = spawn_mock(Arc::new(move |method, _| match method {
                 "test_tx_pool_accept" if pool_missing => Err((-32601, "Method not found".into())),
                 "test_tx_pool_accept" | "estimate_cycles" => Ok(result.clone()),
@@ -1724,23 +1737,28 @@ mod tests {
     }
 
     #[test]
-    fn minimum_fee_rate_rejection_is_transaction_specific() {
-        for method in ["test_tx_pool_accept", "send_transaction"] {
-            let url = spawn_mock(Arc::new(move |actual, _| {
-                assert_eq!(actual, method);
-                Err((
-                    -1104,
-                    format!("{method}: PoolRejectedTransactionByMinFeeRate"),
-                ))
-            }));
-            let rpc = CkbRpc::new(&url, &url);
-            let tx = ckb_types::core::TransactionBuilder::default().build();
-            let error = if method == "test_tx_pool_accept" {
-                rpc.dry_run_transaction(&tx).unwrap_err()
-            } else {
-                rpc.submit_transaction(&tx).unwrap_err()
-            };
-            assert!(matches!(error, RpcError::FeeRateRejected(_)), "{error:?}");
+    fn fee_and_size_policy_rejections_are_transaction_specific() {
+        for code in [-1104, -1110] {
+            for method in ["test_tx_pool_accept", "send_transaction"] {
+                let url = spawn_mock(Arc::new(move |actual, _| {
+                    assert_eq!(actual, method);
+                    Err((
+                        code,
+                        format!("{method}: transaction rejected by pool policy"),
+                    ))
+                }));
+                let rpc = CkbRpc::new(&url, &url);
+                let tx = ckb_types::core::TransactionBuilder::default().build();
+                let error = if method == "test_tx_pool_accept" {
+                    rpc.dry_run_transaction(&tx).unwrap_err()
+                } else {
+                    rpc.submit_transaction(&tx).unwrap_err()
+                };
+                assert!(
+                    matches!(error, RpcError::PoolPolicyRejected(_)),
+                    "{error:?}"
+                );
+            }
         }
     }
 

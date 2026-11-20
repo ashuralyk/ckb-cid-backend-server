@@ -146,7 +146,6 @@ where
     previous_live_keys: HashSet<Vec<u8>>,
     tick_cell_deps: Vec<CellDep>,
     tick_cid_locks: Arc<[CidLockIdentity]>,
-    tick_process_hashes: Arc<HashSet<[u8; 32]>>,
     execution_code_key: Vec<u8>,
 }
 
@@ -184,7 +183,6 @@ where
             previous_live_keys: HashSet::new(),
             tick_cell_deps: Vec::new(),
             tick_cid_locks: Arc::from([]),
-            tick_process_hashes: Arc::default(),
             execution_code_key: Vec::new(),
         }
     }
@@ -474,7 +472,6 @@ where
             );
         }
         self.tick_cid_locks = cid_locks.into();
-        self.tick_process_hashes = Arc::new(self.workers.hashes().into_iter().collect());
         let scanned = match scan_intentions_multi(self.rpc.as_ref(), &scan_ids) {
             Ok(v) => v,
             Err(RpcError::Unavailable(m)) => {
@@ -659,6 +656,12 @@ where
                     continue;
                 };
                 if let Some(polled) = worker.try_poll_batch() {
+                    if let Some(busy) = &self.busy {
+                        busy.update_process(
+                            hash,
+                            worker.with_state(|state| !state.submit.pending.is_empty()),
+                        );
+                    }
                     Self::apply_batch_report(report, &polled.delta);
                     if polled.mode == BatchMode::Assemble
                         && !polled.rest.is_empty()
@@ -1208,7 +1211,6 @@ where
             self.batch_code_key(process),
             self.tick_cell_deps.clone(),
             self.tick_cid_locks.clone(),
-            self.tick_process_hashes.clone(),
             self.config.refund_policy.clone(),
             max_size,
             rest,

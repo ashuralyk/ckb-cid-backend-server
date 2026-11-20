@@ -547,7 +547,7 @@ impl Rpc for FakeRpc {
         check_injected_conflict(&inner, tx, true)?;
         if inner.reject_fee_rate_once == Some((tx.inputs().len(), true)) {
             inner.reject_fee_rate_once = None;
-            return Err(RpcError::FeeRateRejected(
+            return Err(RpcError::PoolPolicyRejected(
                 "injected minimum fee rate".into(),
             ));
         }
@@ -588,7 +588,7 @@ impl Rpc for FakeRpc {
         check_injected_conflict(&inner, tx, false)?;
         if inner.reject_fee_rate_once == Some((tx.inputs().len(), false)) {
             inner.reject_fee_rate_once = None;
-            return Err(RpcError::FeeRateRejected(
+            return Err(RpcError::PoolPolicyRejected(
                 "injected minimum fee rate".into(),
             ));
         }

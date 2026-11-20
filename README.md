@@ -25,7 +25,7 @@ The daemon continuously digests CID Intentions:
 2. Resolve the registered Process state and code cells by exact Type-ID scripts. The state lock points at the Process code Type ID with `hash_type=type`, and its args bind the configured CID Type ID.
 3. Call `Process.filter` on the same code-cell ELF used by `Process.batch` and `Process.assemble`. Each request carries at most 64 cells and 64 KiB. The daemon retries the candidate window on a malformed response, a count mismatch, or an unknown reason. A cell that exceeds 64 KiB by itself stays live.
 4. Select batches from filter reason 0, with at most one input per full CID lock script. Only reasons 4–7 authorize automatic User Lock refunds. Reason 1 is logged and the cell stays live. Reserved reasons 2 and 3, unknown reasons, malformed responses, and response count mismatches defer the whole Process bucket for a fresh filter pass. A missing `Process.filter` defers the Process.
-5. Validate the full `Process.assemble` transaction, dry-run it, and submit it unchanged. Guest-added funding inputs must be live and cannot include an unselected Intention or another registered Process state. Assembly failures, including exits 21, 32, 37, 39, and 40, are logged and trigger a search for another legal subset. Automatic refunds require one of the filter reasons above. Excluded cells stay live. Exit 41 pauses work for the current Process state/code pair. The worker retains that quarantine for its lifetime, including when the pair returns after a reorg.
+5. Validate the full `Process.assemble` transaction, dry-run it, and submit it unchanged. Guest-added funding inputs must be live and cannot include an unselected Intention or another Process state bound to this CID deployment. Assembly failures generally begin a search for another legal subset. Exit 37 from the audited example guest pauses assembly for a state with no fee headroom. Automatic refunds require one of the filter reasons above. Excluded cells stay live. Exit 41 pauses work for the current Process state/code pair. The worker retains that quarantine for its lifetime, including when the pair returns after a reorg.
 6. Track occupied inputs until the node reports a drop or confirmation depth is met. If a send returns an ambiguous result, including a receipt hash mismatch, track it by the locally computed transaction hash and reconcile it before allowing a conflicting digest or refund. Refunds spend the Intention and preserve its data and type, returning capacity to the User Lock in its args. The existing refund builder supports CKB and standard xUDT. It logs and leaves unsupported refund outputs live. The default fee mode returns exact capacity. A configured bounded-refund CID identity lets the daemon deduct the required transaction fee within the on-chain per-output limit.
 
 For each refund, the daemon rereads the Intention at the node and requires an exact snapshot match. It also verifies the live Process code and state snapshots and includes both outpoints as cell dependencies. The worker defers refunds while a pending digest spends or creates the authorizing state. A pending refund blocks digests that would consume its state dependency until the node reports a commit and fresh checks confirm the tip height and the canonical block hash at the commit height. A refund that returns to the pool before settlement blocks those digests again. Refund eligibility uses the node-confirmed Process state’s validated lock args, a fresh filter reason of 4–7, matching node snapshots, and the pending-transaction interlock. A quarantined state/code pair is ineligible. When a pending digest releases the state, eligible refunds get a turn before another digest. The worker considers up to 16 singleton refunds per Process per tick and stops its sweep when RPC is unavailable.
@@ -111,6 +111,7 @@ The daemon does **not** read `CID_PROCESS_EXAMPLE_PATH` / `CID_LOCAL_CHAIN_E2E` 
 ```bash
 export CID_CKB_RPC_URL=http://127.0.0.1:8114
 export CID_POLL_INTERVAL_SECS=5
+export CID_API_BIND=127.0.0.1:9101
 # Set CID_LOCK_TYPE_ID_ARGS (+ optional CID_LOCK_TYPE_ID), then POST /v1/processes.
 # See docs/runbook.md for the testnet registration body.
 cargo run -p cid-backend-daemon
@@ -263,8 +264,9 @@ Default is 24 blocks (~3 minutes at ~8s). FakeRpc and the local-chain E2E use `1
 |---------|--------|-----------|
 | `Dropped` | yes (if cells still live) | released |
 | RPC/indexer `Unavailable` | yes | existing occupancy stays held |
-| `send_transaction` returns `Unavailable` | after node status reports a drop | track the local transaction hash and hold occupancy through reconciliation |
-| `Conflict` (`-301`, `-1107`, unknown-input, etc.) | yes | not taken |
+| `send_transaction` returns `Unavailable` (including duplicate `-1107`) | after rejection, eviction, or expiry of initial unknown-status grace | track the local transaction hash and hold occupancy through reconciliation |
+| `PoolUnavailable` (`-1105`, `-1106`) | next tick | no new occupancy |
+| `Conflict` (`-301`, unknown-input, etc.) | yes | not taken |
 | `SubmitRejected` (`-302` / `-1102` / `-1108`) | isolate that **combo**; do not send it again this process lifetime | not taken; Process is not written to `rejected` |
 | `Process.assemble` error | Log and try smaller or shifted batches. Exit 41 quarantines the state/code pair. | Affected Intentions stay live |
 | `Process.filter` reasons 4–7 | User Lock refund after matching node snapshots | Refund occupies the Intention input and depends on the live Process state and code |
@@ -277,7 +279,7 @@ Committed status requires a valid `block_hash`. The adapter uses the reported `b
 
 - Each Process starts a fresh scan of the current filter-accepted candidates each tick, with at most **64** assembly worker jobs and **64** subset probes, including the initial window. Large searches share the budget across legal batch sizes, give arrivals early probes, and vary the remaining order by tick. Some combinations may repeatedly fall outside the cap. This bounded-search starvation is accepted by design.
 - Candidate liveness is checked when a probe reaches a cell and reused within that search. Each tick allows up to one window plus 64 candidate reads by the isolation scan. An unavailable lookup defers the search.
-- Probes skip duplicate CID lock groups and subsets with non-live Intention or guest-added funding inputs. The funding guard rejects a transaction that adds an unselected Intention or another registered Process state as funding. A dry-run or submit conflict starts or advances isolation when alternatives and budget remain.
+- Probes skip duplicate CID lock groups and subsets with non-live Intention or guest-added funding inputs. The funding guard rejects a transaction that adds an unselected Intention or another Process state bound to this CID deployment as funding. A dry-run or submit conflict starts or advances isolation when alternatives and budget remain.
 - For the audited v0.1.4 example ELF, exit 37 on a state with zero fee headroom pauses assembly until the state or Process code changes. Other guests continue through capped isolation. The affected Intentions stay live.
 
 A singleton `{A, Process}` failure does **not** prove A is permanently invalid. Details: [`docs/confirmation.md`](docs/confirmation.md).
