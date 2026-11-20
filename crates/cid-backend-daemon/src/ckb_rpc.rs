@@ -375,11 +375,11 @@ impl Rpc for CkbRpc {
         )?;
         let hex = result
             .as_str()
-            .ok_or_else(|| RpcError::SubmitRejected("send_transaction: result not hex".into()))?;
+            .ok_or_else(|| RpcError::Unavailable("send_transaction: result not hex".into()))?;
         let bytes = decode_hex(hex)
-            .map_err(|e| RpcError::SubmitRejected(format!("send_transaction hash: {e}")))?;
+            .map_err(|e| RpcError::Unavailable(format!("send_transaction hash: {e}")))?;
         Byte32::from_slice(&bytes)
-            .map_err(|_| RpcError::SubmitRejected("send_transaction hash not 32 bytes".into()))
+            .map_err(|_| RpcError::Unavailable("send_transaction hash not 32 bytes".into()))
     }
 
     fn get_transaction_status(&self, tx_hash: &Byte32) -> Result<TxStatus, RpcError> {
@@ -394,11 +394,10 @@ impl Rpc for CkbRpc {
         let status = result
             .pointer("/tx_status/status")
             .and_then(|s| s.as_str())
-            .or_else(|| result.pointer("/status").and_then(|s| s.as_str()))
-            .unwrap_or("unknown");
+            .or_else(|| result.pointer("/status").and_then(|s| s.as_str()));
         match status {
-            "pending" | "proposed" => Ok(TxStatus::Pending),
-            "committed" => {
+            Some("pending" | "proposed") => Ok(TxStatus::Pending),
+            Some("committed") => {
                 let block_hash = result
                     .pointer("/tx_status/block_hash")
                     .and_then(Value::as_str)
@@ -413,7 +412,10 @@ impl Rpc for CkbRpc {
                     block_hash,
                 })
             }
-            _ => Ok(TxStatus::Dropped),
+            Some("unknown" | "rejected") => Ok(TxStatus::Dropped),
+            _ => Err(RpcError::Unavailable(
+                "get_transaction: missing or invalid status".into(),
+            )),
         }
     }
 
@@ -695,6 +697,10 @@ fn map_verify_rpc_error(method: &str, code: Option<i64>, msg: &str) -> RpcError 
 
 fn map_rpc_error(method: &str, code: Option<i64>, msg: &str) -> RpcError {
     match method {
+        // A duplicate send can refer to an already-admitted transaction.
+        "send_transaction" if code == Some(POOL_REJECTED_DUPLICATED) => {
+            RpcError::Unavailable(msg.into())
+        }
         "send_transaction" | "test_tx_pool_accept" | "estimate_cycles" => {
             map_verify_rpc_error(method, code, msg)
         }
@@ -1496,7 +1502,7 @@ mod tests {
         let url = spawn_mock(Arc::new(|method, _| {
             assert_eq!(method, "send_transaction");
             Err((
-                -1107,
+                -301,
                 "TransactionFailedToResolve: UnknownInputs(0xab)".into(),
             ))
         }));
@@ -1518,7 +1524,8 @@ mod tests {
                 1 => json!({"tx_status":{"status":"proposed"}}),
                 2 => json!({"tx_status":{"status":"unknown"}}),
                 3 => json!({"tx_status":{"status":"rejected"}}),
-                _ => Value::Null,
+                4 => Value::Null,
+                _ => json!({"tx_status": {}}),
             })
         }));
         let rpc = CkbRpc::new(&url, &url);
@@ -1543,6 +1550,10 @@ mod tests {
             rpc.get_transaction_status(&hash).unwrap(),
             TxStatus::Dropped
         );
+        assert!(matches!(
+            rpc.get_transaction_status(&hash),
+            Err(RpcError::Unavailable(_))
+        ));
     }
 
     #[test]
@@ -1653,6 +1664,27 @@ mod tests {
         assert!(!msg.contains("SECRET_MARKER"), "{msg}");
         assert!(!msg.contains("TOKEN_MARKER"), "{msg}");
         assert!(!msg.contains("user:"), "{msg}");
+    }
+
+    #[test]
+    fn unusable_send_receipts_require_status_reconciliation() {
+        for response in [
+            Ok(Value::Null),
+            Ok(json!("invalid")),
+            Ok(json!("0xab")),
+            Err((-1107, "PoolRejectedDuplicatedTransaction".into())),
+        ] {
+            let url = spawn_mock(Arc::new(move |method, _| {
+                assert_eq!(method, "send_transaction");
+                response.clone()
+            }));
+            let rpc = CkbRpc::new(&url, &url);
+            let tx = ckb_types::core::TransactionBuilder::default().build();
+            assert!(matches!(
+                rpc.submit_transaction(&tx),
+                Err(RpcError::Unavailable(_))
+            ));
+        }
     }
 
     #[test]
@@ -1926,6 +1958,7 @@ mod tests {
                     Ok(Value::String(hex_bytes(&[0xab; 32])))
                 }
             }
+            "get_transaction" if sends2.load(Ordering::SeqCst) == 1 => Ok(Value::Null),
             "get_transaction" => Ok(json!({"tx_status":{"status":"pending"}})),
             "get_tip_block_number" => Ok(json!("0x0")),
             other => host_query_or_dry_run(other, &params, &[intent.clone(), proc.clone()]),

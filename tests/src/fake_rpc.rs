@@ -29,6 +29,7 @@ struct Inner {
     submit_attempts: usize,
     dry_run_attempts: usize,
     unavailable_next_submit: bool,
+    lose_next_submit_response: bool,
     defer_commit: bool,
     fail_status_queries: bool,
     fail_tip_queries: bool,
@@ -194,6 +195,11 @@ impl FakeRpc {
     /// Submit succeeds but leaves inputs live and does not apply outputs (indexer lag / mempool).
     pub fn defer_commit(&self) {
         self.inner.lock().unwrap().defer_commit = true;
+    }
+
+    /// Accept the next transaction but lose the RPC response.
+    pub fn lose_next_submit_response(&self) {
+        self.inner.lock().unwrap().lose_next_submit_response = true;
     }
 
     /// `get_transaction_status` returns Unavailable until restored (occupancy must be held).
@@ -634,11 +640,18 @@ impl Rpc for FakeRpc {
             let status = inner.committed_status();
             inner.tx_status.insert(hash_key, status);
         }
+        let lost_response = std::mem::take(&mut inner.lose_next_submit_response);
         drop(inner);
         if let Some(callback) = self.after_submit.lock().unwrap().take() {
             callback();
         }
-        Ok(tx_hash)
+        if lost_response {
+            Err(RpcError::Unavailable(
+                "injected submit response timeout".into(),
+            ))
+        } else {
+            Ok(tx_hash)
+        }
     }
 
     fn get_transaction_status(&self, tx_hash: &Byte32) -> Result<TxStatus, RpcError> {

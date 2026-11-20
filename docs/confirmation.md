@@ -36,7 +36,8 @@ recreate is skipped until settlement (`process_occupied`).
 
 A filter-authorized User Lock refund spends the Intention and uses the live
 Process state and code as cell dependencies. The worker defers the refund while
-a pending digest consumes or creates its authorizing state. If a legal accepted batch is
+a pending digest consumes or creates its authorizing state. All refund sweeps
+wait while a bounded assembly search has probes remaining. If a legal accepted batch is
 available, the worker requires a completed assembly check before releasing the
 deferred refund. A confirming digest's recreated state stays occupied until
 settlement. In the other direction, a pending refund blocks digest submissions
@@ -71,7 +72,11 @@ cells are live again.
 ## Retry vs permanent failure
 
 The adapter keeps the JSON-RPC `error.code` from `send_transaction` and
-classifies it. Transient node/pool errors are `Unavailable`. Core
+classifies it. Transient node/pool errors are `Unavailable`. A send that
+returns `Unavailable` reserves its inputs and outputs under the locally
+computed transaction hash for status reconciliation. Refunds also retain
+their authorizing state dependency. This covers timeouts, unusable receipts,
+and duplicate sends. Core
 `SubmitRejected` is a **transaction-level** permanent failure of that exact
 Intention combo under its Process state and execution code. It does
 **not** prove any one Intention is invalid, so consumed outpoints are not
@@ -80,7 +85,8 @@ written to `rejected`.
 | Outcome | Retry? | Occupancy |
 |---------|--------|-----------|
 | `Dropped` (pool eviction / reorg) | yes, next tick if cells live | released |
-| RPC/indexer `Unavailable` | yes | held if already pending; not taken on a failed submit |
+| RPC/indexer `Unavailable` | yes | existing occupancy stays held |
+| `send_transaction` returns `Unavailable` | after node status reports a drop | held under the local transaction hash through reconciliation |
 | `Conflict` | yes. During assembly isolation, try later subsets and reconsider conflicts on the next search. | not taken (`failed` is informational) |
 | `SubmitRejected` (positively identified permanent send failure of this tx) | isolate / skip that **combo** this process lifetime | not taken; Process outpoint is not blacklisted |
 | `Process.assemble` error | log and try another batch, or quarantine the state/code pair on exit 41 | affected cells stay live |
@@ -102,11 +108,15 @@ for that combination. The worker uses the ELF from the registered Process
 code cell and verifies the indexed Process state against the node before
 filtering or assembly.
 
-An unfinished search resumes only if the indexed candidates, their node
-liveness, and the Process snapshot match. An arrival, removal, or revival
-starts a fresh search. Large searches vary candidate order when restarting.
+An unfinished search resumes only if the ordered filter-accepted candidates,
+their node liveness, and the Process and execution snapshot match. Changes
+to accepted candidates, including revived cells, start a fresh search.
+The arrival of a cell excluded by the filter leaves the cursor in place.
+Large searches vary candidate order when restarting.
 Windows and probes select at most one input per full CID lock script. Probes
 skip non-live Intentions and subsets with non-live guest-added funding inputs.
+A transaction that adds an unselected Intention as funding is rejected for
+that attempt. The guest can assemble the same selection again on a later tick.
 An unavailable liveness lookup defers the search to the next tick. A
 structurally invalid transaction advances the search during a deferred
 refund’s assembly check. The refund stays deferred if the budget runs out

@@ -3,6 +3,7 @@ mod tests {
     use cid_backend_core::digest_loop::LoopConfig;
     use cid_backend_core::rpc::{out_point_key, script_hash32, LiveCell};
     use ckb_types::core::ScriptHashType;
+    use ckb_types::prelude::Entity;
     use std::time::Duration;
 
     use crate::fake_rpc::FakeRpc;
@@ -27,7 +28,7 @@ mod tests {
     }
 
     #[test]
-    fn transient_unavailable_submit_retries_next_tick() {
+    fn unavailable_submit_retries_after_node_reports_it_missing() {
         let rpc = FakeRpc::new();
         let ts = process_type_script(26);
         let hash = script_hash32(&ts);
@@ -41,20 +42,12 @@ mod tests {
         let first = loop_.tick();
         assert_eq!(first.submitted, 0);
         assert_eq!(first.conflicts, 0);
-        assert!(!loop_
-            .state()
-            .submit
-            .as_ref()
-            .unwrap()
-            .in_flight
-            .contains(&out_point_key(&intent.out_point)));
-        assert!(!loop_
-            .state()
-            .submit
-            .as_ref()
-            .unwrap()
-            .rejected
-            .contains(&out_point_key(&intent.out_point)));
+        let submit = loop_.state().submit.unwrap();
+        let key = out_point_key(&intent.out_point);
+        assert!(submit.in_flight.contains(&key));
+        assert!(!submit.rejected.contains(&key));
+        assert_eq!(submit.pending.len(), 1);
+        let unacknowledged = submit.pending.keys().next().unwrap();
         assert!(loop_
             .rpc()
             .live_cells()
@@ -63,7 +56,9 @@ mod tests {
 
         let second = loop_.tick();
         assert_eq!(second.submitted, 1, "transient Unavailable must retry");
-        assert_eq!(loop_.rpc().submitted().len(), 1);
+        let submitted = loop_.rpc().submitted();
+        assert_eq!(submitted.len(), 1);
+        assert_eq!(submitted[0].hash().as_slice(), unacknowledged);
     }
 
     #[test]

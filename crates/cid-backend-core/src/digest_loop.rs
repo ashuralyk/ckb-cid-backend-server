@@ -16,7 +16,7 @@ use cid_intention_filter::{
     FILTER_UNSUPPORTED_ACTION, FILTER_UNSUPPORTED_ASSET,
 };
 use ckb_types::core::ScriptHashType;
-use ckb_types::packed::{Byte32, CellDep, CellOutput, OutPoint};
+use ckb_types::packed::{Byte32, CellDep, CellOutput};
 use ckb_types::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -101,7 +101,6 @@ pub struct TickReport {
 }
 
 struct FilteredBucket {
-    indexed: Vec<OutPoint>,
     process: ResolvedProcess,
     accepted: Vec<ScannedIntention>,
     refunds: Vec<ScannedIntention>,
@@ -109,6 +108,7 @@ struct FilteredBucket {
 
 struct WindowSearch {
     pending: Option<Vec<ScannedIntention>>,
+    probe_pending: bool,
     mode: BatchMode,
 }
 
@@ -551,7 +551,6 @@ where
                     report.skipped += bucket.len();
                     return None;
                 }
-                let indexed = bucket.iter().map(|item| item.out_point.clone()).collect();
                 worker.with_state(|state| {
                     let pending = state.submit.pending_occupied_keys();
                     bucket.retain(|item| {
@@ -564,7 +563,7 @@ where
                 if bucket.is_empty() {
                     return None;
                 }
-                self.prepare_bucket(hash, bucket, indexed, &mut report)
+                self.prepare_bucket(hash, bucket, &mut report)
             })
             .collect();
         let mut searches: HashMap<_, _> = buckets
@@ -579,7 +578,6 @@ where
                         BatchMode::Assemble
                     };
                     state.set_isolation_context(Some(IsolationContext {
-                        indexed: bucket.indexed.clone(),
                         accepted: bucket
                             .accepted
                             .iter()
@@ -599,6 +597,7 @@ where
                     process.type_hash,
                     WindowSearch {
                         pending: Some(bucket.accepted.clone()),
+                        probe_pending: false,
                         mode,
                     },
                 )
@@ -636,6 +635,15 @@ where
         // by assemble must also stop refunds authorized by its filter.
         for bucket in buckets {
             let hash = bucket.process.type_hash;
+            let search = &searches[&hash];
+            if search.probe_pending
+                || search
+                    .pending
+                    .as_ref()
+                    .is_some_and(|items| !items.is_empty())
+            {
+                continue;
+            }
             let can_refund = self.workers.get(&hash).is_some_and(|worker| {
                 worker.with_state(|state| {
                     !state.is_process_quarantined(&bucket.process)
@@ -681,7 +689,10 @@ where
                 items.extend_from_slice(&polled.rest);
                 Some(items)
             }
-            BatchOutcome::ProbePending => None,
+            BatchOutcome::ProbePending => {
+                search.probe_pending = true;
+                None
+            }
             outcome => {
                 worker.with_state_mut(|state| {
                     state.isolation_probe = None;
@@ -1004,7 +1015,6 @@ where
         &self,
         hash: [u8; 32],
         mut bucket: Vec<ScannedIntention>,
-        indexed: Vec<OutPoint>,
         report: &mut TickReport,
     ) -> Option<FilteredBucket> {
         let worker = self.workers.get(&hash)?;
@@ -1100,7 +1110,6 @@ where
         }
 
         Some(FilteredBucket {
-            indexed,
             process,
             accepted,
             refunds,
@@ -1128,7 +1137,11 @@ where
                 }
                 return true;
             }
-            state.probe_budget.remaining == 0 || state.is_process_quarantined(process)
+            if state.probe_budget.remaining == 0 {
+                search.probe_pending = !items.is_empty();
+                return true;
+            }
+            state.is_process_quarantined(process)
         });
         if paused {
             report.skipped += items.len();

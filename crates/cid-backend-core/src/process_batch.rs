@@ -375,7 +375,11 @@ where
                     report.last_error = Some(format!("guest-added input {op:?} is not live"));
                     None
                 }
-                Err(PreparationError::Rejected) if mode == BatchMode::CheckAssembly => None,
+                Err(PreparationError::Rejected | PreparationError::UnsafeFunding)
+                    if mode == BatchMode::CheckAssembly =>
+                {
+                    None
+                }
                 result => Some(result),
             },
             Err(SsriError::Incompatible(PROCESS_LOCK_ARGS_INVALID)) => {
@@ -419,7 +423,11 @@ where
                     Err(PreparationError::InputLookup(error)) => Err(SsriError::Unusable(format!(
                         "verify guest-added input: {error}"
                     ))),
-                    Err(PreparationError::Rejected) if mode == BatchMode::CheckAssembly => Ok(None),
+                    Err(PreparationError::Rejected | PreparationError::UnsafeFunding)
+                        if mode == BatchMode::CheckAssembly =>
+                    {
+                        Ok(None)
+                    }
                     result => Ok(Some(result)),
                 },
                 Err(error @ SsriError::Incompatible(PROCESS_LOCK_ARGS_INVALID)) => Err(error),
@@ -497,15 +505,12 @@ where
 
     let skeleton = match prepared {
         Ok(skeleton) => skeleton,
-        Err(PreparationError::Rejected) => {
+        Err(error @ (PreparationError::Rejected | PreparationError::UnsafeFunding)) => {
             let mut worker = state.lock().expect("process worker state");
-            record_invalid_assembled_reject(
-                &mut worker,
-                &batch,
-                process,
-                execution_code_key,
-                &mut report,
-            );
+            if matches!(error, PreparationError::Rejected) {
+                record_invalid_assembled_reject(&mut worker, &batch, process, execution_code_key);
+            }
+            report.skipped += batch.len();
             return (retry_isolation(&mut worker, true), report);
         }
         Err(PreparationError::InputLookup(error)) => {
@@ -648,6 +653,7 @@ where
 
 enum PreparationError {
     Rejected,
+    UnsafeFunding,
     NonLiveInput(OutPoint),
     InputLookup(RpcError),
 }
@@ -694,7 +700,7 @@ fn prepare_execution(
         {
             tracing::warn!(target: LOG_TARGET, event = "assemble.invalid",
                 reason = "unselected_intention", out_point = ?op);
-            return Err(PreparationError::Rejected);
+            return Err(PreparationError::UnsafeFunding);
         }
     }
     Ok(skeleton)
@@ -1077,12 +1083,20 @@ fn submit_filter_refund<R: Rpc + HostQueryRpc>(
         report.skipped += 1;
         return BatchOutcome::Continue;
     };
-    match submit_execution(rpc, &skeleton, &mut worker.submit, consumed) {
+    let result = submit_execution(rpc, &skeleton, &mut worker.submit, consumed);
+    let tracked_hash = match &result {
+        Ok(hash) => Some(hash.clone()),
+        Err(RpcError::Unavailable(_)) => Some(skeleton.tx.hash()),
+        _ => None,
+    };
+    if let Some(hash) = tracked_hash {
+        worker.refund_state_deps.insert(
+            hash.as_slice().to_vec(),
+            authorizing_state.out_point.clone(),
+        );
+    }
+    match result {
         Ok(tx_hash) => {
-            worker.refund_state_deps.insert(
-                tx_hash.as_slice().to_vec(),
-                authorizing_state.out_point.clone(),
-            );
             tracing::info!(target: LOG_TARGET, event = "submit.ok", tx_hash = %hex_pref(tx_hash.as_slice()));
             report.submitted += 1;
             BatchOutcome::Submitted
@@ -1114,7 +1128,6 @@ fn record_invalid_assembled_reject(
     batch: &[ScannedIntention],
     process: &ResolvedProcess,
     execution_code_key: &[u8],
-    report: &mut BatchReportDelta,
 ) {
     let intent_ops: Vec<_> = batch.iter().map(|i| i.out_point.clone()).collect();
     let fp = combo_fingerprint(
@@ -1123,5 +1136,4 @@ fn record_invalid_assembled_reject(
         execution_code_key,
     );
     worker.submit.rejected_combos.insert(fp);
-    report.skipped += batch.len();
 }

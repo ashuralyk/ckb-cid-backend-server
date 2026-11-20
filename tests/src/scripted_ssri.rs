@@ -17,7 +17,7 @@ pub struct ScriptedSsri {
     intention_errors: Vec<(OutPoint, i8, Option<u64>)>,
     pair_error: Option<(OutPoint, i8)>,
     assembly_error: Option<AssemblyErrorScript>,
-    additional_input: Option<(OutPoint, Option<OutPoint>)>,
+    additional_input: Mutex<Option<(OutPoint, Option<OutPoint>)>>,
     pub bounds: (u32, u32),
     pub mode: Mode,
     /// Binaries observed by `get_batch_bounds` / `assemble` (SSRI source tests).
@@ -40,7 +40,7 @@ impl ScriptedSsri {
             intention_errors: Vec::new(),
             pair_error: None,
             assembly_error: None,
-            additional_input: None,
+            additional_input: Mutex::new(None),
             bounds,
             mode,
             seen_binaries: Mutex::new(Vec::new()),
@@ -99,13 +99,17 @@ impl ScriptedSsri {
         self
     }
 
-    pub fn with_added_input(mut self, op: OutPoint) -> Self {
-        self.additional_input = Some((op, None));
+    pub fn with_added_input(self, op: OutPoint) -> Self {
+        self.set_added_input(op);
         self
     }
 
-    pub fn with_added_input_for(mut self, intention: OutPoint, input: OutPoint) -> Self {
-        self.additional_input = Some((input, Some(intention)));
+    pub fn set_added_input(&self, op: OutPoint) {
+        *self.additional_input.lock().unwrap() = Some((op, None));
+    }
+
+    pub fn with_added_input_for(self, intention: OutPoint, input: OutPoint) -> Self {
+        *self.additional_input.lock().unwrap() = Some((input, Some(intention)));
         self
     }
 
@@ -187,7 +191,7 @@ impl SsriHost for ScriptedSsri {
             Mode::Unusable => Err(SsriError::Unusable("scripted".into())),
             Mode::MimicExample => {
                 let assembled = mimic_assemble(draft_tx, host, None)?;
-                let Some((op, intention)) = &self.additional_input else {
+                let Some((op, intention)) = &*self.additional_input.lock().unwrap() else {
                     return Ok(assembled);
                 };
                 let tx = Transaction::from_slice(assembled.as_molecule_bytes()).unwrap();

@@ -41,7 +41,6 @@ fn process_snapshot(process: &ResolvedProcess) -> (OutPoint, Option<OutPoint>) {
 /// Inputs that must match before a worker can resume across ticks.
 #[derive(PartialEq, Eq)]
 pub(crate) struct IsolationContext {
-    pub(crate) indexed: Vec<OutPoint>,
     pub(crate) accepted: Vec<OutPoint>,
     pub(crate) process: OutPoint,
     pub(crate) guest_hash: [u8; 32],

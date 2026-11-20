@@ -26,9 +26,9 @@ The daemon continuously digests CID Intentions:
 3. Call `Process.filter` on the same code-cell ELF used by `Process.batch` and `Process.assemble`. Each request carries at most 64 cells and 64 KiB. The daemon retries the candidate window on a malformed response, a count mismatch, or an unknown reason. A cell that exceeds 64 KiB by itself stays live.
 4. Select batches from filter reason 0, with at most one input per full CID lock script. Only reasons 4–7 authorize automatic User Lock refunds. Reason 1 is logged and the cell stays live. Reserved reasons 2 and 3, unknown reasons, malformed responses, and response count mismatches defer the whole Process bucket for a fresh filter pass. A missing filter defers the Process by default. Set `loop.allow_missing_filter = true` or `CID_ALLOW_MISSING_FILTER=true` to enable legacy assembly on the explicit SSRI method-missing exit.
 5. Validate the full `Process.assemble` transaction, dry-run it, and submit it unchanged. Guest-added funding inputs are checked against the configured CID locks and known data-hash aliases. Assembly failures, including exits 21, 32, 37, 39, and 40, are logged and trigger a search for another legal subset. Automatic refunds require one of the filter reasons above. Excluded cells stay live. Exit 41 pauses work for the current Process state/code pair. The worker retains that quarantine for its lifetime, including when the pair returns after a reorg.
-6. Track occupied inputs until confirmation depth is met. Refunds spend the Intention and preserve its data and type, returning capacity to the User Lock in its args. The existing refund builder supports CKB and standard xUDT. It logs and leaves unsupported refund outputs live. The default fee mode returns exact capacity. A configured bounded-refund CID identity lets the daemon deduct the required transaction fee within the on-chain per-output limit.
+6. Track occupied inputs until the node reports a drop or confirmation depth is met. If a send returns an ambiguous result, track it by the locally computed transaction hash and reconcile it before allowing a conflicting digest or refund. Refunds spend the Intention and preserve its data and type, returning capacity to the User Lock in its args. The existing refund builder supports CKB and standard xUDT. It logs and leaves unsupported refund outputs live. The default fee mode returns exact capacity. A configured bounded-refund CID identity lets the daemon deduct the required transaction fee within the on-chain per-output limit.
 
-For each refund, the daemon rereads the Intention at the node and requires an exact snapshot match. It also verifies the live Process code and state snapshots and includes both outpoints as cell dependencies. The worker defers refunds while a pending digest spends or creates the authorizing state. A pending refund blocks digests that would consume its state dependency until the node reports a commit and fresh checks confirm the tip height and the canonical block hash at the commit height. A refund that returns to the pool before settlement blocks those digests again. When a legal accepted batch is available, deferred refunds wait for a completed assembly check. A fresh filter pass must return reason 4–7 again. The worker considers up to 16 singleton refunds per Process per tick and stops its sweep when RPC is unavailable.
+For each refund, the daemon rereads the Intention at the node and requires an exact snapshot match. It also verifies the live Process code and state snapshots and includes both outpoints as cell dependencies. The worker defers refunds while a pending digest spends or creates the authorizing state. A pending refund blocks digests that would consume its state dependency until the node reports a commit and fresh checks confirm the tip height and the canonical block hash at the commit height. A refund that returns to the pool before settlement blocks those digests again. A refund sweep waits while assembly still has candidates to probe. When a legal accepted batch is available, refunds deferred behind a digest wait for a completed assembly check. A fresh filter pass must return reason 4–7 again. The worker considers up to 16 singleton refunds per Process per tick and stops its sweep when RPC is unavailable.
 
 Upstream contract pin for testnet v0.1.4 is `b2d01e0a5a9760c8ee627633365aa98dd7a99859`. For the public config, deployment outpoints, and registry POST body, see the [runbook](docs/runbook.md).
 
@@ -224,7 +224,7 @@ flowchart TD
   dok --> gate["Dry-run"]
   refund -->|healthy Process| gate
   gate --> send["send_transaction"]
-  send -->|ok| pending["pending occupancy<br/>wait confirmation_depth"]
+  send -->|ok or ambiguous| pending["pending occupancy<br/>wait confirmation_depth"]
   send -->|SubmitRejected| combo["record combo fingerprint and keep splitting"]
   send -->|Conflict| isolate
   send -->|Unavailable| retry["Defer without taking occupancy"]
@@ -238,7 +238,7 @@ Each tick ([`digest_loop.rs`](crates/cid-backend-core/src/digest_loop.rs)):
 2. Resolve Type-ID code cells with a bounded exact search and merge their dependencies with static extras. SSRI uses the live Process code-cell ELF. The Process state lock references that code Type ID with `hash_type=type`.
 3. Scan live Intentions; skip cells whose lock args fail to decode.
 4. Resolve the indexed Process state and confirm its outpoint, output, and data with the node. Filter each Process bucket before selecting legal `[min, max]` sub-batches. Transaction rejection fingerprints include Type-ID code outpoints so code upgrades clear stale `CachedRejected` without dropping `pending` / `in_flight`.
-5. Resolve assembly outcomes before submitting filter refunds. Exit 41 also blocks that state's filter refunds.
+5. Complete pending assembly searches before sweeping filter refunds. Exit 41 also blocks that state's filter refunds.
 
 ### Memory-only state and restart
 
@@ -263,7 +263,8 @@ Default is 24 blocks (~3 minutes at ~8s). FakeRpc and the local-chain E2E use `1
 | Outcome | Retry? | Occupancy |
 |---------|--------|-----------|
 | `Dropped` | yes (if cells still live) | released |
-| RPC/indexer `Unavailable` (including `-1106` PoolIsFull, `-1105` ancestors, `-1104` min fee, unclassified) | yes | held if already pending; not taken on a failed submit |
+| RPC/indexer `Unavailable` | yes | existing occupancy stays held |
+| `send_transaction` returns `Unavailable` | after node status reports a drop | track the local transaction hash and hold occupancy through reconciliation |
 | `Conflict` (`-301`, `-1107`, unknown-input, etc.) | yes | not taken |
 | `SubmitRejected` (`-302` / `-1102` / `-1108`) | isolate that **combo**; do not send it again this process lifetime | not taken; Process is not written to `rejected` |
 | `Process.assemble` error | Log and try smaller or shifted batches. Exit 41 quarantines the state/code pair. | Affected Intentions stay live |
@@ -276,8 +277,8 @@ Committed status requires a valid `block_hash`. The adapter uses the reported `b
 `SubmitRejected` fingerprints the ordered Intention outpoints, the Process state outpoint, and the execution code identity. Rejected digest windows enter the same subset search as assembly failures. The worker skips cached combinations and can try noncontiguous candidates.
 
 - Each Process gets at most **64** assembly worker jobs and **64** subset probes per tick. After an assembly failure, the search starts at the minimum batch size and can advance to larger legal subsets.
-- An unfinished search resumes next tick only while the candidate set, node-reported candidate liveness, and Process snapshot match. Arrivals, removals, and revived cells restart the search. A deferred refund waits for the assembly check to finish.
-- Probes skip duplicate CID lock groups and subsets with non-live Intention or guest-added funding inputs. A dry-run or submit conflict starts or advances isolation when alternatives and budget remain. An unavailable liveness lookup defers the search to the next tick.
+- An unfinished search resumes while the ordered filter-accepted candidates, their node-reported liveness, and the Process and execution snapshot match. Arrivals excluded by the filter leave the cursor in place. Changes to accepted candidates, including revived cells, restart the search.
+- Probes skip duplicate CID lock groups and subsets with non-live Intention or guest-added funding inputs. The funding guard rejects a transaction that adds an unselected Intention as funding. The guest can assemble the same selection again on a later tick. A dry-run or submit conflict starts or advances isolation when alternatives and budget remain. An unavailable liveness lookup defers the search to the next tick.
 - For the audited v0.1.4 example ELF, exit 37 on a state with zero fee headroom pauses assembly until the state or Process code changes. Other guests continue through capped isolation. The affected Intentions stay live.
 
 A singleton `{A, Process}` failure does **not** prove A is permanently invalid. Details: [`docs/confirmation.md`](docs/confirmation.md).
