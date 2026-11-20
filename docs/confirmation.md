@@ -91,7 +91,7 @@ written to `rejected`.
 | `PoolPolicyRejected` | try another combination now and reconsider this combination on a later tick | no new occupancy |
 | `send_transaction` returns `Unavailable` | after a known drop or expiry of the initial admission grace period | held under the local transaction hash through reconciliation |
 | `Conflict` | yes. During assembly isolation, try later subsets and reconsider conflicts on the next search. | not taken (`failed` is informational) |
-| `SubmitRejected` (positively identified permanent send failure of this tx) | isolate / skip that **combo** this process lifetime | not taken; Process outpoint is not blacklisted |
+| `SubmitRejected` (permanent local, preflight, or send validation failure) | isolate that combination while its Process state and execution code stay the same | no new occupancy |
 | `Process.assemble` error | log and try another batch, or quarantine the state/code pair on exit 41 | affected cells stay live |
 | `Process.filter` reasons 4–7 | User Lock refund after matching node snapshots | Intention input occupied on successful submit |
 
@@ -134,10 +134,10 @@ headroom pauses assembly until the state or Process code changes. Other guests
 continue through capped isolation. Intentions excluded during assembly stay
 live. The filter refund sweep considers up to 16 current verdicts per tick.
 
-A singleton `{A, Process}` failure is **not** treated as proof that A is
-permanently invalid (`-302` / `-1102` / `-1108` may come from Process, lock,
-deps, or the combination). Only that combo is skipped. If the live Process
-cell changes, A may be tried again.
+A permanent rejection of a singleton `{A, Process}` caches that combination.
+The worker can still include A in other combinations or retry it after the
+Process state or code changes. A maturity-related `-302` is retryable and
+does not populate the cache.
 
 **min > 1.** A rejected window is not written wholesale into `rejected`. If
 the window cannot be split below `min`, members stay eligible as cells but
@@ -166,12 +166,12 @@ from a full indexer rescan.
 | `-1110` | `PoolRejectedTransactionBySizeLimit` | `PoolPolicyRejected` (try other combinations and allow later retries) |
 | `-1111` | `PoolRejectedRBF` | `Conflict` |
 | `-1112` | `PoolRejectedInvalidated` | `Conflict` |
-| other / missing code | — | `Unavailable` (do **not** blacklist an Intention on an unclassified error) |
+| other / missing code | — | `Conflict` for known conflict messages. Other responses are `Unavailable`. |
 
-A committed execution tx with a **known** `tx_status.block_number` of `0` is
-genesis height and is used as-is. Missing/invalid `block_hash` or `get_header`
-returning null is `Unavailable`, not height 0: occupancy stays held until a
-real height is observed.
+A valid `tx_status.block_number` of `0x0` is genesis height. A missing or
+malformed reported height falls back to `get_header` for the reported block
+hash. A missing or invalid hash, null header, or malformed header height
+returns `Unavailable` and keeps occupancy held.
 
 `rejected_combos` is memory-only. Restarting the daemon will try those
 Intentions again.

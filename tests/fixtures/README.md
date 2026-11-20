@@ -53,8 +53,15 @@ The exact deployed v0.1.4 guest can also be retrieved from CKB testnet with the 
 Lookup order: `CID_PROCESS_EXAMPLE_PATH`, then
 `tests/fixtures/cid_process_example`.
 
-FakeRpc verticals (`cid-backend-tests`) use `ScriptedSsri` and do not need
-the ELF.
+The standard FakeRpc suite uses `ScriptedSsri`. The opt-in regression for
+the audited guest's zero-fee-headroom pause requires the exact deployed
+v0.1.4 guest with the hash above. Run it from this repository with:
+
+```bash
+CID_PROCESS_EXAMPLE_PATH=/abs/path/to/deployed-v0.1.4-cid_process_example \
+  cargo test --locked -p cid-backend-tests \
+  audited_guest_with_zero_fee_headroom_waits_for_state_or_code_change -- --ignored --nocapture
+```
 
 Local-chain E2E also builds `ckb_common_intention_dispatcher` (CID lock) and
 a tiny `always_success` guest; those ELFs are gitignored. See
