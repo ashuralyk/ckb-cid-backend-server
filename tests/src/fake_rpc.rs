@@ -16,6 +16,7 @@ struct Inner {
     reject_next_submit: bool,
     reject_next_dry_run: bool,
     spent_deps: HashSet<OutPoint>,
+    spend_dep_on_submit: Option<OutPoint>,
     stale_indexer_cells: HashSet<OutPoint>,
     indexer_snapshots: HashMap<OutPoint, Option<LiveCell>>,
     unavailable_submit_inputs: HashSet<OutPoint>,
@@ -184,6 +185,10 @@ impl FakeRpc {
 
     pub fn mark_dep_spent(&self, op: OutPoint) {
         self.inner.lock().unwrap().spent_deps.insert(op);
+    }
+
+    pub fn spend_dep_on_next_submit(&self, op: OutPoint) {
+        self.inner.lock().unwrap().spend_dep_on_submit = Some(op);
     }
 
     pub fn inject_unavailable_refund_once(&self, op: OutPoint) {
@@ -460,6 +465,10 @@ impl Rpc for FakeRpc {
     fn submit_transaction(&self, tx: &TransactionView) -> Result<Byte32, RpcError> {
         let mut inner = self.inner.lock().unwrap();
         inner.submit_attempts += 1;
+        if let Some(op) = inner.spend_dep_on_submit.take() {
+            inner.cells.remove(&out_point_key(&op));
+            inner.spent_deps.insert(op);
+        }
         if tx
             .cell_deps()
             .into_iter()

@@ -98,7 +98,11 @@ script raw bytes then block/tx/output index (see contract
 
 Pinned `cid_process_example` pays fee from Process state and **rejects extra
 funding inputs** with `UnsupportedFundingLock` (38). Do not pass funding cells
-to the example guest / calculator submit helper. Exit 21 retains the existing incompatible refund path. Exits 39 (deposit below minimum) and 40 (CID lock mismatch) trigger diagnostic assembly calls to identify individual offenders. When the guest's minimum batch size exceeds one, the worker searches up to 64 comparison batches before resuming on a later tick for the same candidates and Process snapshot. Individually confirmed verdicts survive transient failures and dropped refunds while the Intention is still live and the Process policy is unchanged. Exit 41 (invalid Process state lock args) logs `process.unhealthy` and pauses assembly and refunds for that state and Process code version. Host query failures (36) and insufficient state capacity (37) leave Intentions live for retry.
+to the example guest / calculator submit helper. Exit 21 retains the existing incompatible refund path.
+
+Exits 39 (deposit below minimum) and 40 (CID lock mismatch) trigger diagnostic assembly. If the guest requires more than one Intention, the worker shares a budget of 64 probes per Process per tick between finding a working batch and substituting candidates into it. It resumes both phases on later ticks for the same candidate set and Process snapshot. Substitution failures exclude candidates from the current batch and authorize refunds only for audited example ELF hashes. A singleton verdict scoped to a particular Process state carries that state as a cell dependency, so a refund can commit only while the authorizing state is live. Confirmed verdicts survive transient failures and dropped refunds while the Intention is live and the Process policy is unchanged.
+
+Exit 41 (invalid Process state lock args) logs `process.unhealthy` and pauses assembly and refunds for that state and Process code version. Host query failures (36) are retried. Insufficient state capacity (37) leaves Intentions live and the comparison search advances to the next subset, which may need a smaller fee.
 
 ## Ops checklist
 

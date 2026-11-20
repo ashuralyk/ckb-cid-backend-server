@@ -6,7 +6,7 @@ use crate::process::ResolvedProcess;
 use crate::process::{ProcessEntry, ProcessResolver};
 use crate::process_batch::{
     run_process_batch, BatchMode, BatchOutcome, BatchReportDelta, IsolationProbe,
-    ProcessBatchParams,
+    ProcessBatchParams, MAX_COMPARISON_PROBES,
 };
 use crate::rpc::{LiveCell, Rpc};
 use crate::scan::ScannedIntention;
@@ -56,7 +56,7 @@ pub struct ProcessWorkerState {
     pub(crate) isolated_prune_cursor: Option<OutPoint>,
     pub(crate) refund_cursor: Option<OutPoint>,
     pub(crate) isolation_probe: Option<IsolationProbe>,
-    pub(crate) isolation_probe_paused: bool,
+    pub(crate) comparison_probes_left: usize,
     pub generation: u64,
     /// State out point quarantined after Process.assemble exit 41.
     pub unhealthy_state: Option<OutPoint>,
@@ -84,7 +84,7 @@ impl ProcessWorkerState {
             isolated_prune_cursor: None,
             refund_cursor: None,
             isolation_probe: None,
-            isolation_probe_paused: false,
+            comparison_probes_left: MAX_COMPARISON_PROBES,
             generation,
             unhealthy_state: None,
             filter_missing_logged: false,

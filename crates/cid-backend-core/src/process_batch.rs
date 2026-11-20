@@ -13,11 +13,12 @@ use crate::scan::ScannedIntention;
 use crate::ssri::{
     build_batch_draft, draft_cell_deps_for_batch, draft_cells_for_batch, intention_draft_cell,
     SsriError, SsriHost, BENEFICIARY_MISSING, CID_LOCK_MISMATCH, DEPOSIT_BELOW_MINIMUM,
-    INCOMPATIBLE_BATCH, PROCESS_LOCK_ARGS_INVALID, UNSUPPORTED_FUNDING_LOCK,
+    HOST_QUERY_FAILED, INCOMPATIBLE_BATCH, PROCESS_LOCK_ARGS_INVALID, STATE_CAPACITY_INSUFFICIENT,
+    UNSUPPORTED_FUNDING_LOCK,
 };
 use crate::submit::{combo_fingerprint, dry_run_gate, submit_execution, DryRunGate};
 use crate::worker_commands::{Submission, WorkerCommands};
-use crate::workers::ProcessWorkerState;
+use crate::workers::{IsolatedRefundScope, ProcessWorkerState};
 use cid_protocol::CidArgs;
 use ckb_types::packed::{CellDep, OutPoint};
 use ckb_types::prelude::{Entity, Unpack};
@@ -27,6 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 const LOG_TARGET: &str = "cid_backend";
+pub(crate) const MAX_COMPARISON_PROBES: usize = 64;
 
 fn hex_pref(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(2 + bytes.len() * 2);
@@ -281,11 +283,10 @@ where
         let cells = draft_cells_for_batch(items, process);
         ssri.assemble_live(rpc.clone(), &process.binary, &draft, &cells, tip)
     };
-    let mut probe = state
-        .lock()
-        .expect("process worker state")
-        .isolation_probe
-        .take();
+    let (mut probe, mut probes_left) = {
+        let mut worker = state.lock().expect("process worker state");
+        (worker.isolation_probe.take(), worker.comparison_probes_left)
+    };
     // A resumed search already has its trigger. Re-assembling the changed
     // window could restart isolation before the saved comparisons run.
     let resuming = probe.as_ref().is_some_and(|saved| saved.indices.is_some());
@@ -308,7 +309,7 @@ where
         // Check node liveness before using a comparison cell as evidence,
         // once per candidate per job.
         let mut live = HashMap::new();
-        let mut probe_attempt = |items: &[ScannedIntention]| {
+        let mut check_live = |items: &[ScannedIntention]| {
             for item in items {
                 let is_live = match live.get(&item.out_point) {
                     Some(&is_live) => is_live,
@@ -325,7 +326,7 @@ where
                     return Ok(false);
                 }
             }
-            attempt(items).map(|_| true)
+            Ok(true)
         };
         let result = isolate_intentions(
             &batch,
@@ -334,16 +335,18 @@ where
             original_code,
             &process.live_cell.out_point,
             &mut probe,
-            &mut probe_attempt,
+            &mut probes_left,
+            &mut check_live,
+            &attempt,
         );
-        state.lock().expect("process worker state").isolation_probe = probe;
+        {
+            let mut worker = state.lock().expect("process worker state");
+            worker.isolation_probe = probe;
+            worker.comparison_probes_left = probes_left;
+        }
         let (good, bad) = match result {
             Ok(Some(result)) => result,
             Ok(None) => {
-                state
-                    .lock()
-                    .expect("process worker state")
-                    .isolation_probe_paused = true;
                 report.skipped += batch.len();
                 return (BatchOutcome::ProbePending, report);
             }
@@ -378,10 +381,17 @@ where
         }
         if process.verdict_code_cell().is_some() && !lease.cancelled() {
             let mut worker = state.lock().expect("process worker state");
+            let can_refund = min == 1
+                || matches!(
+                    worker.isolated_refund_scope,
+                    Some(IsolatedRefundScope::Example(_))
+                );
             for (item, code) in bad {
                 tracing::warn!(target: LOG_TARGET, event = "assemble.intention_isolated",
-                    process_type_hash = %hex_pref(&hash), out_point = ?item.out_point, code);
-                worker.isolated_refunds.insert(item.out_point, code);
+                    process_type_hash = %hex_pref(&hash), out_point = ?item.out_point, code, can_refund);
+                if can_refund {
+                    worker.isolated_refunds.insert(item.out_point, code);
+                }
             }
         }
         let Some(remaining) = remaining else {
@@ -686,6 +696,26 @@ fn find_unselected_intention<R: HostQueryRpc>(
 
 type IsolatedIntentions = (Vec<ScannedIntention>, Vec<(ScannedIntention, i8)>);
 
+enum ProbeVerdict {
+    Accepted,
+    Rejected(i8),
+}
+
+impl ProbeVerdict {
+    fn record(self, item: &ScannedIntention, (good, bad): &mut IsolatedIntentions) {
+        match self {
+            Self::Accepted => good.push(item.clone()),
+            Self::Rejected(code) => bad.push((item.clone(), code)),
+        }
+    }
+}
+
+#[derive(Default)]
+struct SubstitutionProbe {
+    next: usize,
+    verdicts: Vec<(usize, ProbeVerdict)>,
+}
+
 /// Keep positions stable while walking combinations. Cells missing from a
 /// later scan leave holes and arrivals wait for a subsequent search.
 pub(crate) struct IsolationProbe {
@@ -694,6 +724,8 @@ pub(crate) struct IsolationProbe {
     window_len: usize,
     min: usize,
     indices: Option<Vec<usize>>,
+    // While substituting, `indices` identifies the successful control.
+    substitution: Option<SubstitutionProbe>,
 }
 
 impl IsolationProbe {
@@ -732,42 +764,57 @@ impl IsolationProbe {
     }
 }
 
-fn isolate_intentions(
+fn classify_probe(
+    item: &ScannedIntention,
+    result: Result<bool, SsriError>,
+) -> Result<Option<ProbeVerdict>, SsriError> {
+    match result {
+        Ok(true) => Ok(Some(ProbeVerdict::Accepted)),
+        Ok(false) => Ok(None),
+        Err(SsriError::Incompatible(code @ (DEPOSIT_BELOW_MINIMUM | CID_LOCK_MISMATCH))) => {
+            Ok(Some(ProbeVerdict::Rejected(code)))
+        }
+        Err(error @ SsriError::Incompatible(PROCESS_LOCK_ARGS_INVALID)) => Err(error),
+        Err(error) => {
+            tracing::debug!(target: LOG_TARGET, event = "assemble.isolation_skipped",
+                out_point = ?item.out_point, %error);
+            Ok(None)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn isolate_intentions<T>(
     batch: &[ScannedIntention],
     rest: &[ScannedIntention],
     min: usize,
     original_code: Option<i8>,
     process: &OutPoint,
     probe: &mut Option<IsolationProbe>,
-    attempt: &mut impl FnMut(&[ScannedIntention]) -> Result<bool, SsriError>,
+    probes_left: &mut usize,
+    check_live: &mut impl FnMut(&[ScannedIntention]) -> Result<bool, SsriError>,
+    attempt: &impl Fn(&[ScannedIntention]) -> Result<T, SsriError>,
 ) -> Result<Option<IsolatedIntentions>, SsriError> {
-    let mut good = Vec::new();
-    let mut bad = Vec::new();
-    let mut classify = |item: &ScannedIntention, result: Result<bool, SsriError>| {
-        match result {
-            Ok(true) => good.push(item.clone()),
-            Ok(false) => {}
-            Err(SsriError::Incompatible(code @ (DEPOSIT_BELOW_MINIMUM | CID_LOCK_MISMATCH))) => {
-                bad.push((item.clone(), code));
-            }
-            Err(error @ SsriError::Incompatible(PROCESS_LOCK_ARGS_INVALID)) => return Err(error),
-            Err(error) => {
-                tracing::debug!(target: LOG_TARGET, event = "assemble.isolation_skipped",
-                    out_point = ?item.out_point, %error);
-            }
-        }
-        Ok(())
-    };
     if min == 1 {
         *probe = None;
+        let mut isolated = IsolatedIntentions::default();
         for item in batch {
+            let single = std::slice::from_ref(item);
             let result = match original_code {
                 Some(code) if batch.len() == 1 => Err(SsriError::Incompatible(code)),
-                _ => attempt(std::slice::from_ref(item)),
+                _ => check_live(single).and_then(|live| {
+                    if live {
+                        attempt(single).map(|_| true)
+                    } else {
+                        Ok(false)
+                    }
+                }),
             };
-            classify(item, result)?;
+            if let Some(verdict) = classify_probe(item, result)? {
+                verdict.record(item, &mut isolated);
+            }
         }
-        return Ok(Some((good, bad)));
+        return Ok(Some(isolated));
     }
 
     let candidates: HashMap<_, _> = batch
@@ -785,58 +832,97 @@ fn isolate_intentions(
         window_len: batch.len(),
         min,
         indices: Some((0..min).collect()),
+        substitution: None,
     });
     let Some(indices) = &mut saved.indices else {
-        return Ok(Some((good, bad)));
+        return Ok(Some(IsolatedIntentions::default()));
     };
     let snapshot: Vec<_> = saved
         .candidates
         .iter()
         .map(|op| candidates.get(op).copied())
         .collect();
-    const MAX_PROBES: usize = 64;
-    for _ in 0..MAX_PROBES {
+    let control = loop {
+        if *probes_left == 0 {
+            return Ok(None);
+        }
         let control: Option<Vec<_>> = indices.iter().map(|&i| snapshot[i].cloned()).collect();
-        let result = match control.as_deref() {
-            Some(items) => attempt(items),
-            None => Ok(false),
-        };
-        match result {
-            Ok(true) => {
-                let end = saved.window_len.max(indices[min - 1] + 1);
-                for (index, item) in snapshot[..end].iter().enumerate() {
-                    let Some(item) = item else { continue };
-                    if indices.contains(&index) {
-                        classify(item, Ok(true))?;
-                        continue;
-                    }
-
-                    let mut comparison = control.as_ref().expect("successful control").clone();
-                    comparison.pop();
-                    let position = indices[..min - 1].partition_point(|&i| i < index);
-                    comparison.insert(position, (*item).clone());
-                    classify(item, attempt(&comparison))?;
+        // Count missing or spent subsets too, so holes cannot make the
+        // combination walk unbounded within a tick.
+        *probes_left -= 1;
+        match control {
+            Some(items) if check_live(&items)? => {
+                if saved.substitution.is_some() {
+                    // Reuse the successful control without assembling it again.
+                    *probes_left += 1;
+                    break items;
                 }
-                good.truncate(batch.len());
-                *probe = None;
-                return Ok(Some((good, bad)));
+                match attempt(&items) {
+                    Ok(_) => break items,
+                    Err(SsriError::Incompatible(
+                        DEPOSIT_BELOW_MINIMUM
+                        | CID_LOCK_MISMATCH
+                        | INCOMPATIBLE_BATCH
+                        | UNSUPPORTED_FUNDING_LOCK
+                        | BENEFICIARY_MISSING
+                        | STATE_CAPACITY_INSUFFICIENT,
+                    )) => {}
+                    Err(error) => return Err(error),
+                }
             }
-            Ok(false)
-            | Err(SsriError::Incompatible(
-                DEPOSIT_BELOW_MINIMUM
-                | CID_LOCK_MISMATCH
-                | INCOMPATIBLE_BATCH
-                | UNSUPPORTED_FUNDING_LOCK
-                | BENEFICIARY_MISSING,
-            )) => {}
-            Err(error) => return Err(error),
+            // Discard partial results if a saved control cell disappeared.
+            _ => saved.substitution = None,
         }
         if !advance_probe_indices(indices, snapshot.len()) {
             saved.indices = None;
-            return Ok(Some((good, bad)));
+            return Ok(Some(IsolatedIntentions::default()));
+        }
+    };
+
+    let substitution = saved
+        .substitution
+        .get_or_insert_with(SubstitutionProbe::default);
+    let end = saved.window_len.max(indices[min - 1] + 1);
+    for (index, item) in snapshot[..end].iter().enumerate().skip(substitution.next) {
+        if let Some(item) = *item {
+            let verdict = if indices.contains(&index) {
+                Some(ProbeVerdict::Accepted)
+            } else {
+                if *probes_left == 0 {
+                    return Ok(None);
+                }
+                *probes_left -= 1;
+                let mut comparison = control.clone();
+                comparison.pop();
+                let position = indices[..min - 1].partition_point(|&i| i < index);
+                comparison.insert(position, item.clone());
+                if check_live(&comparison)? {
+                    let result = match attempt(&comparison) {
+                        Err(error @ SsriError::Incompatible(HOST_QUERY_FAILED)) => {
+                            return Err(error)
+                        }
+                        result => result.map(|_| true),
+                    };
+                    classify_probe(item, result)?
+                } else {
+                    None
+                }
+            };
+            if let Some(verdict) = verdict {
+                substitution.verdicts.push((index, verdict));
+            }
+        }
+        substitution.next = index + 1;
+    }
+    let mut isolated = IsolatedIntentions::default();
+    for (index, verdict) in std::mem::take(&mut substitution.verdicts) {
+        if let Some(item) = snapshot[index] {
+            verdict.record(item, &mut isolated);
         }
     }
-    Ok(None)
+    isolated.0.truncate(batch.len());
+    *probe = None;
+    Ok(Some(isolated))
 }
 
 /// Move to the next subset, exhausting nearby candidates before adding a
@@ -963,22 +1049,35 @@ fn refund_policy_rejections<R: Rpc + HostQueryRpc>(
         if lease.cancelled() {
             break;
         }
-        let code = {
+        let (code, state_scoped) = {
             let mut worker = params.state.lock().expect("process worker state");
             worker.refund_cursor = Some(item.out_point.clone());
-            worker.isolated_refunds.get(&item.out_point).copied()
+            match (
+                worker.isolated_refunds.get(&item.out_point),
+                &worker.isolated_refund_scope,
+            ) {
+                (Some(&code), Some(IsolatedRefundScope::State(op)))
+                    if *op == params.process.live_cell.out_point =>
+                {
+                    (code, true)
+                }
+                (Some(&code), Some(IsolatedRefundScope::Example(_))) => (code, false),
+                (None, _) => (INCOMPATIBLE_BATCH, false),
+                (Some(_), _) => continue,
+            }
         };
         let outcome = assemble_and_submit_refund(
             rpc,
             &params.state,
             std::slice::from_ref(item),
-            code.unwrap_or(INCOMPATIBLE_BATCH),
+            code,
             params.execution_code_key,
             &deps,
             params.refund_policy,
             &mut report,
             BatchMode::PolicyRefund,
             &params.process.live_cell,
+            state_scoped,
             &lease,
         );
         if outcome == BatchOutcome::RpcUnavailable {
@@ -1053,6 +1152,7 @@ fn handle_incompatible_refunds<R: Rpc + HostQueryRpc>(
                 BatchMode::Assemble
             },
             &process.live_cell,
+            false,
             lease,
         );
         match outcome {
@@ -1092,6 +1192,7 @@ fn assemble_and_submit_refund<R: Rpc + HostQueryRpc>(
     report: &mut BatchReportDelta,
     attempt_mode: BatchMode,
     authorizing_state: &LiveCell,
+    state_scoped: bool,
     lease: &BatchLease<'_>,
 ) -> BatchOutcome {
     let refund_only = attempt_mode.refund_only();
@@ -1122,6 +1223,24 @@ fn assemble_and_submit_refund<R: Rpc + HostQueryRpc>(
             return outcome;
         }
     }
+    let state_deps;
+    let tick_cell_deps = if state_scoped {
+        // Consensus must still see this state as live when the refund commits.
+        state_deps = match merge_cell_deps(
+            &[cell_dep_code(&authorizing_state.out_point)],
+            tick_cell_deps,
+        ) {
+            Ok(deps) => deps,
+            Err(error) => {
+                report.last_error = Some(format!("policy refund: {error}"));
+                report.skipped += group.len();
+                return BatchOutcome::Continue;
+            }
+        };
+        &state_deps
+    } else {
+        tick_cell_deps
+    };
     let mode = refund_policy.mode_for(&group[0].lock_identity());
     let skeleton =
         match assemble_refund_with_policy(group, tick_cell_deps, mode, refund_policy.fee_rate) {
@@ -1179,7 +1298,10 @@ fn assemble_and_submit_refund<R: Rpc + HostQueryRpc>(
         };
 
     let intent_ops: Vec<_> = group.iter().map(|i| i.out_point.clone()).collect();
-    let fp = combo_fingerprint(&intent_ops, None, execution_code_key);
+    let mut fp = combo_fingerprint(&intent_ops, None, execution_code_key);
+    if state_scoped {
+        fp.extend_from_slice(authorizing_state.out_point.as_slice());
+    }
     {
         let worker = state.lock().expect("process worker state");
         if worker.submit.rejected_combos.contains(&fp) {

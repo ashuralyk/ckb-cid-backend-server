@@ -17,6 +17,8 @@ pub const INCOMPATIBLE_BATCH: i8 = 21;
 
 /// The example guest cannot build the requested beneficiary.
 pub const BENEFICIARY_MISSING: i8 = 32;
+pub const HOST_QUERY_FAILED: i8 = 36;
+pub const STATE_CAPACITY_INSUFFICIENT: i8 = 37;
 pub const DEPOSIT_BELOW_MINIMUM: i8 = 39;
 pub const CID_LOCK_MISMATCH: i8 = 40;
 pub const PROCESS_LOCK_ARGS_INVALID: i8 = 41;

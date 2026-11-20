@@ -529,7 +529,7 @@ where
                 state
                     .pending_incompatible_refund
                     .retain(|k| live_keys.contains(k) || pending_occupied.contains(k));
-                state.isolation_probe_paused = false;
+                state.comparison_probes_left = process_batch::MAX_COMPARISON_PROBES;
                 // A dropped refund can become visible to the node before the indexer.
                 // Rotate through absent marks so a lagging indexer cannot monopolize lookups.
                 let cursor = state.isolated_prune_cursor.as_ref();
@@ -1227,7 +1227,7 @@ where
         if self
             .workers
             .get(&hash)
-            .is_some_and(|worker| worker.with_state(|state| state.isolation_probe_paused))
+            .is_some_and(|worker| worker.with_state(|state| state.comparison_probes_left == 0))
         {
             return;
         }
