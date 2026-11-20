@@ -293,6 +293,11 @@ pub(crate) fn assemble_refund_with_policy(
 }
 
 fn refund_output(intent: &ScannedIntention) -> Result<(CellOutput, Vec<u8>), AssembleError> {
+    if !intent.has_supported_user_lock() {
+        return Err(AssembleError::RefundUnbuildable(
+            "unsupported CID user lock hash type".into(),
+        ));
+    }
     let user = protocol_script_to_packed(&intent.args.entry.user_lock);
     let mut builder = CellOutput::new_builder()
         .capacity(intent.capacity.pack())
@@ -419,6 +424,17 @@ mod tests {
         assert!(matches!(
             assemble_digest_incompatible(&[intent], &[]),
             Err(AssembleError::RefundUnbuildable(_))
+        ));
+    }
+
+    #[test]
+    fn refund_rejects_data2_user_lock() {
+        let mut intent = intention(1, [2; 32], 600_0000_0000);
+        intent.args.entry.user_lock.hash_type = ScriptHashType::Data2 as u8;
+        intent.lock_args = intent.args.encode().unwrap();
+        assert!(matches!(
+            assemble_digest_incompatible(&[intent], &[]),
+            Err(AssembleError::RefundUnbuildable(message)) if message.contains("user lock hash type")
         ));
     }
 

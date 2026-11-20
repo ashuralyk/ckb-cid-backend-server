@@ -8,12 +8,12 @@ const DEFAULT_MAX_ASSEMBLED_TX_BYTES: usize = 512 * 1024;
 use crate::fee::{CidLockIdentity, RefundPolicy};
 use crate::host_query::HostQueryRpc;
 use crate::process::ResolvedProcess;
-use crate::rpc::{out_point_key, Rpc, RpcError};
+use crate::rpc::{out_point_key, LiveCell, Rpc, RpcError};
 use crate::scan::ScannedIntention;
 use crate::ssri::{
-    build_batch_draft, draft_cell_deps_for_batch, draft_cells_for_batch, SsriError, SsriHost,
-    BENEFICIARY_MISSING, CID_LOCK_MISMATCH, DEPOSIT_BELOW_MINIMUM, INCOMPATIBLE_BATCH,
-    PROCESS_LOCK_ARGS_INVALID, UNSUPPORTED_FUNDING_LOCK,
+    build_batch_draft, draft_cell_deps_for_batch, draft_cells_for_batch, intention_draft_cell,
+    SsriError, SsriHost, BENEFICIARY_MISSING, CID_LOCK_MISMATCH, DEPOSIT_BELOW_MINIMUM,
+    INCOMPATIBLE_BATCH, PROCESS_LOCK_ARGS_INVALID, UNSUPPORTED_FUNDING_LOCK,
 };
 use crate::submit::{combo_fingerprint, dry_run_gate, submit_execution, DryRunGate};
 use crate::worker_commands::{Submission, WorkerCommands};
@@ -224,6 +224,7 @@ where
         );
         return handle_incompatible_refunds(
             rpc.as_ref(),
+            process,
             &state,
             &batch,
             INCOMPATIBLE_BATCH,
@@ -296,8 +297,16 @@ where
         _ => None,
     };
     let assemble_outcome = if resuming || original_code.is_some() {
-        // Some hosts seed draft inputs from the scan. Check node liveness
-        // before using a scanned cell as evidence, once per candidate per job.
+        if let Some(code) = process.verdict_code_cell() {
+            if let Err(outcome) =
+                verify_refund_cell(rpc.as_ref(), code, "Process code", batch.len(), &mut report)
+            {
+                state.lock().expect("process worker state").isolation_probe = probe;
+                return (outcome, report);
+            }
+        }
+        // Check node liveness before using a comparison cell as evidence,
+        // once per candidate per job.
         let mut live = HashMap::new();
         let mut probe_attempt = |items: &[ScannedIntention]| {
             for item in items {
@@ -484,6 +493,7 @@ where
             // Refund path: unlock around dry-run + submit like digest_ok (P2).
             return handle_incompatible_refunds(
                 rpc.as_ref(),
+                process,
                 &state,
                 &batch,
                 code,
@@ -815,6 +825,7 @@ fn isolate_intentions(
             | Err(SsriError::Incompatible(
                 DEPOSIT_BELOW_MINIMUM
                 | CID_LOCK_MISMATCH
+                | INCOMPATIBLE_BATCH
                 | UNSUPPORTED_FUNDING_LOCK
                 | BENEFICIARY_MISSING,
             )) => {}
@@ -858,7 +869,7 @@ fn mark_process_unhealthy(
     worker.isolate_pending.clear();
     worker.isolate_resume = None;
     worker.isolation_probe = None;
-    worker.isolated_refunds.clear();
+    worker.clear_isolated_refunds();
     (
         BatchOutcome::Continue,
         BatchReportDelta {
@@ -867,6 +878,38 @@ fn mark_process_unhealthy(
             ..BatchReportDelta::default()
         },
     )
+}
+
+fn intention_snapshot(item: &ScannedIntention) -> LiveCell {
+    let draft = intention_draft_cell(item);
+    LiveCell {
+        out_point: draft.out_point,
+        output: draft.output,
+        data: draft.data,
+    }
+}
+
+fn verify_refund_cell(
+    rpc: &impl HostQueryRpc,
+    snapshot: &LiveCell,
+    role: &str,
+    count: usize,
+    report: &mut BatchReportDelta,
+) -> Result<(), BatchOutcome> {
+    let outcome = match rpc.get_live_cell(&snapshot.out_point) {
+        Ok(live) if live.as_ref() == Some(snapshot) => return Ok(()),
+        Ok(_) => {
+            tracing::warn!(target: LOG_TARGET, event = "refund.snapshot_mismatch",
+                role, out_point = ?snapshot.out_point);
+            BatchOutcome::Continue
+        }
+        Err(error) => {
+            report.last_error = Some(format!("refund {role} lookup: {error}"));
+            BatchOutcome::RpcUnavailable
+        }
+    };
+    report.skipped += count;
+    Err(outcome)
 }
 
 fn refund_policy_rejections<R: Rpc + HostQueryRpc>(
@@ -880,6 +923,11 @@ fn refund_policy_rejections<R: Rpc + HostQueryRpc>(
         report.last_error = Some("policy refund requires a live Process code-cell ELF".into());
         return (BatchOutcome::Continue, report);
     };
+    if let Err(outcome) =
+        verify_refund_cell(rpc, code, "Process code", params.batch.len(), &mut report)
+    {
+        return (outcome, report);
+    }
     let deps = match merge_cell_deps(&[cell_dep_code(&code.out_point)], params.tick_cell_deps) {
         Ok(deps) => deps,
         Err(error) => {
@@ -930,7 +978,7 @@ fn refund_policy_rejections<R: Rpc + HostQueryRpc>(
             params.refund_policy,
             &mut report,
             BatchMode::PolicyRefund,
-            code.map(|_| &params.process.live_cell.out_point),
+            &params.process.live_cell,
             &lease,
         );
         if outcome == BatchOutcome::RpcUnavailable {
@@ -948,6 +996,7 @@ fn refund_policy_rejections<R: Rpc + HostQueryRpc>(
 #[allow(clippy::too_many_arguments)]
 fn handle_incompatible_refunds<R: Rpc + HostQueryRpc>(
     rpc: &R,
+    process: &ResolvedProcess,
     state: &Arc<Mutex<ProcessWorkerState>>,
     batch: &[ScannedIntention],
     code: i8,
@@ -958,6 +1007,11 @@ fn handle_incompatible_refunds<R: Rpc + HostQueryRpc>(
     refund_only: bool,
     lease: &BatchLease<'_>,
 ) -> (BatchOutcome, BatchReportDelta) {
+    if let Some(code) = process.verdict_code_cell() {
+        if let Err(outcome) = verify_refund_cell(rpc, code, "Process code", batch.len(), report) {
+            return (outcome, report.clone());
+        }
+    }
     let mut by_identity: Vec<(CidLockIdentity, Vec<ScannedIntention>)> = Vec::new();
     for item in batch {
         let id = item.lock_identity();
@@ -998,7 +1052,7 @@ fn handle_incompatible_refunds<R: Rpc + HostQueryRpc>(
             } else {
                 BatchMode::Assemble
             },
-            None,
+            &process.live_cell,
             lease,
         );
         match outcome {
@@ -1037,7 +1091,7 @@ fn assemble_and_submit_refund<R: Rpc + HostQueryRpc>(
     refund_policy: &RefundPolicy,
     report: &mut BatchReportDelta,
     attempt_mode: BatchMode,
-    authorizing_state: Option<&OutPoint>,
+    authorizing_state: &LiveCell,
     lease: &BatchLease<'_>,
 ) -> BatchOutcome {
     let refund_only = attempt_mode.refund_only();
@@ -1053,6 +1107,19 @@ fn assemble_and_submit_refund<R: Rpc + HostQueryRpc>(
         {
             report.skipped += group.len();
             return BatchOutcome::Continue;
+        }
+    }
+    // The CID refund verifies assets and fees, so dry-run cannot validate the
+    // Intention data and lock args that were used to obtain the policy verdict.
+    for item in group {
+        if let Err(outcome) = verify_refund_cell(
+            rpc,
+            &intention_snapshot(item),
+            "Intention",
+            group.len(),
+            report,
+        ) {
+            return outcome;
         }
     }
     let mode = refund_policy.mode_for(&group[0].lock_identity());
@@ -1168,19 +1235,10 @@ fn assemble_and_submit_refund<R: Rpc + HostQueryRpc>(
         }
         DryRunGate::Proceed => {}
     }
-    if let Some(out_point) = authorizing_state {
-        match rpc.get_live_cell(out_point) {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                report.skipped += group.len();
-                return BatchOutcome::Continue;
-            }
-            Err(error) => {
-                report.skipped += group.len();
-                report.last_error = Some(format!("refund Process state lookup: {error}"));
-                return BatchOutcome::RpcUnavailable;
-            }
-        }
+    if let Err(outcome) =
+        verify_refund_cell(rpc, authorizing_state, "Process state", group.len(), report)
+    {
+        return outcome;
     }
     let mut worker = state.lock().expect("process worker state");
     let Ok(_submission) = lease.begin_submission() else {

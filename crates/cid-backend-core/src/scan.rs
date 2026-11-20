@@ -23,6 +23,11 @@ pub struct ScannedIntention {
 }
 
 impl ScannedIntention {
+    /// The CID dispatcher decodes the user lock before selecting a spend branch.
+    pub(crate) fn has_supported_user_lock(&self) -> bool {
+        matches!(self.args.entry.user_lock.hash_type, 0..=2)
+    }
+
     pub(crate) fn protocol_lock(&self) -> CidScript {
         CidScript {
             code_hash: self.lock_code_hash,

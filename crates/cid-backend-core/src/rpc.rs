@@ -3,7 +3,7 @@ use ckb_types::packed::{Byte32, CellOutput, OutPoint, Script};
 use ckb_types::prelude::*;
 use std::fmt;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveCell {
     pub out_point: OutPoint,
     pub output: CellOutput,

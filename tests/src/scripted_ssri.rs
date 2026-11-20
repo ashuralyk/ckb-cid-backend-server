@@ -14,6 +14,7 @@ pub struct ScriptedSsri {
     filter_script: Mutex<Option<FilterScript>>,
     pub filter_requests: Mutex<Vec<Vec<u8>>>,
     intention_errors: Vec<(OutPoint, i8, Option<u64>)>,
+    pair_error: Option<(OutPoint, i8)>,
     additional_input: Option<OutPoint>,
     pub bounds: (u32, u32),
     pub mode: Mode,
@@ -39,6 +40,7 @@ impl ScriptedSsri {
             filter_script: Mutex::new(None),
             filter_requests: Mutex::new(Vec::new()),
             intention_errors: Vec::new(),
+            pair_error: None,
             additional_input: None,
             bounds,
             mode,
@@ -82,6 +84,11 @@ impl ScriptedSsri {
 
     pub fn with_intention_error(mut self, op: OutPoint, code: i8) -> Self {
         self.intention_errors.push((op, code, None));
+        self
+    }
+
+    pub fn with_pair_error(mut self, op: OutPoint, code: i8) -> Self {
+        self.pair_error = Some((op, code));
         self
     }
 
@@ -133,13 +140,18 @@ impl SsriHost for ScriptedSsri {
         host: MockHost,
     ) -> Result<AssembledTx, SsriError> {
         self.note_binary(binary);
-        if !self.intention_errors.is_empty() {
+        if !self.intention_errors.is_empty() || self.pair_error.is_some() {
             let inputs: Vec<_> = Transaction::from_slice(draft_tx)
                 .unwrap()
                 .raw()
                 .inputs()
                 .into_iter()
                 .collect();
+            if let Some((op, code)) = &self.pair_error {
+                if inputs.len() == 3 && inputs.iter().any(|input| input.previous_output() == *op) {
+                    return Err(SsriError::Incompatible(*code));
+                }
+            }
             for input in &inputs {
                 let op = input.previous_output();
                 for (bad, code, state_cap) in &self.intention_errors {

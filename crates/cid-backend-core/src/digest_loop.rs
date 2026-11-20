@@ -21,6 +21,7 @@ use ckb_types::packed::{Byte32, CellDep, CellOutput};
 use ckb_types::prelude::*;
 use std::collections::HashSet;
 use std::fmt::Write as _;
+use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -516,7 +517,8 @@ where
             .collect();
 
         self.workers.for_each_mut(|w| {
-            w.with_state_mut(|state| {
+            const MAX_ISOLATED_PRUNE_CHECKS: usize = 16;
+            let missing: Vec<_> = w.with_state_mut(|state| {
                 let pending_occupied = state.submit.pending_occupied_keys();
                 state.submit.in_flight.retain(|k| {
                     (live_keys.contains(k) || pending_occupied.contains(k))
@@ -527,11 +529,38 @@ where
                 state
                     .pending_incompatible_refund
                     .retain(|k| live_keys.contains(k) || pending_occupied.contains(k));
-                state.isolated_refunds.retain(|op, _| {
-                    live_keys.contains(op.as_slice()) || pending_occupied.contains(op.as_slice())
-                });
                 state.isolation_probe_paused = false;
+                // A dropped refund can become visible to the node before the indexer.
+                // Rotate through absent marks so a lagging indexer cannot monopolize lookups.
+                let cursor = state.isolated_prune_cursor.as_ref();
+                state
+                    .isolated_refunds
+                    .range((cursor.map_or(Unbounded, Excluded), Unbounded))
+                    .chain(
+                        cursor
+                            .into_iter()
+                            .flat_map(|op| state.isolated_refunds.range((Unbounded, Included(op)))),
+                    )
+                    .filter(|(op, _)| {
+                        !live_keys.contains(op.as_slice())
+                            && !pending_occupied.contains(op.as_slice())
+                    })
+                    .take(MAX_ISOLATED_PRUNE_CHECKS)
+                    .map(|(op, _)| op.clone())
+                    .collect()
             });
+            for op in missing {
+                let live = self.rpc.get_live_cell(&op);
+                w.with_state_mut(|state| {
+                    if matches!(live, Ok(None)) {
+                        state.isolated_refunds.remove(&op);
+                    }
+                    state.isolated_prune_cursor = Some(op);
+                });
+                if live.is_err() {
+                    break;
+                }
+            }
         });
 
         let buckets = bucket_by_process_type_hash(scanned, &self.config.cid_code_hash);
@@ -1077,12 +1106,18 @@ where
         };
         worker.with_state_mut(|state| {
             if state.isolated_refund_scope.as_ref() != Some(&scope) {
-                state.isolated_refunds.clear();
+                state.clear_isolated_refunds();
                 state.isolated_refund_scope = Some(scope);
             }
         });
-        bucket.retain(
-            |item| match item.belongs_to_process(&cid.code_hash, &process.type_hash) {
+        bucket.retain(|item| {
+            if !item.has_supported_user_lock() {
+                tracing::warn!(target: LOG_TARGET, event = "scan.unsupported_user_lock",
+                    out_point = ?item.out_point, hash_type = item.args.entry.user_lock.hash_type);
+                report.skipped += 1;
+                return false;
+            }
+            match item.belongs_to_process(&cid.code_hash, &process.type_hash) {
                 Ok(()) => true,
                 Err(reason) => {
                     tracing::warn!(target: LOG_TARGET, event = "scan.unroutable",
@@ -1090,8 +1125,8 @@ where
                     report.skipped += 1;
                     false
                 }
-            },
-        );
+            }
+        });
 
         let mut accepted = Vec::new();
         let mut refunds = Vec::new();

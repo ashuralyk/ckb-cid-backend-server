@@ -17,6 +17,7 @@ struct Inner {
     reject_next_dry_run: bool,
     spent_deps: HashSet<OutPoint>,
     stale_indexer_cells: HashSet<OutPoint>,
+    indexer_snapshots: HashMap<OutPoint, Option<LiveCell>>,
     unavailable_submit_inputs: HashSet<OutPoint>,
     unavailable_next_dry_run: bool,
     reject_inputs: HashSet<Vec<u8>>,
@@ -37,6 +38,15 @@ struct Inner {
     block_hashes: HashMap<u64, [u8; 32]>,
     /// Optional indexer order metadata keyed by out_point bytes.
     cell_index_meta: HashMap<Vec<u8>, (u64, u32)>,
+}
+
+impl Inner {
+    fn indexed_cell(&self, op: &OutPoint) -> Option<&LiveCell> {
+        match self.indexer_snapshots.get(op) {
+            Some(snapshot) => snapshot.as_ref(),
+            None => self.cells.get(&out_point_key(op)),
+        }
+    }
 }
 
 pub struct FakeRpc {
@@ -158,6 +168,18 @@ impl FakeRpc {
     /// The node rejects this dependency while the indexer still lists it.
     pub fn mark_indexer_cell_stale(&self, op: OutPoint) {
         self.inner.lock().unwrap().stale_indexer_cells.insert(op);
+    }
+
+    pub fn set_indexer_snapshot(&self, op: OutPoint, cell: Option<LiveCell>) {
+        self.inner
+            .lock()
+            .unwrap()
+            .indexer_snapshots
+            .insert(op, cell);
+    }
+
+    pub fn clear_indexer_snapshot(&self, op: &OutPoint) {
+        self.inner.lock().unwrap().indexer_snapshots.remove(op);
     }
 
     pub fn mark_dep_spent(&self, op: OutPoint) {
@@ -363,7 +385,7 @@ impl Rpc for FakeRpc {
         let inner = self.inner.lock().unwrap();
         let mut out = Vec::new();
         for op in &inner.order {
-            let Some(cell) = inner.cells.get(&out_point_key(op)) else {
+            let Some(cell) = inner.indexed_cell(op) else {
                 continue;
             };
             let lock = cell.lock();
@@ -410,7 +432,7 @@ impl Rpc for FakeRpc {
             if out.len() >= max_results {
                 break;
             }
-            let Some(cell) = inner.cells.get(&out_point_key(op)) else {
+            let Some(cell) = inner.indexed_cell(op) else {
                 continue;
             };
             if let Some(ts) = cell.type_script() {

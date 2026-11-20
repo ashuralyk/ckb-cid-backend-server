@@ -87,7 +87,7 @@ Static `[[cell_deps]]` can supply extra scripts such as xUDT. The primary CID lo
 | `CID_POLL_INTERVAL_SECS` | required | Seconds between ticks, integer **≥ 1** |
 | `CID_LOCK_CELL_DEP` | optional static | `<tx_hash>:<index>` when not using Type-ID discovery |
 | `CID_PROCESS_CODE_CELL_DEP` | optional static | Process type code cell outpoint (static mode) |
-| `CID_PROCESS_LOCK_CELL_DEP` | optional static | Process lock code cell (local-chain: always-success) |
+| `CID_PROCESS_LOCK_CELL_DEP` | optional static | Extra Process lock code dependency. The local fixture resolves the Process code by Type ID. |
 | `CID_EXTRA_CELL_DEPS` | optional | Extra `<tx_hash>:<index>` list, comma-separated |
 | `CID_PROCESS_CODE_HASH` | deprecated | Ignored at runtime; register Processes via the registry API instead |
 | `CID_HEALTH_BIND` | optional | `host:port` (e.g. `127.0.0.1:9100`); unset or empty **disables** HTTP |
@@ -137,7 +137,7 @@ cargo test -p cid-backend-daemon --test local_chain_e2e -- --ignored --nocapture
 
 The fixture requires its opt-in flag, the guest paths, and a numeric loopback HTTP endpoint reporting `ckb_dev`. Its setup uses the public dev-chain genesis key. The committed transaction must consume the original Intention and contain the expected beneficiary output. On macOS / ARM Linux, install a matching `ckb` v0.119.0 into `$CKB_DIR/ckb` first.
 
-Success prints `local-chain execution tx committed:` and `local-chain closure ok:`. Details (Process data must be an ELF, Process lock is always-success, no post-Intention signature) are in [`docs/local-dev-chain.md`](docs/local-dev-chain.md).
+Success prints `local-chain execution tx committed:` and `local-chain closure ok:`. The fixture stores the ELF in the Process code cell. The separate Process state cell has empty data and a lock that references the Process code Type ID. The beneficiary uses always-success. The daemon submits the digest and refund transactions without signing them. See [`docs/local-dev-chain.md`](docs/local-dev-chain.md).
 
 ### Health / metrics
 

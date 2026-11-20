@@ -14,7 +14,7 @@ use crate::ssri::SsriHost;
 use crate::submit::SubmitState;
 use crate::worker_commands::WorkerCommands;
 use ckb_types::packed::{CellDep, OutPoint, Script};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -51,8 +51,9 @@ pub struct ProcessWorkerState {
     /// legal `[min,max]` assemble window.
     pub pending_incompatible_refund: HashSet<Vec<u8>>,
     /// Individually isolated exit-39/40 verdicts for the current code and scope.
-    pub(crate) isolated_refunds: HashMap<OutPoint, i8>,
+    pub(crate) isolated_refunds: BTreeMap<OutPoint, i8>,
     pub(crate) isolated_refund_scope: Option<IsolatedRefundScope>,
+    pub(crate) isolated_prune_cursor: Option<OutPoint>,
     pub(crate) refund_cursor: Option<OutPoint>,
     pub(crate) isolation_probe: Option<IsolationProbe>,
     pub(crate) isolation_probe_paused: bool,
@@ -78,8 +79,9 @@ impl ProcessWorkerState {
             isolate_expanded: HashSet::new(),
             isolate_pending: Vec::new(),
             pending_incompatible_refund: HashSet::new(),
-            isolated_refunds: HashMap::new(),
+            isolated_refunds: BTreeMap::new(),
             isolated_refund_scope: None,
+            isolated_prune_cursor: None,
             refund_cursor: None,
             isolation_probe: None,
             isolation_probe_paused: false,
@@ -108,10 +110,15 @@ impl ProcessWorkerState {
         self.isolate_pending.clear();
         self.isolate_resume = None;
         self.pending_incompatible_refund.clear();
-        self.isolated_refunds.clear();
+        self.clear_isolated_refunds();
         self.isolated_refund_scope = None;
         self.refund_cursor = None;
         self.isolation_probe = None;
+    }
+
+    pub(crate) fn clear_isolated_refunds(&mut self) {
+        self.isolated_refunds.clear();
+        self.isolated_prune_cursor = None;
     }
 
     pub fn process_type_hash(&self) -> [u8; 32] {

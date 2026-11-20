@@ -41,7 +41,7 @@ Before signing setup, the ignored fixture requires a numeric loopback HTTP RPC U
 | `CID_POLL_INTERVAL_SECS` | required | ≥ 1 |
 | `CID_LOCK_CELL_DEP` | optional; needed at run | `<tx_hash>:<index>` CID lock code cell (`DepType::Code`) |
 | `CID_PROCESS_CODE_CELL_DEP` | optional; needed at run | Process type code cell |
-| `CID_PROCESS_LOCK_CELL_DEP` | optional; needed at run | Process lock code cell (local-chain: always-success) |
+| `CID_PROCESS_LOCK_CELL_DEP` | optional static | Extra Process lock code dependency. The local fixture resolves the Process code by Type ID. |
 | `CID_PROCESS_CODE_HASH` | deprecated | Ignored; register Processes via registry API |
 | `CID_EXTRA_CELL_DEPS` | optional | Extra `tx_hash:index` list |
 | `CID_HEALTH_BIND` | optional | Opt-in health/stats HTTP (`docs/observability.md`) |
@@ -54,7 +54,7 @@ Before signing setup, the ignored fixture requires a numeric loopback HTTP RPC U
 
 Production/dev operators may put the same public RPC / Type-ID / static cell-dep values in a TOML file. `network.genesis_hash` is declared identity only unless `validate_genesis = true`.
 
-The local fixture creates TYPE_ID code cells for CID and the example Process. It registers the Process state in memory. The Process state has a separate TYPE_ID and its lock points at the Process code cell, with args that bind the CID code Type ID. The always-success beneficiary remains a static Data1 dependency.
+The local fixture creates TYPE_ID code cells for CID and the example Process, and stores the Process ELF in its code cell. It registers the Process state in memory. The state has empty data and its own TYPE_ID. Its lock references the Process code Type ID with args that bind the CID code Type ID. The always-success beneficiary uses a static Data1 code dependency.
 
 The daemon resolves the code CellDeps at every tick and uses the live Process code binary for filter, batch bounds, and assembly.
 
