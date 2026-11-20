@@ -670,7 +670,11 @@ fn scan_resolve_ssri_submit_confirms_on_local_dev_chain() {
 
     let mut digest_hash = None;
     let mut refund_hash = None;
-    for i in 0..20 {
+    // The refund waits for the replacement state from a committed digest.
+    // The default dev miner takes five seconds per block.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut i = 0;
+    while Instant::now() < deadline {
         let report = loop_.tick();
         eprintln!(
             "tick {i}: scanned={} submitted={} skipped={}",
@@ -698,6 +702,7 @@ fn scan_resolve_ssri_submit_confirms_on_local_dev_chain() {
         if digest_hash.is_some() && refund_hash.is_some() {
             break;
         }
+        i += 1;
         thread::sleep(Duration::from_millis(500));
     }
     let hash = digest_hash.expect("daemon did not submit an execution tx");

@@ -160,6 +160,7 @@ enum ProcessWorkerJob {
         execution_code_key: Vec<u8>,
         tick_cell_deps: Vec<CellDep>,
         cid_locks: Arc<[CidLockIdentity]>,
+        process_hashes: Arc<HashSet<[u8; 32]>>,
         refund_policy: RefundPolicy,
         max_assembled_tx_bytes: usize,
         min: u32,
@@ -180,7 +181,7 @@ pub struct PolledBatch {
     pub outcome: BatchOutcome,
     pub delta: BatchReportDelta,
     pub rest: Arc<[ScannedIntention]>,
-    pub mode: BatchMode,
+    pub(crate) mode: BatchMode,
 }
 
 /// Handle to a Process worker thread.
@@ -267,13 +268,14 @@ impl ProcessWorker {
     /// One in-flight batch per Process (`batch_outstanding`). Outcomes are
     /// collected via [`try_poll_batch`] within the same tick.
     #[allow(clippy::too_many_arguments)]
-    pub fn start_batch(
+    pub(crate) fn start_batch(
         &self,
         process: ResolvedProcess,
         batch: Vec<ScannedIntention>,
         execution_code_key: Vec<u8>,
         tick_cell_deps: Vec<CellDep>,
         cid_locks: Arc<[CidLockIdentity]>,
+        process_hashes: Arc<HashSet<[u8; 32]>>,
         refund_policy: RefundPolicy,
         max_assembled_tx_bytes: usize,
         rest: Vec<ScannedIntention>,
@@ -301,6 +303,7 @@ impl ProcessWorker {
                 execution_code_key,
                 tick_cell_deps,
                 cid_locks,
+                process_hashes,
                 refund_policy,
                 max_assembled_tx_bytes,
                 min,
@@ -374,6 +377,7 @@ fn worker_thread_main<R, S>(
                 execution_code_key,
                 tick_cell_deps,
                 cid_locks,
+                process_hashes,
                 refund_policy,
                 max_assembled_tx_bytes,
                 min,
@@ -410,6 +414,7 @@ fn worker_thread_main<R, S>(
                         execution_code_key: &execution_code_key,
                         tick_cell_deps: &tick_cell_deps,
                         cid_locks: &cid_locks,
+                        process_hashes: &process_hashes,
                         refund_policy: &refund_policy,
                         max_assembled_tx_bytes,
                         job_epoch,
@@ -760,6 +765,7 @@ mod tests {
                     created: vec![],
                     seen_committed: false,
                     currently_committed: false,
+                    admission_deadline: None,
                 },
             );
         });
@@ -786,6 +792,7 @@ mod tests {
                     created: vec![],
                     seen_committed: false,
                     currently_committed: false,
+                    admission_deadline: None,
                 },
             );
         });

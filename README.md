@@ -25,7 +25,7 @@ The daemon continuously digests CID Intentions:
 2. Resolve the registered Process state and code cells by exact Type-ID scripts. The state lock points at the Process code Type ID with `hash_type=type`, and its args bind the configured CID Type ID.
 3. Call `Process.filter` on the same code-cell ELF used by `Process.batch` and `Process.assemble`. Each request carries at most 64 cells and 64 KiB. The daemon retries the candidate window on a malformed response, a count mismatch, or an unknown reason. A cell that exceeds 64 KiB by itself stays live.
 4. Select batches from filter reason 0, with at most one input per full CID lock script. Only reasons 4–7 authorize automatic User Lock refunds. Reason 1 is logged and the cell stays live. Reserved reasons 2 and 3, unknown reasons, malformed responses, and response count mismatches defer the whole Process bucket for a fresh filter pass. A missing `Process.filter` defers the Process.
-5. Validate the full `Process.assemble` transaction, dry-run it, and submit it unchanged. Guest-added funding inputs are checked against the configured CID locks and known data-hash aliases. Assembly failures, including exits 21, 32, 37, 39, and 40, are logged and trigger a search for another legal subset. Automatic refunds require one of the filter reasons above. Excluded cells stay live. Exit 41 pauses work for the current Process state/code pair. The worker retains that quarantine for its lifetime, including when the pair returns after a reorg.
+5. Validate the full `Process.assemble` transaction, dry-run it, and submit it unchanged. Guest-added funding inputs must be live and cannot include an unselected Intention or another registered Process state. Assembly failures, including exits 21, 32, 37, 39, and 40, are logged and trigger a search for another legal subset. Automatic refunds require one of the filter reasons above. Excluded cells stay live. Exit 41 pauses work for the current Process state/code pair. The worker retains that quarantine for its lifetime, including when the pair returns after a reorg.
 6. Track occupied inputs until the node reports a drop or confirmation depth is met. If a send returns an ambiguous result, including a receipt hash mismatch, track it by the locally computed transaction hash and reconcile it before allowing a conflicting digest or refund. Refunds spend the Intention and preserve its data and type, returning capacity to the User Lock in its args. The existing refund builder supports CKB and standard xUDT. It logs and leaves unsupported refund outputs live. The default fee mode returns exact capacity. A configured bounded-refund CID identity lets the daemon deduct the required transaction fee within the on-chain per-output limit.
 
 For each refund, the daemon rereads the Intention at the node and requires an exact snapshot match. It also verifies the live Process code and state snapshots and includes both outpoints as cell dependencies. The worker defers refunds while a pending digest spends or creates the authorizing state. A pending refund blocks digests that would consume its state dependency until the node reports a commit and fresh checks confirm the tip height and the canonical block hash at the commit height. A refund that returns to the pool before settlement blocks those digests again. Refund eligibility uses the node-confirmed Process state’s validated lock args, a fresh filter reason of 4–7, matching node snapshots, and the pending-transaction interlock. A quarantined state/code pair is ineligible. When a pending digest releases the state, eligible refunds get a turn before another digest. The worker considers up to 16 singleton refunds per Process per tick and stops its sweep when RPC is unavailable.
@@ -127,7 +127,7 @@ Do not use public RPC. The supported entry is:
 ./scripts/local-dev-chain.sh
 ```
 
-That script: auto-downloads pinned `ckb` v0.119.0 **only** as `x86_64-unknown-linux-gnu` (skip download if `$CKB_DIR/ckb` is already executable; default `CKB_DIR=.local-ckb`); inits `dev` with genesis miner lock; sets `min_fee_rate` to **0** (no fee input; `digest_ok` fees come from Process recreate); enables the Indexer module; builds RISC-V guests (`clang-18` / `CLANG`, `git`, `make`, `python3`); starts `ckb run` + `ckb miner` on `127.0.0.1:8114`; exports `CID_CKB_RPC_URL`, `CID_PROCESS_EXAMPLE_PATH`, `CID_LOCK_ELF_PATH`, `CID_ALWAYS_SUCCESS_PATH`, `CID_LOCAL_CHAIN_E2E=1`; then runs:
+That script: auto-downloads pinned `ckb` v0.119.0 **only** as `x86_64-unknown-linux-gnu` (skip download if `$CKB_DIR/ckb` is already executable; default `CKB_DIR=.local-ckb`); inits `dev` with genesis miner lock; sets `min_fee_rate` to **0** (no fee input; `digest_ok` fees come from Process recreate); enables the Indexer module; builds RISC-V guests (`clang-18` / `CLANG`, `git`, `make`, `python3`); starts `ckb run` + `ckb miner` on `127.0.0.1:8114`; exports `CID_CKB_RPC_URL`, `CID_PROCESS_EXAMPLE_PATH`, `CID_LOCK_ELF_PATH`, `CID_XUDT_ELF_PATH`, `CID_ALWAYS_SUCCESS_PATH`, `CID_LOCAL_CHAIN_E2E=1`; then runs:
 
 ```bash
 cargo test -p cid-backend-daemon --test local_chain_e2e -- --ignored --nocapture
@@ -222,11 +222,11 @@ flowchart TD
   probe -->|working batch| dok
   dok --> gate["Dry-run"]
   refund -->|healthy Process| gate
-  gate --> send["send_transaction"]
-  send -->|ok or ambiguous| pending["pending occupancy<br/>wait confirmation_depth"]
+  gate -->|Unavailable| retry["Defer without taking occupancy"]
+  gate -->|accepted or already in pool| send["send_transaction"]
+  send -->|ok or Unavailable| pending["pending occupancy<br/>wait confirmation_depth"]
   send -->|SubmitRejected| combo["record combo fingerprint and keep splitting"]
   send -->|Conflict| isolate
-  send -->|Unavailable| retry["Defer without taking occupancy"]
   split --> isolate
   combo --> isolate
 ```
@@ -277,7 +277,7 @@ Committed status requires a valid `block_hash`. The adapter uses the reported `b
 
 - Each Process starts a fresh scan of the current filter-accepted candidates each tick, with at most **64** assembly worker jobs and **64** subset probes, including the initial window. Large searches share the budget across legal batch sizes, give arrivals early probes, and vary the remaining order by tick. Some combinations may repeatedly fall outside the cap. This bounded-search starvation is accepted by design.
 - Candidate liveness is checked when a probe reaches a cell and reused within that search. Each tick allows up to one window plus 64 candidate reads by the isolation scan. An unavailable lookup defers the search.
-- Probes skip duplicate CID lock groups and subsets with non-live Intention or guest-added funding inputs. The funding guard rejects a transaction that adds an unselected Intention as funding. A dry-run or submit conflict starts or advances isolation when alternatives and budget remain.
+- Probes skip duplicate CID lock groups and subsets with non-live Intention or guest-added funding inputs. The funding guard rejects a transaction that adds an unselected Intention or another registered Process state as funding. A dry-run or submit conflict starts or advances isolation when alternatives and budget remain.
 - For the audited v0.1.4 example ELF, exit 37 on a state with zero fee headroom pauses assembly until the state or Process code changes. Other guests continue through capped isolation. The affected Intentions stay live.
 
 A singleton `{A, Process}` failure does **not** prove A is permanently invalid. Details: [`docs/confirmation.md`](docs/confirmation.md).

@@ -57,6 +57,7 @@ if these checks fail or the refund returns to the pool before settlement.
 | Confirming or committed tx becomes `Dropped` | Log `pending.reorg` (if we had seen Committed) or `pending.dropped`. Release occupancy. If cells are live, the next tick retries. |
 | Commit block missing or replaced at the same height | Keep occupancy and the refund dependency interlock. Log `pending.noncanonical`. |
 | Status, tip, or block hash RPC unavailable | Keep occupancy until reconciliation succeeds. |
+| Null or unknown status after an ambiguous send | Keep occupancy for up to 30 seconds from that send while the node may still be admitting it. An explicit rejection releases occupancy immediately. |
 
 Exit 41 quarantines a Process state/code pair. A replacement pair can run
 independently. The worker retains the old quarantine for its lifetime, so the
@@ -72,11 +73,11 @@ cells are live again.
 ## Retry vs permanent failure
 
 The adapter keeps the JSON-RPC `error.code` from `send_transaction` and
-classifies it. Transient node/pool errors are `Unavailable`. A send that
+classifies it. Explicit pool limits return `PoolUnavailable` and defer the current attempt. A send that
 returns `Unavailable` reserves its inputs and outputs under the locally
 computed transaction hash for status reconciliation. Refunds also retain
 their authorizing state dependency. This covers timeouts, unusable receipts,
-and duplicate sends. Core
+and duplicate sends. An explicit duplicate from pool preflight proceeds to the same idempotent send path. Core
 `SubmitRejected` is a **transaction-level** permanent failure of that exact
 Intention combo under its Process state and execution code. It does
 **not** prove any one Intention is invalid, so consumed outpoints are not
@@ -86,7 +87,8 @@ written to `rejected`.
 |---------|--------|-----------|
 | `Dropped` (pool eviction / reorg) | yes, next tick if cells live | released |
 | RPC/indexer `Unavailable` | yes | existing occupancy stays held |
-| `send_transaction` returns `Unavailable` | after node status reports a drop | held under the local transaction hash through reconciliation |
+| `PoolUnavailable` | yes, on the next tick | no new occupancy |
+| `send_transaction` returns `Unavailable` | after rejection, eviction, or expiry of the unknown-status grace period | held under the local transaction hash through reconciliation |
 | `Conflict` | yes. During assembly isolation, try later subsets and reconsider conflicts on the next search. | not taken (`failed` is informational) |
 | `SubmitRejected` (positively identified permanent send failure of this tx) | isolate / skip that **combo** this process lifetime | not taken; Process outpoint is not blacklisted |
 | `Process.assemble` error | log and try another batch, or quarantine the state/code pair on exit 41 | affected cells stay live |
@@ -120,7 +122,7 @@ can be used. An unavailable lookup defers the search.
 
 Windows and probes select at most one input per full CID lock script. Probes
 skip non-live Intentions and subsets with non-live guest-added funding inputs.
-Adding an unselected Intention as funding rejects that attempt. The worker tries
+Adding an unselected Intention or another registered Process state as funding rejects that attempt. The worker tries
 another subset after a validation failure, dry-run or submit rejection, or
 conflict when budget remains.
 
@@ -153,8 +155,8 @@ from a full indexer rescan.
 | `-302` | `TransactionFailedToVerify` | `SubmitRejected` |
 | `-1102` | `PoolRejectedTransactionByOutputsValidator` | `SubmitRejected` |
 | `-1108` | `PoolRejectedMalformedTransaction` | `SubmitRejected` |
-| `-1106` | `PoolIsFull` | `Unavailable` (retry) |
-| `-1105` | `PoolRejectedTransactionByMaxAncestorsCountLimit` | `Unavailable` (retry) |
+| `-1106` | `PoolIsFull` | `PoolUnavailable` (retry) |
+| `-1105` | `PoolRejectedTransactionByMaxAncestorsCountLimit` | `PoolUnavailable` (retry) |
 | `-1104` | `PoolRejectedTransactionByMinFeeRate` | `FeeRateRejected` (keep scanning other combinations in the current tick and allow the same combination to be retried in a later tick) |
 | other / missing code | — | `Unavailable` (do **not** blacklist an Intention on an unclassified error) |
 

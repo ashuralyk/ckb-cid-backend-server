@@ -83,12 +83,12 @@ pub struct BatchReportDelta {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BatchMode {
+pub(crate) enum BatchMode {
     Assemble,
     FilterRefund,
 }
 
-pub struct ProcessBatchParams<'a> {
+pub(crate) struct ProcessBatchParams<'a> {
     pub hash: [u8; 32],
     /// Shared worker state — lock only around submit/cache mutations (P2-9).
     pub state: Arc<Mutex<ProcessWorkerState>>,
@@ -98,6 +98,7 @@ pub struct ProcessBatchParams<'a> {
     pub execution_code_key: &'a [u8],
     pub tick_cell_deps: &'a [CellDep],
     pub cid_locks: &'a [CidLockIdentity],
+    pub process_hashes: &'a HashSet<[u8; 32]>,
     pub refund_policy: &'a RefundPolicy,
     pub max_assembled_tx_bytes: usize,
     pub job_epoch: u64,
@@ -149,7 +150,7 @@ pub fn window_combo_cached(
     worker.submit.rejected_combos.contains(&fp)
 }
 
-pub fn run_process_batch<R, S>(
+pub(crate) fn run_process_batch<R, S>(
     rpc: Arc<R>,
     ssri: &S,
     params: ProcessBatchParams<'_>,
@@ -227,6 +228,7 @@ where
         execution_code_key,
         tick_cell_deps,
         cid_locks,
+        process_hashes,
         max_assembled_tx_bytes,
         min,
         ..
@@ -399,6 +401,7 @@ where
             process,
             max_tx_bytes,
             cid_locks,
+            process_hashes,
         ) {
             Ok(skeleton) => skeleton,
             Err(PreparationError::NonLiveInput(op)) => {
@@ -520,11 +523,17 @@ fn submit_digest<R: Rpc>(
     }
 
     let mut worker = state.lock().expect("process worker state");
-    let Ok(_submission) = lease.begin_submission() else {
+    let Ok(submission) = lease.begin_submission() else {
         mark_cancelled(report, batch.len());
         return Some(BatchOutcome::Continue);
     };
-    match submit_execution(rpc, skeleton, &mut worker.submit, &consumed) {
+    let result = submit_execution(rpc, skeleton, &mut worker.submit, &consumed);
+    if let Some(submission) = submission.as_ref() {
+        if matches!(result, Ok(_) | Err(RpcError::Unavailable(_))) {
+            submission.record_pending();
+        }
+    }
+    match result {
         Ok(tx_hash) => {
             tracing::info!(
                 target: LOG_TARGET,
@@ -592,6 +601,7 @@ fn prepare_execution(
     process: &ResolvedProcess,
     max_size: usize,
     cid_locks: &[CidLockIdentity],
+    process_hashes: &HashSet<[u8; 32]>,
 ) -> Result<ExecutionSkeleton, PreparationError> {
     let skeleton = validate_assembled_tx(assembled, batch, process, max_size)
         .and_then(|()| execution_from_assembled(assembled))
@@ -619,6 +629,14 @@ fn prepare_execution(
                 process_type_hash = %hex_pref(&process.type_hash));
             return Err(PreparationError::NonLiveInput(op));
         };
+        if cell
+            .type_script()
+            .is_some_and(|script| process_hashes.contains(&crate::rpc::script_hash32(&script)))
+        {
+            tracing::warn!(target: LOG_TARGET, event = "assemble.invalid",
+                reason = "registered_process_funding_input", out_point = ?op);
+            return Err(PreparationError::UnsafeFunding);
+        }
         let lock = cell.lock();
         let code_hash: [u8; 32] = lock.code_hash().unpack();
         if cid_locks.iter().any(|identity| {
@@ -1008,7 +1026,10 @@ fn submit_filter_refund<R: Rpc + HostQueryRpc>(
                 reason = "dry_run_unavailable", %error);
             report.last_error = Some(format!("dry-run: {error}"));
             report.skipped += 1;
-            return if matches!(error, RpcError::Unavailable(_)) {
+            return if matches!(
+                error,
+                RpcError::Unavailable(_) | RpcError::PoolUnavailable(_)
+            ) {
                 BatchOutcome::RpcUnavailable
             } else {
                 BatchOutcome::Continue
@@ -1020,7 +1041,7 @@ fn submit_filter_refund<R: Rpc + HostQueryRpc>(
         return outcome;
     }
     let mut worker = state.lock().expect("process worker state");
-    let Ok(_submission) = lease.begin_submission() else {
+    let Ok(submission) = lease.begin_submission() else {
         report.skipped += 1;
         return BatchOutcome::Continue;
     };
@@ -1031,6 +1052,9 @@ fn submit_filter_refund<R: Rpc + HostQueryRpc>(
         _ => None,
     };
     if let Some(hash) = tracked_hash {
+        if let Some(submission) = submission.as_ref() {
+            submission.record_pending();
+        }
         worker.refund_state_deps.insert(
             hash.as_slice().to_vec(),
             authorizing_state.out_point.clone(),

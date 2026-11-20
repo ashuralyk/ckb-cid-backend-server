@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const LOG_TARGET: &str = "cid_backend";
 /// Default max molecule size for guest-assembled execution txs (512 KiB).
@@ -146,6 +146,7 @@ where
     previous_live_keys: HashSet<Vec<u8>>,
     tick_cell_deps: Vec<CellDep>,
     tick_cid_locks: Arc<[CidLockIdentity]>,
+    tick_process_hashes: Arc<HashSet<[u8; 32]>>,
     execution_code_key: Vec<u8>,
 }
 
@@ -183,6 +184,7 @@ where
             previous_live_keys: HashSet::new(),
             tick_cell_deps: Vec::new(),
             tick_cid_locks: Arc::from([]),
+            tick_process_hashes: Arc::default(),
             execution_code_key: Vec::new(),
         }
     }
@@ -361,9 +363,16 @@ where
         }
     }
 
-    fn sync_busy_map(&self) {
+    fn sync_pending_processes(&self) {
+        if self.busy.is_none() && self.worker_cmds.is_none() {
+            return;
+        }
+        let pending = self.workers.pending_hashes();
+        if let Some(commands) = &self.worker_cmds {
+            commands.set_pending(&pending);
+        }
         if let Some(busy) = &self.busy {
-            busy.set_pending(self.workers.pending_hashes());
+            busy.set_pending(pending);
         }
     }
 
@@ -420,6 +429,7 @@ where
         let mut report = TickReport::default();
         let tip = self.refresh_tip();
         self.reconcile_pending(tip);
+        self.sync_pending_processes();
 
         let resolved = match self.refresh_cell_deps() {
             Ok(deps) => deps,
@@ -432,7 +442,6 @@ where
                 report.last_error = Some(format!("code deps: {e}"));
                 self.clear_worker_tick_code();
                 self.tick_cell_deps.clear();
-                self.sync_busy_map();
                 return report;
             }
         };
@@ -465,6 +474,7 @@ where
             );
         }
         self.tick_cid_locks = cid_locks.into();
+        self.tick_process_hashes = Arc::new(self.workers.hashes().into_iter().collect());
         let scanned = match scan_intentions_multi(self.rpc.as_ref(), &scan_ids) {
             Ok(v) => v,
             Err(RpcError::Unavailable(m)) => {
@@ -476,7 +486,6 @@ where
                 report.last_error = Some(format!("scan unavailable: {m}"));
                 self.tick_cell_deps.clear();
                 self.clear_worker_tick_code();
-                self.sync_busy_map();
                 return report;
             }
             Err(e) => {
@@ -488,7 +497,6 @@ where
                 report.last_error = Some(format!("scan error: {e}"));
                 self.tick_cell_deps.clear();
                 self.clear_worker_tick_code();
-                self.sync_busy_map();
                 return report;
             }
         };
@@ -620,7 +628,7 @@ where
         });
         self.tick_cell_deps.clear();
         self.clear_worker_tick_code();
-        self.sync_busy_map();
+        self.sync_pending_processes();
         report
     }
 
@@ -651,12 +659,6 @@ where
                     continue;
                 };
                 if let Some(polled) = worker.try_poll_batch() {
-                    if matches!(
-                        polled.outcome,
-                        BatchOutcome::Submitted | BatchOutcome::SubmittedProcess
-                    ) {
-                        self.sync_busy_map();
-                    }
                     Self::apply_batch_report(report, &polled.delta);
                     if polled.mode == BatchMode::Assemble
                         && !polled.rest.is_empty()
@@ -781,7 +783,22 @@ where
                     });
                 }
                 match status {
-                    Ok(TxStatus::Dropped) => {
+                    Ok(TxStatus::Unknown)
+                        if self.workers.get(&process_hash).is_some_and(|worker| {
+                            worker.with_state(|state| {
+                                state
+                                    .submit
+                                    .pending
+                                    .get(&hash_bytes)
+                                    .and_then(|tx| tx.admission_deadline)
+                                    .is_some_and(|deadline| Instant::now() < deadline)
+                            })
+                        }) =>
+                    {
+                        tracing::debug!(target: LOG_TARGET, event = "pending.admission_unknown",
+                            tx_hash = %tx_hex);
+                    }
+                    Ok(TxStatus::Unknown | TxStatus::Dropped) => {
                         let Some(worker) = self.workers.get(&process_hash) else {
                             continue;
                         };
@@ -877,6 +894,7 @@ where
                             } else if let Some(pending) = state.submit.pending.get_mut(&hash_bytes)
                             {
                                 pending.currently_committed = true;
+                                pending.admission_deadline = None;
                             }
                         });
                         if confirmations >= depth {
@@ -903,6 +921,9 @@ where
                         if let Some(worker) = self.workers.get(&process_hash) {
                             worker.with_state_mut(|state| {
                                 state.refund_priority.confirm_admission(&tx_hash);
+                                if let Some(pending) = state.submit.pending.get_mut(&hash_bytes) {
+                                    pending.admission_deadline = None;
+                                }
                             });
                         }
                     }
@@ -1187,6 +1208,7 @@ where
             self.batch_code_key(process),
             self.tick_cell_deps.clone(),
             self.tick_cid_locks.clone(),
+            self.tick_process_hashes.clone(),
             self.config.refund_policy.clone(),
             max_size,
             rest,
@@ -1364,6 +1386,7 @@ mod worker_cmd_tests {
                     created: vec![],
                     seen_committed: false,
                     currently_committed: false,
+                    admission_deadline: None,
                 },
             );
         });

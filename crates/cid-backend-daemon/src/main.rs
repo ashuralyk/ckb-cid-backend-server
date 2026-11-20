@@ -1,6 +1,6 @@
 use cid_backend_core::digest_loop::{DigestLoop, NopClock, WorkerCommands};
 use cid_backend_core::ssri::EmbeddedSsri;
-use cid_backend_core::{ProcessBusyMap, ProcessRegistry, WorkerPool};
+use cid_backend_core::{ProcessRegistry, WorkerPool};
 use cid_backend_daemon::observe::{spawn_health, DaemonStats};
 use cid_backend_daemon::registry_api::{spawn_registry_api, RegistryApiState};
 use cid_backend_daemon::{
@@ -100,7 +100,6 @@ fn main() {
     );
 
     let worker_cmds = Arc::new(WorkerCommands::default());
-    let busy = ProcessBusyMap::new();
 
     let rpc = Arc::new(CkbRpc::from_config(&config));
     if config.validate_genesis {
@@ -145,7 +144,6 @@ fn main() {
         let state = RegistryApiState {
             registry: registry.clone(),
             worker_cmds: worker_cmds.clone(),
-            busy: busy.clone(),
             cid: cid_backend_core::CidLockIdentity::new(
                 config.cid_lock_code_hash,
                 config.hash_type,
@@ -185,8 +183,7 @@ fn main() {
     let loop_config = config.to_loop_config();
     let poll = config.poll_interval;
     let mut digest =
-        DigestLoop::with_workers(rpc, NopClock, ssri, loop_config, workers, Some(worker_cmds))
-            .with_busy_map(busy);
+        DigestLoop::with_workers(rpc, NopClock, ssri, loop_config, workers, Some(worker_cmds));
     loop {
         let report = digest.tick();
         let pending = digest

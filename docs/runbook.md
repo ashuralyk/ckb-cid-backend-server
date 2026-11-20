@@ -25,7 +25,7 @@ See `examples/cid.testnet.toml` / `examples/cid.network.toml.example`.
 | `[registry]` | `path` + `max_entries` for on-disk Process registry |
 | `[observe].api_bind` | HTTP Process registry API |
 | `[observe].health_bind` | `/healthz` `/readyz` `/stats` `/metrics` |
-| `[loop]` | poll interval, confirmation depth, missing-filter fallback |
+| `[loop]` | poll interval, confirmation depth, refund fee rate |
 
 Register existing Process state cells through the HTTP API. The former `process.example_policy_data_hashes` and `CID_EXAMPLE_POLICY_DATA_HASHES` settings are obsolete and can be removed.
 
@@ -74,7 +74,7 @@ The state cell lock uses `code_hash` equal to `code_type_id` above and `hash_typ
 - `code_*` = Process **code** cell Type ID (lock `code_hash` + SSRI ELF).
 - Optional `*_type_id` fields fail-closed if they disagree with derived hashes.
 - Idempotent re-register; replacing `code_*` for the same identity updates the
-  binding. The node must confirm the indexer's Process state outpoint, output,
+  binding when the worker is idle. A change attempted during an active send or while a transaction is pending returns HTTP 409. The node must confirm the indexer's Process state outpoint, output,
   and data before the API persists either operation. Bounded by
   `registry.max_entries` (default 64).
 - DELETE returns 404 if missing. After deletion is queued, the worker stops
@@ -102,7 +102,7 @@ Pinned `cid_process_example` pays the digest fee from Process state and rejects 
 
 Assembly errors log `assemble.batch_failed` or `assemble.probe_failed`. Every tick starts a fresh scan of the current filter-accepted cells. Each Process can consider up to 64 subsets, including the first window. Large searches share that budget across legal batch sizes, give arrivals early probes, and vary the remaining order by tick. Some combinations may repeatedly fall outside the cap. This bounded-search starvation is accepted by design.
 
-Windows and probes use one input per full CID lock script. The worker reads candidate liveness on demand, with up to one window plus 64 reads per tick for isolation. It skips non-live Intentions and subsets with non-live guest-added funding inputs. An unavailable lookup defers the search. Validation failures, dry-run or submit rejections, and conflicts advance to another subset when budget remains.
+Windows and probes use one input per full CID lock script. The worker reads candidate liveness on demand, with up to one window plus 64 reads per tick for isolation. It skips non-live Intentions and subsets with non-live guest-added funding inputs. Another registered Process state cannot be used as funding. An unavailable lookup defers the search. Validation failures, dry-run or submit rejections, and conflicts advance to another subset when budget remains.
 
 Exit 37 pauses assembly for the audited v0.1.4 example ELF on a state with zero fee headroom. A state or Process code change re-enables assembly. Other guests continue through the capped scan. Exit 41 logs `process.unhealthy` and quarantines the state/code pair for the worker’s lifetime, blocking its assembly and filter refunds. Cells excluded during assembly stay live and are eligible for a fresh filter pass on later ticks.
 
@@ -111,6 +111,6 @@ Exit 37 pauses assembly for the audited v0.1.4 example ELF on a state with zero 
 1. For testnet v0.1.4 use `examples/cid.testnet.toml` and identify your live Process state cell.
 2. Start the daemon with `--config examples/cid.testnet.toml`.
 3. `POST /v1/processes` for each Process you operate.
-4. Watch `/readyz` and logs (`process.unregistered` = skip; `submit.ok` =
-   passthrough submit).
+4. Watch the logs for `process.unregistered` and `submit.ok`. To check
+   `/readyz`, enable `observe.health_bind` on a loopback address.
 5. To disable a Process, call `DELETE /v1/processes/0x…`. The worker drains any pending transactions.

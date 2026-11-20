@@ -352,7 +352,10 @@ impl Rpc for CkbRpc {
             json!([tx_json.clone(), "passthrough"]),
         ) {
             Ok(()) => Ok(()),
-            Err((code, msg)) if dry_run_should_fallback(code, &msg) => self
+            // The exact transaction is already in the pool. An idempotent send
+            // follows the normal receipt and duplicate reconciliation path.
+            Err((Some(POOL_REJECTED_DUPLICATED), _)) => Ok(()),
+            Err((Some(JSON_RPC_METHOD_NOT_FOUND), _)) => self
                 .dry_run_rpc_call("estimate_cycles", json!([tx_json]))
                 .map_err(|(c, m)| map_verify_rpc_error("estimate_cycles", c, &m)),
             Err((code, msg)) => Err(map_verify_rpc_error("test_tx_pool_accept", code, &msg)),
@@ -395,7 +398,7 @@ impl Rpc for CkbRpc {
             json!([hex_bytes(tx_hash.as_slice())]),
         )?;
         if result.is_null() {
-            return Ok(TxStatus::Dropped);
+            return Ok(TxStatus::Unknown);
         }
         let status = result
             .pointer("/tx_status/status")
@@ -418,7 +421,8 @@ impl Rpc for CkbRpc {
                     block_hash,
                 })
             }
-            Some("unknown" | "rejected") => Ok(TxStatus::Dropped),
+            Some("unknown") => Ok(TxStatus::Unknown),
+            Some("rejected") => Ok(TxStatus::Dropped),
             _ => Err(RpcError::Unavailable(
                 "get_transaction: missing or invalid status".into(),
             )),
@@ -667,6 +671,8 @@ const TX_FAILED_TO_RESOLVE: i64 = -301;
 const TX_FAILED_TO_VERIFY: i64 = -302;
 const POOL_REJECTED_BY_OUTPUTS_VALIDATOR: i64 = -1102;
 const POOL_REJECTED_BY_MIN_FEE_RATE: i64 = -1104;
+const POOL_REJECTED_BY_MAX_ANCESTORS: i64 = -1105;
+const POOL_IS_FULL: i64 = -1106;
 const POOL_REJECTED_DUPLICATED: i64 = -1107;
 const POOL_REJECTED_MALFORMED: i64 = -1108;
 
@@ -680,19 +686,18 @@ fn json_rpc_code(err: &Value) -> Option<i64> {
 const JSON_RPC_METHOD_NOT_FOUND: i64 = -32601;
 
 fn map_verify_rpc_error(method: &str, code: Option<i64>, msg: &str) -> RpcError {
-    if code == Some(POOL_REJECTED_BY_MIN_FEE_RATE) {
-        return RpcError::FeeRateRejected(msg.into());
-    }
-    if is_conflict(msg) {
-        return RpcError::Conflict(msg.into());
-    }
     match code {
+        Some(POOL_REJECTED_BY_MIN_FEE_RATE) => RpcError::FeeRateRejected(msg.into()),
+        Some(POOL_REJECTED_BY_MAX_ANCESTORS | POOL_IS_FULL) => {
+            RpcError::PoolUnavailable(msg.into())
+        }
         Some(TX_FAILED_TO_RESOLVE) | Some(POOL_REJECTED_DUPLICATED) => {
             RpcError::Conflict(msg.into())
         }
         Some(TX_FAILED_TO_VERIFY)
         | Some(POOL_REJECTED_BY_OUTPUTS_VALIDATOR)
         | Some(POOL_REJECTED_MALFORMED) => RpcError::SubmitRejected(msg.into()),
+        _ if is_conflict(msg) => RpcError::Conflict(msg.into()),
         _ => RpcError::Unavailable(format!("{method} {code:?}: {msg}")),
     }
 }
@@ -708,17 +713,6 @@ fn map_rpc_error(method: &str, code: Option<i64>, msg: &str) -> RpcError {
         }
         _ => RpcError::Unavailable(msg.into()),
     }
-}
-
-fn dry_run_should_fallback(code: Option<i64>, msg: &str) -> bool {
-    if code == Some(JSON_RPC_METHOD_NOT_FOUND) {
-        return true;
-    }
-    if code == Some(POOL_REJECTED_BY_MIN_FEE_RATE) {
-        return false;
-    }
-    let m = msg.to_ascii_lowercase();
-    m.contains("method not found") || m.contains("test_tx_pool_accept")
 }
 
 impl CkbRpc {
@@ -747,10 +741,16 @@ impl CkbRpc {
             let code = json_rpc_code(err);
             return Err((code, msg));
         }
-        if v.get("result").is_some() {
+        let result = &v["result"];
+        let has_uint = |key: &str| {
+            result
+                .get(key)
+                .is_some_and(|value| parse_uint(value).is_ok())
+        };
+        if has_uint("cycles") && (method != "test_tx_pool_accept" || has_uint("fee")) {
             Ok(())
         } else {
-            Err((None, format!("{method}: missing result")))
+            Err((None, format!("{method}: missing or invalid result")))
         }
     }
 }
@@ -1468,12 +1468,43 @@ mod tests {
     fn dry_run_maps_verify_failure_to_submit_rejected() {
         let url = spawn_mock(Arc::new(|method, _| {
             assert_eq!(method, "test_tx_pool_accept");
-            Err((-302, "TransactionFailedToVerify".into()))
+            Err((
+                -302,
+                "test_tx_pool_accept: TransactionFailedToVerify".into(),
+            ))
         }));
         let rpc = CkbRpc::new(&url, &url);
         let tx = ckb_types::core::TransactionBuilder::default().build();
         let err = rpc.dry_run_transaction(&tx).unwrap_err();
         assert!(matches!(err, RpcError::SubmitRejected(_)), "{err:?}");
+    }
+
+    #[test]
+    fn duplicate_pool_preflight_allows_idempotent_send() {
+        let url = spawn_mock(Arc::new(|method, _| {
+            assert_eq!(method, "test_tx_pool_accept");
+            Err((-1107, "PoolRejectedDuplicatedTransaction".into()))
+        }));
+        let rpc = CkbRpc::new(&url, &url);
+        let tx = ckb_types::core::TransactionBuilder::default().build();
+        rpc.dry_run_transaction(&tx).expect("already admitted");
+    }
+
+    #[test]
+    fn dry_run_refuses_unusable_rpc_success_results() {
+        for (pool_missing, result) in [(false, Value::Null), (true, json!({}))] {
+            let url = spawn_mock(Arc::new(move |method, _| match method {
+                "test_tx_pool_accept" if pool_missing => Err((-32601, "Method not found".into())),
+                "test_tx_pool_accept" | "estimate_cycles" => Ok(result.clone()),
+                _ => panic!("unexpected {method}"),
+            }));
+            let rpc = CkbRpc::new(&url, &url);
+            let tx = ckb_types::core::TransactionBuilder::default().build();
+            assert!(matches!(
+                rpc.dry_run_transaction(&tx),
+                Err(RpcError::Unavailable(_))
+            ));
+        }
     }
 
     #[test]
@@ -1518,7 +1549,7 @@ mod tests {
     }
 
     #[test]
-    fn tx_status_pending_committed_and_dropped() {
+    fn tx_status_distinguishes_pending_unknown_and_rejected() {
         let n = Arc::new(AtomicUsize::new(0));
         let n2 = n.clone();
         let url = spawn_mock(Arc::new(move |method, _| {
@@ -1545,7 +1576,7 @@ mod tests {
         );
         assert_eq!(
             rpc.get_transaction_status(&hash).unwrap(),
-            TxStatus::Dropped
+            TxStatus::Unknown
         );
         assert_eq!(
             rpc.get_transaction_status(&hash).unwrap(),
@@ -1553,7 +1584,7 @@ mod tests {
         );
         assert_eq!(
             rpc.get_transaction_status(&hash).unwrap(),
-            TxStatus::Dropped
+            TxStatus::Unknown
         );
         assert!(matches!(
             rpc.get_transaction_status(&hash),
@@ -1714,7 +1745,7 @@ mod tests {
     }
 
     #[test]
-    fn send_transaction_pool_is_full_is_unavailable_not_rejected() {
+    fn send_transaction_pool_is_full_is_retryable_without_admission() {
         let url = spawn_mock(Arc::new(|method, _| {
             assert_eq!(method, "send_transaction");
             Err((-1106, "PoolIsFull: the pool has reached its limit".into()))
@@ -1723,7 +1754,7 @@ mod tests {
         let tx = ckb_types::core::TransactionBuilder::default().build();
         let err = rpc.submit_transaction(&tx).unwrap_err();
         assert!(
-            matches!(err, RpcError::Unavailable(ref m) if m.to_ascii_lowercase().contains("pool")),
+            matches!(err, RpcError::PoolUnavailable(ref m) if m.to_ascii_lowercase().contains("pool")),
             "PoolIsFull must be retryable, got {err:?}"
         );
     }
@@ -1741,7 +1772,7 @@ mod tests {
         let tx = ckb_types::core::TransactionBuilder::default().build();
         let err = rpc.submit_transaction(&tx).unwrap_err();
         assert!(
-            matches!(err, RpcError::Unavailable(_)),
+            matches!(err, RpcError::PoolUnavailable(_)),
             "max-ancestors is retryable, got {err:?}"
         );
     }
@@ -2058,6 +2089,10 @@ mod tests {
         let (intent, proc, _) = live_intent_and_process();
         let admitted = Arc::new(Mutex::new(None));
         let node_pending = admitted.clone();
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let node_lookups = lookups.clone();
+        let sends = Arc::new(AtomicUsize::new(0));
+        let node_sends = sends.clone();
         let url = spawn_mock(Arc::new(move |method, params| match method {
             "get_cells" if params[0]["script_type"] == "lock" => {
                 Ok(cells_result(vec![intent.clone()]))
@@ -2065,8 +2100,12 @@ mod tests {
             "get_cells" => Ok(cells_result(vec![proc.clone()])),
             "send_transaction" => {
                 let hash = stub_transaction_hash(&params);
-                assert!(node_pending.lock().unwrap().replace(hash).is_none());
+                node_pending.lock().unwrap().replace(hash);
+                node_sends.fetch_add(1, Ordering::SeqCst);
                 Ok(json!(hex_bytes(&[0xab; 32])))
+            }
+            "get_transaction" if node_lookups.fetch_add(1, Ordering::SeqCst) == 0 => {
+                Ok(Value::Null)
             }
             "get_transaction" => Ok(if node_pending.lock().unwrap().as_ref() == params.get(0) {
                 json!({"tx_status": {"status": "pending"}})
@@ -2093,10 +2132,15 @@ mod tests {
             .index(0u32.pack())
             .build();
         assert_eq!(loop_.tick().submitted, 0);
-        let state = loop_.state().submit.unwrap();
-        assert_eq!(state.pending.len(), 1);
-        assert!(state.pending.contains_key(&live_hash));
-        assert!(state.pending_occupies(&created));
+        assert!(
+            loop_.state().submit.unwrap().pending_occupies(&created),
+            "first unknown result must retain the locally hashed transaction"
+        );
+        assert_eq!(lookups.load(Ordering::SeqCst), 1);
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+        assert_eq!(loop_.tick().submitted, 0);
+        assert_eq!(lookups.load(Ordering::SeqCst), 2);
+        assert!(loop_.state().submit.unwrap().pending_occupies(&created));
     }
 
     #[test]

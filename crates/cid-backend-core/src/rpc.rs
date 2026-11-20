@@ -34,6 +34,8 @@ pub enum TxStatus {
         block_hash: [u8; 32],
     },
     Dropped,
+    /// The node has no status for this transaction hash.
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +44,8 @@ pub enum RpcError {
     SubmitRejected(String),
     /// The node declined this transaction at its current minimum fee rate.
     FeeRateRejected(String),
+    /// The node declined the transaction because of a temporary pool limit.
+    PoolUnavailable(String),
     Conflict(String),
 }
 
@@ -51,6 +55,7 @@ impl fmt::Display for RpcError {
             RpcError::Unavailable(m) => write!(f, "rpc unavailable: {m}"),
             RpcError::SubmitRejected(m) => write!(f, "submit rejected: {m}"),
             RpcError::FeeRateRejected(m) => write!(f, "minimum fee rate rejected: {m}"),
+            RpcError::PoolUnavailable(m) => write!(f, "transaction pool unavailable: {m}"),
             RpcError::Conflict(m) => write!(f, "submit conflict: {m}"),
         }
     }

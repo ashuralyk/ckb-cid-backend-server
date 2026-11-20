@@ -7,8 +7,8 @@
 use cid_backend_core::process::{state_is_process_lock, validate_state_cid_binding};
 use cid_backend_core::rpc::{LiveCell, RpcError};
 use cid_backend_core::{
-    type_id_script_hash, CidLockIdentity, ProcessBusyMap, ProcessRegistration, ProcessRegistry,
-    RegisterOutcome, RegistryError, WorkerCommand, WorkerCommands,
+    type_id_script_hash, CidLockIdentity, ProcessRegistration, ProcessRegistry, RegisterOutcome,
+    RegistryError, WorkerCommand, WorkerCommands,
 };
 use ckb_types::packed::{OutPoint, Script};
 use serde::{Deserialize, Serialize};
@@ -31,8 +31,6 @@ type FindProcessState = dyn Fn(&Script) -> Result<Vec<LiveCell>, RpcError> + Sen
 pub struct RegistryApiState {
     pub registry: Arc<Mutex<ProcessRegistry>>,
     pub worker_cmds: Arc<WorkerCommands>,
-    /// Shared with the digest loop for pending/idle checks (P1-6).
-    pub busy: ProcessBusyMap,
     pub cid: CidLockIdentity,
     pub find_process_state: Arc<FindProcessState>,
     pub get_live_cell: Arc<GetLiveCell>,
@@ -281,15 +279,22 @@ fn register_process(
         return Ok(bad_request(format!("{reason}\n").as_bytes()));
     }
 
-    // Single critical section: registry persist + worker-cmd enqueue (P0-2).
-    // Lock order: registry → workers → worker_cmds.
+    // Keep the idle check, registry write, and worker update atomic against
+    // submission admission. This also covers sends whose receipt is uncertain.
     let outcome = {
+        use cid_backend_core::worker_commands::RegistrationQueueError;
         let mut reg = state.registry.lock().map_err(|_| ())?;
         let hash = reg_entry.identity_type_hash();
-        if let Some(existing) = reg.get(&hash) {
-            let code_changing = existing.code_type_id_args != reg_entry.code_type_id_args
-                || existing.code_type_id != reg_entry.code_type_id;
-            if code_changing && state.busy.is_pending(&hash) {
+        let require_idle = reg.get(&hash).is_none_or(|existing| {
+            existing.code_type_id_args != reg_entry.code_type_id_args
+                || existing.code_type_id != reg_entry.code_type_id
+        });
+        match state
+            .worker_cmds
+            .enqueue_registration(entry, require_idle, || reg.register(reg_entry.clone()))
+        {
+            Ok(outcome) => outcome,
+            Err(RegistrationQueueError::Busy) => {
                 return Ok((
                     409,
                     "Conflict",
@@ -297,10 +302,7 @@ fn register_process(
                     b"process has in-flight submits; defer code re-bind until idle\n".to_vec(),
                 ));
             }
-        }
-        let outcome = match reg.register(reg_entry.clone()) {
-            Ok(o) => o,
-            Err(RegistryError::Full) => {
+            Err(RegistrationQueueError::Persist(RegistryError::Full)) => {
                 return Ok((
                     409,
                     "Conflict",
@@ -308,12 +310,11 @@ fn register_process(
                     b"registry full\n".to_vec(),
                 ));
             }
-            Err(e) => return Ok(bad_request(format!("{e}\n").as_bytes())),
-        };
-        if !state.worker_cmds.enqueue(WorkerCommand::Register(entry)) {
-            return Err(());
+            Err(RegistrationQueueError::Persist(e)) => {
+                return Ok(bad_request(format!("{e}\n").as_bytes()));
+            }
+            Err(RegistrationQueueError::Unavailable) => return Err(()),
         }
-        outcome
     };
     let hash = reg_entry.identity_type_hash();
     tracing::info!(
@@ -584,7 +585,6 @@ mod tests {
         RegistryApiState {
             registry: Arc::new(Mutex::new(registry)),
             worker_cmds: Arc::new(WorkerCommands::default()),
-            busy: ProcessBusyMap::new(),
             cid: CID,
             find_process_state: Arc::new(move |typ| {
                 assert_eq!(indexed.type_script().as_ref(), Some(typ));

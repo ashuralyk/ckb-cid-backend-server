@@ -34,6 +34,25 @@ impl WorkerCommand {
 struct CommandState {
     queue: Vec<WorkerCommand>,
     submitting: HashSet<[u8; 32]>,
+    pending: HashSet<[u8; 32]>,
+}
+
+impl CommandState {
+    fn enqueue(&mut self, command: WorkerCommand) {
+        if let WorkerCommand::Register(entry) = &command {
+            self.queue.retain(|cmd| {
+                !matches!(cmd, WorkerCommand::Delete { hash, .. } if *hash == entry.identity_type_hash)
+            });
+        }
+        self.queue.push(command);
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum RegistrationQueueError<E> {
+    Busy,
+    Unavailable,
+    Persist(E),
 }
 
 /// Serializes registry updates with admission to each transaction submission.
@@ -48,13 +67,35 @@ impl WorkerCommands {
         let Ok(mut state) = self.state.lock() else {
             return false;
         };
-        if let WorkerCommand::Register(entry) = &command {
-            state.queue.retain(|cmd| {
-                !matches!(cmd, WorkerCommand::Delete { hash, .. } if *hash == entry.identity_type_hash)
-            });
-        }
-        state.queue.push(command);
+        state.enqueue(command);
         true
+    }
+
+    /// Persist a registration and enqueue it under the submission admission lock.
+    pub fn enqueue_registration<T, E>(
+        &self,
+        entry: ProcessEntry,
+        require_idle: bool,
+        persist: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, RegistrationQueueError<E>> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| RegistrationQueueError::Unavailable)?;
+        let hash = &entry.identity_type_hash;
+        if require_idle && (state.submitting.contains(hash) || state.pending.contains(hash)) {
+            return Err(RegistrationQueueError::Busy);
+        }
+        let result = persist().map_err(RegistrationQueueError::Persist)?;
+        state.enqueue(WorkerCommand::Register(entry));
+        Ok(result)
+    }
+
+    /// Refresh after reconciliation, while no batch is submitting.
+    pub(crate) fn set_pending(&self, pending: &[[u8; 32]]) {
+        if let Ok(mut state) = self.state.lock() {
+            state.pending = pending.iter().copied().collect();
+        }
     }
 
     pub(crate) fn drain(&self) -> Option<Vec<WorkerCommand>> {
@@ -111,6 +152,14 @@ pub(crate) struct Submission<'a> {
     hash: [u8; 32],
 }
 
+impl Submission<'_> {
+    pub(crate) fn record_pending(&self) {
+        if let Ok(mut state) = self.commands.state.lock() {
+            state.pending.insert(self.hash);
+        }
+    }
+}
+
 impl Drop for Submission<'_> {
     fn drop(&mut self) {
         let mut state = self
@@ -120,5 +169,45 @@ impl Drop for Submission<'_> {
             .unwrap_or_else(|e| e.into_inner());
         state.submitting.remove(&self.hash);
         self.commands.submission_finished.notify_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::type_id::TypeIdIdentity;
+
+    #[test]
+    fn rebind_waits_for_submission_and_its_pending_status() {
+        let commands = WorkerCommands::default();
+        let identity = TypeIdIdentity::new([1; 32]);
+        let entry = ProcessEntry {
+            identity_type_hash: identity.type_script_hash(),
+            identity,
+            code: TypeIdIdentity::new([2; 32]),
+            ssri_elf_path: None,
+        };
+        let hash = entry.identity_type_hash;
+        let persist = || -> Result<(), ()> { panic!("busy rebind must not persist") };
+
+        let send = commands.begin_submission(hash).unwrap();
+        assert_eq!(
+            commands.enqueue_registration(entry.clone(), true, persist),
+            Err(RegistrationQueueError::Busy)
+        );
+        send.record_pending();
+        drop(send);
+        assert_eq!(
+            commands.enqueue_registration(entry.clone(), true, persist),
+            Err(RegistrationQueueError::Busy)
+        );
+        assert!(commands.queued().is_empty());
+
+        commands.set_pending(&[]);
+        commands
+            .enqueue_registration(entry, true, || Ok::<_, ()>(()))
+            .unwrap();
+        assert_eq!(commands.queued().len(), 1);
+        assert!(commands.begin_submission(hash).is_none());
     }
 }

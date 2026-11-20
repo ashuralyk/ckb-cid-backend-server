@@ -4,6 +4,10 @@ use ckb_types::core::TransactionView;
 use ckb_types::packed::{Byte32, OutPoint};
 use ckb_types::prelude::*;
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
+
+// An unanswered send can still finish after the next status lookup.
+const ADMISSION_GRACE: Duration = Duration::from_secs(30);
 
 /// In-memory submit bookkeeping. Restart drops this; the next scan is the
 /// source of truth.
@@ -35,6 +39,8 @@ pub struct PendingTx {
     pub seen_committed: bool,
     /// True only when the latest status poll reports Committed.
     pub currently_committed: bool,
+    /// Keep an ambiguous send occupied through initially unknown lookups.
+    pub(crate) admission_deadline: Option<Instant>,
 }
 
 impl SubmitState {
@@ -119,6 +125,7 @@ pub fn submit_execution<R: Rpc>(
             created,
             seen_committed: false,
             currently_committed: false,
+            admission_deadline: result.is_err().then(|| Instant::now() + ADMISSION_GRACE),
         },
     );
     result
