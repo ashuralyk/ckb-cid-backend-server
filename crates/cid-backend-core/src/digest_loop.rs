@@ -18,7 +18,7 @@ use cid_intention_filter::{
 use ckb_types::core::ScriptHashType;
 use ckb_types::packed::{Byte32, CellDep};
 use ckb_types::prelude::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::Arc;
 use std::thread;
@@ -106,6 +106,13 @@ struct FilteredBucket {
     refunds: Vec<ScannedIntention>,
 }
 
+/// Window expansion lives only as long as the current scan.
+struct WindowSearch {
+    pending: Vec<Vec<ScannedIntention>>,
+    expanded: HashSet<Vec<u8>>,
+    cached_splits: usize,
+}
+
 pub trait Clock {
     fn sleep(&self, duration: Duration);
 }
@@ -141,6 +148,8 @@ where
     /// Optional shared pending map for registry API code-rebind checks (P1-6).
     busy: Option<ProcessBusyMap>,
     last_tip: Option<u64>,
+    /// Varies probe order for large candidate sets independently of search results.
+    scan_number: u64,
     tick_cell_deps: Vec<CellDep>,
     tick_cid_locks: Arc<[CidLockIdentity]>,
     execution_code_key: Vec<u8>,
@@ -177,6 +186,7 @@ where
             worker_cmds,
             busy: None,
             last_tip: None,
+            scan_number: 0,
             tick_cell_deps: Vec::new(),
             tick_cid_locks: Arc::from([]),
             execution_code_key: Vec::new(),
@@ -502,6 +512,8 @@ where
             .map(|i| out_point_key(&i.out_point))
             .collect();
 
+        let scan_number = self.scan_number;
+        self.scan_number = self.scan_number.wrapping_add(1);
         self.workers.for_each_mut(|w| {
             w.with_state_mut(|state| {
                 let pending_occupied = state.submit.pending_occupied_keys();
@@ -512,14 +524,8 @@ where
                 state
                     .refund_state_deps
                     .retain(|hash, _| state.submit.pending.contains_key(hash));
-                state.probe_budget = process_batch::ProbeBudget::default();
+                state.probe_budget = process_batch::ProbeBudget::for_scan(scan_number);
                 state.refund_assembly_checked = false;
-                if let Some(exhausted) = &mut state.exhausted_isolation {
-                    exhausted.polls_remaining -= 1;
-                    if exhausted.polls_remaining == 0 {
-                        state.exhausted_isolation = None;
-                    }
-                }
             });
         });
 
@@ -558,16 +564,29 @@ where
                 self.prepare_bucket(hash, bucket, tip.and(self.last_tip), &mut report)
             })
             .collect();
-        // Multi-round only for reject-isolate expansions. Transient Continue /
-        // Conflict wait for the next tick (same as pre-async semantics).
-        for _round in 0..64 {
+        let mut searches: HashMap<_, _> = buckets
+            .iter()
+            .map(|bucket| {
+                (
+                    bucket.process.type_hash,
+                    WindowSearch {
+                        pending: vec![bucket.accepted.clone()],
+                        expanded: HashSet::new(),
+                        cached_splits: 0,
+                    },
+                )
+            })
+            .collect();
+        // Give each Process one worker job per round, then handle its result.
+        for _ in 0..64 {
             let mut started = false;
             for bucket in &buckets {
                 let hash = &bucket.process.type_hash;
                 let Some(worker) = self.workers.get(hash) else {
                     continue;
                 };
-                if worker.batch_outstanding() {
+                let search = searches.get_mut(hash).expect("scan window search");
+                if search.pending.is_empty() {
                     continue;
                 }
                 let mode = if !bucket.refunds.is_empty()
@@ -577,20 +596,17 @@ where
                 } else {
                     BatchMode::Assemble
                 };
-                self.process_bucket(&bucket.process, bucket.accepted.clone(), mode, &mut report);
-                if self
-                    .workers
-                    .get(hash)
-                    .is_some_and(|w| w.batch_outstanding())
-                {
-                    started = true;
-                }
+                self.process_bucket(&bucket.process, search, mode, &mut report);
+                started |= worker.batch_outstanding();
             }
-            let more = self.wait_all_batches(&mut report);
-            if !started || !more {
+            if !started {
                 break;
             }
+            self.wait_all_batches(&mut report, &mut searches);
         }
+        self.workers.for_each_mut(|worker| {
+            worker.with_state_mut(|state| state.isolation_probe = None);
+        });
 
         // Wait for assembly to finish first. A Process state fault discovered
         // by assemble must also stop refunds authorized by its filter.
@@ -611,13 +627,12 @@ where
                     bucket.refunds,
                     Vec::new(),
                     1,
-                    None,
                     &mut report,
                     BatchMode::FilterRefund,
                 );
             }
         }
-        self.wait_all_batches(&mut report);
+        self.wait_all_batches(&mut report, &mut searches);
 
         self.tick_cell_deps.clear();
         self.clear_worker_tick_code();
@@ -654,83 +669,55 @@ where
         worker: &crate::workers::ProcessWorker,
         report: &mut TickReport,
         polled: crate::workers::PolledBatch,
-    ) -> bool {
+        search: Option<&mut WindowSearch>,
+    ) {
         Self::apply_batch_report(report, &polled.delta);
         if polled.mode == BatchMode::FilterRefund {
-            return false;
+            return;
         }
-        let mut continue_round = false;
+        let search = search.expect("scan window search");
         match polled.outcome {
-            BatchOutcome::Submitted | BatchOutcome::SubmittedProcess => {
-                // Keep leftover isolate_pending frames saved on ProcessOccupied.
-                let has_pending = worker.with_state(|s| !s.isolate_pending.is_empty());
-                continue_round = has_pending;
-                worker.with_state_mut(|state| {
-                    if let Some(r) = polled.resume_on_continue {
-                        state.isolate_resume = Some(r);
-                    } else if !has_pending {
-                        state.isolate_resume = None;
-                        state.isolate_expanded.clear();
-                    }
-                });
+            BatchOutcome::RetryIsolation => {
+                let mut items = polled.window;
+                items.extend_from_slice(&polled.rest);
+                search.pending.push(items);
             }
             BatchOutcome::Rejected | BatchOutcome::CachedRejected => {
                 let (frames, skipped) =
                     Self::reject_isolate_frames(&polled.window, &polled.rest, polled.min);
                 report.skipped += skipped;
-                continue_round = true;
-                worker.with_state_mut(|state| {
-                    state.isolate_expanded.insert(polled.window_fp);
-                    state.isolate_pending.extend(frames);
-                });
+                search.expanded.insert(polled.window_fp);
+                search.pending.extend(frames);
             }
-            BatchOutcome::RetryLater => {
-                // Keep draining leftover isolate frames without splitting this batch.
-                continue_round = worker.with_state(|s| !s.isolate_pending.is_empty());
-                if let Some(r) = polled.resume_on_continue {
-                    worker.with_state_mut(|state| {
-                        state.isolate_resume = Some(r);
-                    });
+            BatchOutcome::IsolationExhausted => {}
+            BatchOutcome::Submitted => {
+                if !polled.rest.is_empty() {
+                    search.pending.push(polled.rest.to_vec());
                 }
             }
-            BatchOutcome::ProbePending => {
-                worker.with_state_mut(|state| {
-                    state.isolate_resume = polled
-                        .window
-                        .first()
-                        .map(|item| out_point_key(&item.out_point));
-                });
-            }
-            BatchOutcome::Continue | BatchOutcome::RpcUnavailable => {
+            BatchOutcome::Continue
                 if polled.delta.conflicts == 0
                     && polled.delta.last_error.is_none()
-                    && polled.delta.skipped > 0
-                {
-                    // Unbuildable / soft skip: advance past window and keep isolating.
-                    // Conflict / submit failure set last_error or conflicts — next tick.
-                    continue_round = true;
-                    worker.with_state_mut(|state| {
-                        if let Some(r) = polled.resume_on_continue {
-                            state.isolate_resume = Some(r);
-                        } else {
-                            state.isolate_resume = None;
-                            state.isolate_expanded.clear();
-                        }
-                    });
+                    && polled.delta.skipped > 0 =>
+            {
+                if !polled.rest.is_empty() {
+                    search.pending.push(polled.rest.to_vec());
                 }
             }
             BatchOutcome::AssemblyChecked => {
                 worker.with_state_mut(|state| state.refund_assembly_checked = true);
+                search.pending.clear();
             }
-            BatchOutcome::ProcessOccupied => {}
+            _ => search.pending.clear(),
         }
-        continue_round
     }
 
-    /// Block until every outstanding RunBatch has an ack — never invent outcomes.
-    /// Returns true when isolate should run another round this tick.
-    fn wait_all_batches(&mut self, report: &mut TickReport) -> bool {
-        let mut more = false;
+    /// Block until every outstanding RunBatch has an ack.
+    fn wait_all_batches(
+        &mut self,
+        report: &mut TickReport,
+        searches: &mut HashMap<[u8; 32], WindowSearch>,
+    ) {
         loop {
             let mut any_outstanding = false;
             for hash in self.workers.hashes() {
@@ -744,15 +731,13 @@ where
                     ) {
                         self.sync_busy_map();
                     }
-                    if Self::apply_polled_batch(worker, report, polled) {
-                        more = true;
-                    }
+                    Self::apply_polled_batch(worker, report, polled, searches.get_mut(&hash));
                 } else if worker.batch_outstanding() {
                     any_outstanding = true;
                 }
             }
             if !any_outstanding {
-                return more;
+                return;
             }
             thread::sleep(Duration::from_micros(100));
         }
@@ -1118,18 +1103,6 @@ where
             }
         }
 
-        // Old isolate frames may contain cells that failed this tick's filter,
-        // or disappeared from the live set. Keep only this tick's accepted cells.
-        let keys: HashSet<_> = accepted
-            .iter()
-            .map(|i| out_point_key(&i.out_point))
-            .collect();
-        worker.with_state_mut(|state| {
-            for frame in &mut state.isolate_pending {
-                frame.retain(|i| keys.contains(&out_point_key(&i.out_point)));
-            }
-            state.isolate_pending.retain(|frame| !frame.is_empty());
-        });
         Some(FilteredBucket {
             process,
             accepted,
@@ -1138,44 +1111,36 @@ where
     }
 
     fn process_bucket(
-        &mut self,
+        &self,
         process: &ResolvedProcess,
-        bucket: Vec<ScannedIntention>,
+        search: &mut WindowSearch,
         mode: BatchMode,
         report: &mut TickReport,
     ) {
-        if bucket.is_empty() || !self.process_is_healthy(process) {
+        if !self.process_is_healthy(process) {
+            search.pending.clear();
             return;
         }
         let hash = process.type_hash;
-        if self.workers.get(&hash).is_some_and(|worker| {
-            worker.with_state_mut(|state| {
-                if state.is_process_unfunded(process) {
-                    if mode == BatchMode::CheckAssembly {
-                        state.refund_assembly_checked = true;
-                    }
-                    report.skipped += bucket.len();
-                    return true;
-                }
-                state.probe_budget.remaining == 0
-                    || (mode == BatchMode::CheckAssembly && state.refund_assembly_checked)
-            })
-        }) {
+        let Some(worker) = self.workers.get(&hash) else {
             return;
-        }
-        if self.workers.get(&hash).is_some_and(|worker| {
-            worker.with_state_mut(|state| {
-                let Some(exhausted) = &state.exhausted_isolation else {
-                    return false;
-                };
-                if exhausted.matches(process, &self.batch_code_key(process), &bucket) {
-                    return true;
+        };
+        let paused = worker.with_state_mut(|state| {
+            if state.is_process_unfunded(process) {
+                if mode == BatchMode::CheckAssembly {
+                    state.refund_assembly_checked = true;
                 }
-                state.exhausted_isolation = None;
-                false
-            })
-        }) {
-            report.skipped += bucket.len();
+                return true;
+            }
+            state.probe_budget.remaining == 0
+                || (mode == BatchMode::CheckAssembly && state.refund_assembly_checked)
+        });
+        if paused {
+            report.skipped += search
+                .pending
+                .drain(..)
+                .map(|frame| frame.len())
+                .sum::<usize>();
             return;
         }
         let (min, max) = match self.ssri.get_batch_bounds(&process.binary) {
@@ -1187,7 +1152,11 @@ where
                     reason = "batch_bounds",
                     error = %e,
                 );
-                report.skipped += bucket.len();
+                report.skipped += search
+                    .pending
+                    .drain(..)
+                    .map(|frame| frame.len())
+                    .sum::<usize>();
                 return;
             }
         };
@@ -1199,131 +1168,18 @@ where
                 min,
                 max,
             );
-            report.skipped += bucket.len();
+            report.skipped += search
+                .pending
+                .drain(..)
+                .map(|frame| frame.len())
+                .sum::<usize>();
             return;
         }
 
-        if mode == BatchMode::CheckAssembly
-            && bucket
-                .iter()
-                .map(ScannedIntention::lock_group_key)
-                .collect::<HashSet<_>>()
-                .len()
-                < min as usize
-        {
-            if let Some(worker) = self.workers.get(&hash) {
-                worker.with_state_mut(|state| state.refund_assembly_checked = true);
-            }
-            report.skipped += bucket.len();
-            return;
-        }
-
-        const MAX_ATTEMPTS: u32 = 64;
-        let mut attempts = 0u32;
-        if let Some(worker) = self.workers.get(&hash) {
-            worker.with_state_mut(|state| {
-                if state.isolate_resume.is_none() {
-                    state.isolate_expanded.clear();
-                }
+        while let Some(mut items) = search.pending.pop() {
+            worker.with_state(|s| {
+                items.retain(|item| !s.submit.in_flight.contains(&out_point_key(&item.out_point)));
             });
-        }
-        let resume_key = self
-            .workers
-            .get(&hash)
-            .and_then(|w| w.with_state(|s| s.isolate_resume.clone()));
-        let resuming_probe = self.workers.get(&hash).is_some_and(|worker| {
-            worker.with_state_mut(|state| {
-                let Some(probe) = &state.isolation_probe else {
-                    return false;
-                };
-                if probe.matches(&process.live_cell.out_point, min) {
-                    return true;
-                }
-                state.isolation_probe = None;
-                false
-            })
-        });
-        let bucket = if resuming_probe {
-            bucket
-        } else {
-            Self::rotate_bucket(bucket, resume_key.as_ref())
-        };
-        let resume = self.isolate_window(
-            hash,
-            process,
-            bucket,
-            min,
-            max,
-            report,
-            &mut attempts,
-            MAX_ATTEMPTS,
-            resuming_probe,
-            mode,
-        );
-        if let Some(worker) = self.workers.get(&hash) {
-            worker.with_state_mut(|state| {
-                if let Some(k) = resume {
-                    state.isolate_resume = Some(k);
-                } else {
-                    state.isolate_resume = None;
-                    state.isolate_expanded.clear();
-                }
-            });
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn isolate_window(
-        &mut self,
-        hash: [u8; 32],
-        process: &ResolvedProcess,
-        items: Vec<ScannedIntention>,
-        min: u32,
-        max: u32,
-        report: &mut TickReport,
-        attempts: &mut u32,
-        max_attempts: u32,
-        resuming_probe: bool,
-        mode: BatchMode,
-    ) -> Option<Vec<u8>> {
-        const MAX_CACHED_SPLITS: u32 = 256;
-        let mut cached_splits = 0u32;
-        // Prefer async Rejected frames (drop_first + shrink) over re-walking the
-        // bucket via `already` (P0).
-        let mut stack = (!resuming_probe)
-            .then(|| self.workers.get(&hash))
-            .flatten()
-            .map(|w| {
-                w.with_state_mut(|s| {
-                    if s.isolate_pending.is_empty() {
-                        Vec::new()
-                    } else {
-                        std::mem::take(&mut s.isolate_pending)
-                    }
-                })
-            })
-            .unwrap_or_default();
-        if stack.is_empty() {
-            stack.push(items);
-        }
-        while let Some(items) = stack.pop() {
-            let items: Vec<ScannedIntention> = items
-                .into_iter()
-                .filter(|i| {
-                    self.workers
-                        .get(&hash)
-                        .map(|w| {
-                            w.with_state(|s| {
-                                !s.submit.in_flight.contains(&out_point_key(&i.out_point))
-                            })
-                        })
-                        .unwrap_or(true)
-                })
-                .collect();
-            if items.len() < min as usize {
-                report.skipped += items.len();
-                continue;
-            }
             let mut locks = HashSet::new();
             let mut window = Vec::new();
             let mut rest = Vec::new();
@@ -1335,123 +1191,47 @@ where
                 }
             }
             if window.len() < min as usize {
-                report.skipped += items.len();
+                if mode == BatchMode::CheckAssembly {
+                    worker.with_state_mut(|state| state.refund_assembly_checked = true);
+                }
+                report.skipped += window.len() + rest.len();
                 continue;
             }
+
             report.isolate_windows += 1;
             let fp = self.window_fingerprint(&window, process);
-            let already = self
-                .workers
-                .get(&hash)
-                .map(|w| w.with_state(|s| s.isolate_expanded.contains(&fp)))
-                .unwrap_or(false);
-            if !resuming_probe && already {
-                // Already expanded once this sweep — do not re-push drop_first/
-                // shrink (diamond explosion). Async Rejected queues frames via
-                // isolate_pending at poll time instead of relying on this arm.
+            let resuming_probe = worker.with_state(|state| state.isolation_probe.is_some());
+            if !resuming_probe && search.expanded.contains(&fp) {
                 continue;
             }
-            let cached = mode != BatchMode::CheckAssembly
-                && !resuming_probe
-                && self.window_combo_cached(&hash, &window, process);
-            let outcome = if cached {
-                tracing::debug!(
-                    target: LOG_TARGET,
-                    event = "submit.rejected_combo",
-                    n = window.len(),
-                );
-                BatchOutcome::CachedRejected
-            } else {
-                if *attempts >= max_attempts {
-                    tracing::warn!(
-                        target: LOG_TARGET,
-                        event = "tick.skip",
-                        reason = "reject_isolate_budget",
-                        attempts,
-                    );
-                    report.skipped += items.len();
-                    for leftover in stack.drain(..) {
-                        report.skipped += leftover.len();
-                    }
-                    return items.first().map(|i| out_point_key(&i.out_point));
+            if !resuming_probe
+                && mode != BatchMode::CheckAssembly
+                && self.window_combo_cached(&hash, &window, process)
+            {
+                const MAX_CACHED_SPLITS: usize = 256;
+                if search.cached_splits >= MAX_CACHED_SPLITS {
+                    tracing::warn!(target: LOG_TARGET, event = "tick.skip",
+                        reason = "cached_split_budget", cached_splits = search.cached_splits);
+                    report.skipped += window.len()
+                        + rest.len()
+                        + search
+                            .pending
+                            .drain(..)
+                            .map(|frame| frame.len())
+                            .sum::<usize>();
+                    return;
                 }
-                let resume_on_continue = rest.first().map(|i| out_point_key(&i.out_point));
-                let outcome = self.dispatch_process_batch(
-                    hash,
-                    process,
-                    window.clone(),
-                    rest.clone(),
-                    min,
-                    resume_on_continue,
-                    report,
-                    mode,
-                );
-                if !matches!(outcome, BatchOutcome::CachedRejected) {
-                    *attempts += 1;
-                }
-                outcome
-            };
-            if matches!(outcome, BatchOutcome::CachedRejected) {
-                if cached_splits >= MAX_CACHED_SPLITS {
-                    tracing::warn!(
-                        target: LOG_TARGET,
-                        event = "tick.skip",
-                        reason = "cached_split_budget",
-                        cached_splits,
-                    );
-                    report.skipped += items.len();
-                    for leftover in stack.drain(..) {
-                        report.skipped += leftover.len();
-                    }
-                    return items.first().map(|i| out_point_key(&i.out_point));
-                }
-                cached_splits += 1;
+                search.cached_splits += 1;
+                search.expanded.insert(fp);
+                let (frames, skipped) = Self::reject_isolate_frames(&window, &rest, min);
+                report.skipped += skipped;
+                search.pending.extend(frames);
+                continue;
             }
-            match outcome {
-                BatchOutcome::SubmittedProcess => {
-                    let resume = rest
-                        .first()
-                        .or_else(|| stack.iter().find_map(|s| s.first()))
-                        .map(|i| out_point_key(&i.out_point));
-                    report.skipped += rest.len();
-                    for leftover in stack.drain(..) {
-                        report.skipped += leftover.len();
-                    }
-                    return resume;
-                }
-                BatchOutcome::ProcessOccupied => {
-                    // Preserve unprocessed frames for the next round after poll.
-                    if let Some(w) = self.workers.get(&hash) {
-                        if !stack.is_empty() {
-                            w.with_state_mut(|state| {
-                                state.isolate_pending.append(&mut stack);
-                            });
-                        }
-                    }
-                    // Resume at this window after poll (do not skip to `rest`).
-                    return items.first().map(|i| out_point_key(&i.out_point));
-                }
-                BatchOutcome::Submitted
-                | BatchOutcome::AssemblyChecked
-                | BatchOutcome::Continue
-                | BatchOutcome::RetryLater
-                | BatchOutcome::RpcUnavailable
-                | BatchOutcome::ProbePending => {
-                    if !rest.is_empty() {
-                        stack.push(rest);
-                    }
-                }
-                BatchOutcome::Rejected | BatchOutcome::CachedRejected => {
-                    if let Some(w) = self.workers.get(&hash) {
-                        w.with_state_mut(|state| state.isolate_expanded.insert(fp));
-                        let (frames, skipped) = Self::reject_isolate_frames(&window, &rest, min);
-                        report.skipped += skipped;
-                        stack.extend(frames);
-                    }
-                }
-            }
+
+            self.dispatch_process_batch(hash, process, window, rest, min, report, mode);
+            return;
         }
-        None
     }
 
     fn batch_code_key(&self, process: &ResolvedProcess) -> Vec<u8> {
@@ -1469,26 +1249,6 @@ where
             Some(&process.live_cell.out_point),
             &self.batch_code_key(process),
         )
-    }
-
-    fn rotate_bucket(
-        bucket: Vec<ScannedIntention>,
-        resume: Option<&Vec<u8>>,
-    ) -> Vec<ScannedIntention> {
-        let Some(key) = resume else {
-            return bucket;
-        };
-        match bucket
-            .iter()
-            .position(|i| out_point_key(&i.out_point) == *key)
-        {
-            Some(i) if i > 0 => {
-                let mut rotated = bucket[i..].to_vec();
-                rotated.extend_from_slice(&bucket[..i]);
-                rotated
-            }
-            _ => bucket,
-        }
     }
 
     fn window_combo_cached(
@@ -1526,7 +1286,6 @@ where
         batch: Vec<ScannedIntention>,
         rest: Vec<ScannedIntention>,
         min: u32,
-        resume_on_continue: Option<Vec<u8>>,
         report: &mut TickReport,
         mode: BatchMode,
     ) -> BatchOutcome {
@@ -1556,7 +1315,6 @@ where
             self.config.refund_policy.clone(),
             max_size,
             window_fp,
-            resume_on_continue,
             rest,
             min,
             mode,

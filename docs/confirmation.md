@@ -97,41 +97,29 @@ refund path. A replacement state has a different outpoint, so the worker can
 reconsider the refund after a fresh filter verdict of 4–7 and matching node
 snapshots for the Intention, replacement state, and code.
 
-At most 64 **new** `send_transaction` or assemble-skip attempts per bucket
-per tick (cached `rejected_combos` hits do not consume that budget). A
-separate cap of 256 **cached splits** per bucket per tick bounds diamond
-re-expansion of already-rejected windows; it does not replace the send
-cap. Each window fingerprint is expanded at most once per isolate sweep
-(memory-only `isolate_expanded`). When either budget cuts the tick, that
-set is kept with the resume cursor so the next tick continues remaining
-unique windows instead of re-walking the tree from the ASC head (which
-would starve a later valid B). The set is dropped when the sweep
-completes, and on restart.
+Each Process can dispatch at most 64 assembly worker jobs per tick. A separate
+cap of 256 cached splits bounds expansion of rejected windows. Each rejected
+window fingerprint is expanded at most once per tick. A cache hit skips
+assembly and submission while still allowing the window to split. The worker
+uses the ELF from the registered Process code cell and verifies the indexed
+Process state against the node before filtering or assembly.
 
-Before SSRI assemble, the worker checks the digest fingerprint for the
-candidate window. A cache hit skips assembly and submission while the window
-can still be split to reach later Intentions. Windows and probes select at
-most one input per full CID lock script.
+Assembly failures also share a budget of 64 subset probes per Process per
+tick. Window expansion and subset probing start fresh with each tick's
+accepted candidates, including Intentions revived by a reorg. Probe order varies
+between ticks for large candidate sets. Windows and probes select at most one input per full CID lock script. Probes skip non-live
+Intentions and subsets with non-live guest-added funding inputs. An unavailable
+funding lookup defers the search to the next tick. A conflict at dry-run or
+submission starts or advances isolation within the tick if alternatives and
+budget remain. A structurally invalid transaction advances the search during
+a deferred refund’s assembly check. The refund stays deferred if the budget
+runs out before that check completes.
 
-A subset whose guest-added funding input is no longer live is skipped. A
-funding lookup error leaves the subset at the probe cursor for retry.
-A conflict at dry-run or submission starts or advances subset isolation when
-alternatives are available. A structurally invalid transaction advances the
-subset cursor during a deferred refund’s assembly check. The worker keeps
-the subset cursor across ticks when the per-tick budget is spent. Natural
-exhaustion leaves the Intentions live and pauses assembly for three successful
-scans. Exit 37 on a Process state with zero fee headroom pauses assembly until
-the state or execution code changes.
-
-Uncached no-send skips (`RefundUnbuildable`, capacity shortfall, SSRI
-assemble Unusable) still count toward the per-tick work bound — they are
-not a `send_transaction` — and are **not** written to `rejected` or
-`rejected_combos`. When the bound cuts a bucket, a memory-only per-Process
-resume cursor starts the next tick at the first unprocessed Intention so a
-long persistently skippable prefix cannot starve later valid/refundable
-work. The cursor is dropped on restart (full rescan from the indexer
-head). A new Process outpoint is still a new combo; `SubmitRejected` is
-still combo-scoped, not a per-outpoint blacklist.
+For the audited v0.1.4 example ELF, exit 37 on a Process state with zero fee
+headroom pauses assembly until the state or Process code changes. Other guests
+continue through capped isolation. Intentions excluded during assembly stay
+live. The refund sweep has its own retry position under the filter refund
+policy.
 
 A singleton `{A, Process}` failure is **not** treated as proof that A is
 permanently invalid (`-302` / `-1102` / `-1108` may come from Process, lock,

@@ -629,6 +629,31 @@ mod tests {
             }
         }
 
+        impl crate::host_query::HostQueryRpc for OneProcess {
+            fn get_live_cell(&self, op: &OutPoint) -> Result<Option<LiveCell>, RpcError> {
+                Ok((&self.cell.out_point == op).then(|| self.cell.clone()))
+            }
+
+            fn get_block_hash(&self, _: u64) -> Result<Option<[u8; 32]>, RpcError> {
+                unreachable!()
+            }
+            fn get_header_by_number(&self, _: u64) -> Result<Option<Vec<u8>>, RpcError> {
+                unreachable!()
+            }
+            fn get_header(&self, _: &[u8; 32]) -> Result<Option<Vec<u8>>, RpcError> {
+                unreachable!()
+            }
+            fn get_cells_page(
+                &self,
+                _: &[u8],
+                _: u64,
+                _: u32,
+                _: &[u8],
+            ) -> Result<(Vec<crate::host_query::IndexedLiveCell>, Vec<u8>), RpcError> {
+                unreachable!()
+            }
+        }
+
         let rpc = OneProcess { cell: state };
         let entry = ProcessEntry {
             identity_type_hash: type_hash,

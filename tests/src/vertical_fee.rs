@@ -173,9 +173,7 @@ mod tests {
             affordable.out_point
         );
         assert!(loop_.rpc().has_cell(&expensive.out_point));
-        loop_.workers().get(&hash).unwrap().with_state(|s| {
-            assert!(s.isolate_expanded.is_empty());
-        });
+        assert_eq!(report.isolate_windows, 0);
 
         loop_.config_mut().refund_policy.fee_rate = DEFAULT_FEE_RATE;
         let report = loop_.tick();
@@ -206,12 +204,9 @@ mod tests {
 
         let report = loop_.tick();
         assert_eq!(report.submitted, 0, "{:?}", report.last_error);
+        assert_eq!(report.isolate_windows, 0);
         assert!(loop_.rpc().has_cell(&bounded.out_point));
         loop_.workers().get(&hash).unwrap().with_state(|s| {
-            assert!(
-                s.isolate_expanded.is_empty(),
-                "FeeUnaffordable must not isolate-split"
-            );
             assert!(
                 s.submit.rejected_combos.is_empty(),
                 "FeeUnaffordable must not cache rejected_combos"
@@ -332,10 +327,6 @@ mod tests {
         );
         loop_.workers().get(&hash).unwrap().with_state(|s| {
             assert!(
-                s.isolate_expanded.is_empty(),
-                "filter refund permanent reject must not isolate-split"
-            );
-            assert!(
                 !s.submit.rejected_combos.is_empty(),
                 "combo must be cached to avoid re-burn"
             );
@@ -357,10 +348,5 @@ mod tests {
             dry_cached,
             "cached filter refund must not dry-run again"
         );
-        assert!(loop_
-            .workers()
-            .get(&hash)
-            .unwrap()
-            .with_state(|s| s.isolate_expanded.is_empty()));
     }
 }

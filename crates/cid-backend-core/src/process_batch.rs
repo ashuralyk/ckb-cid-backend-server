@@ -20,28 +20,38 @@ use crate::worker_commands::{Submission, WorkerCommands};
 use crate::workers::ProcessWorkerState;
 use cid_process_executor::AssembledTx;
 use cid_protocol::CidArgs;
-use ckb_types::packed::{CellDep, OutPoint};
+use ckb_types::packed::{CellDep, CellOutput, OutPoint};
 use ckb_types::prelude::{Entity, Unpack};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 const LOG_TARGET: &str = "cid_backend";
 const MAX_COMPARISON_PROBES: usize = 64;
-const MAX_ARRIVAL_PROBES: usize = 16;
+const AUDITED_EXAMPLE_DATA_HASH: [u8; 32] = [
+    0x23, 0x74, 0xe4, 0x55, 0xd8, 0xcd, 0xca, 0xe5, 0xd5, 0x38, 0x72, 0x57, 0xec, 0x0d, 0x5b, 0x33,
+    0x11, 0x4d, 0x3b, 0x53, 0x38, 0xd8, 0x23, 0xd5, 0xe3, 0x88, 0xb5, 0xa0, 0xa7, 0x67, 0xf2, 0x26,
+];
 
 #[derive(Clone, Copy)]
 pub(crate) struct ProbeBudget {
     pub(crate) remaining: usize,
-    arrivals: usize,
+    scan_number: u64,
 }
 
 impl Default for ProbeBudget {
     fn default() -> Self {
+        Self::for_scan(0)
+    }
+}
+
+impl ProbeBudget {
+    pub(crate) fn for_scan(scan_number: u64) -> Self {
         Self {
             remaining: MAX_COMPARISON_PROBES,
-            arrivals: MAX_ARRIVAL_PROBES,
+            scan_number,
         }
     }
 }
@@ -66,6 +76,10 @@ pub enum BatchOutcome {
     ProcessOccupied,
     /// Leave cells live and advance to the next window without caching a verdict.
     RetryLater,
+    /// Resume the current subset search within this tick.
+    RetryIsolation,
+    /// The current window has no more subsets, so queued siblings can proceed.
+    IsolationExhausted,
     ProbePending,
     RpcUnavailable,
 }
@@ -276,9 +290,13 @@ where
     // The pinned guest preserves occupied capacity and pays a positive fee
     // from the Process state for every batch. A funded state can still return
     // exit 37 for some subsets, so only stop on verified zero headroom.
-    let no_fee_headroom =
+    let can_pause_on_exit_37 =
         cell_occupied_capacity(&process.live_cell.output, &process.live_cell.data)
-            .is_some_and(|occupied| process.live_cell.capacity() <= occupied);
+            .is_some_and(|occupied| process.live_cell.capacity() <= occupied)
+            && process.verdict_code_cell().is_some_and(|code| {
+                let data_hash: [u8; 32] = CellOutput::calc_data_hash(&code.data).unpack();
+                data_hash == AUDITED_EXAMPLE_DATA_HASH
+            });
     let mark_unfunded = || {
         tracing::warn!(target: LOG_TARGET, event = "assemble.process_unfunded",
             process_type_hash = %hex_pref(&hash), out_point = ?process.live_cell.out_point,
@@ -314,7 +332,7 @@ where
             Err(SsriError::Incompatible(PROCESS_LOCK_ARGS_INVALID)) => {
                 return mark_process_unhealthy(hash, process, &state, batch.len());
             }
-            Err(SsriError::Incompatible(STATE_CAPACITY_INSUFFICIENT)) if no_fee_headroom => {
+            Err(SsriError::Incompatible(STATE_CAPACITY_INSUFFICIENT)) if can_pause_on_exit_37 => {
                 return mark_unfunded();
             }
             Err(error) => {
@@ -331,16 +349,15 @@ where
     let prepared = if let Some(prepared) = prepared {
         prepared
     } else {
-        let candidates: HashMap<_, _> = batch
-            .iter()
-            .chain(rest)
-            .map(|item| (&item.out_point, item))
-            .collect();
+        let candidates: Vec<_> = batch.iter().chain(rest).collect();
         let mut probe = probe.unwrap_or_else(|| {
-            IsolationProbe::new(&process.live_cell.out_point, &batch, rest, min as usize)
+            IsolationProbe::new(
+                candidates.len(),
+                min as usize,
+                batch.len(),
+                budget.scan_number,
+            )
         });
-        probe.max = probe.max.max(batch.len());
-        probe.include_arrivals(batch.iter().chain(rest));
         let mut live = HashMap::new();
         let mut try_subset = |items: &[ScannedIntention]| {
             if mode != BatchMode::CheckAssembly
@@ -380,7 +397,7 @@ where
                 },
                 Err(error @ SsriError::Incompatible(PROCESS_LOCK_ARGS_INVALID)) => Err(error),
                 Err(error @ SsriError::Incompatible(STATE_CAPACITY_INSUFFICIENT))
-                    if no_fee_headroom =>
+                    if can_pause_on_exit_37 =>
                 {
                     Err(error)
                 }
@@ -397,14 +414,8 @@ where
         {
             let mut worker = state.lock().expect("process worker state");
             worker.probe_budget = budget;
-            if pending || matches!(result, Ok(Some(_))) {
+            if matches!(result, Ok(Some(_))) {
                 worker.isolation_probe = Some(probe);
-            } else if matches!(result, Ok(None)) {
-                worker.exhausted_isolation = Some(ExhaustedIsolation::new(
-                    process,
-                    execution_code_key,
-                    batch.iter().chain(rest),
-                ));
             }
         }
         match result {
@@ -418,7 +429,7 @@ where
             Err(SsriError::Incompatible(PROCESS_LOCK_ARGS_INVALID)) => {
                 return mark_process_unhealthy(hash, process, &state, batch.len());
             }
-            Err(SsriError::Incompatible(STATE_CAPACITY_INSUFFICIENT)) if no_fee_headroom => {
+            Err(SsriError::Incompatible(STATE_CAPACITY_INSUFFICIENT)) if can_pause_on_exit_37 => {
                 return mark_unfunded();
             }
             result => {
@@ -434,7 +445,7 @@ where
                 } else if checked {
                     BatchOutcome::AssemblyChecked
                 } else {
-                    BatchOutcome::RetryLater
+                    BatchOutcome::IsolationExhausted
                 };
                 return (outcome, report);
             }
@@ -444,13 +455,15 @@ where
         Ok(skeleton) => skeleton,
         Err(PreparationError::Rejected) => {
             let mut worker = state.lock().expect("process worker state");
-            return record_invalid_assembled_reject(
+            let isolation = advance_isolation(&mut worker);
+            let (outcome, delta) = record_invalid_assembled_reject(
                 &mut worker,
                 &batch,
                 process,
                 execution_code_key,
                 &mut report,
             );
+            return (isolation.unwrap_or(outcome), delta);
         }
         Err(PreparationError::InputLookup(error)) => {
             tracing::warn!(target: LOG_TARGET, event = "tick.skip",
@@ -478,14 +491,15 @@ where
     let fp = combo_fingerprint(&intent_ops, process_op.as_ref(), execution_code_key);
 
     {
-        let worker = state.lock().expect("process worker state");
+        let mut worker = state.lock().expect("process worker state");
         if worker.submit.rejected_combos.contains(&fp) {
+            let outcome = advance_isolation(&mut worker).unwrap_or(BatchOutcome::CachedRejected);
             tracing::debug!(
                 target: LOG_TARGET,
                 event = "submit.rejected_combo",
                 n = batch.len(),
             );
-            return (BatchOutcome::CachedRejected, report);
+            return (outcome, report);
         }
     }
 
@@ -497,25 +511,27 @@ where
         .collect();
 
     let isolate_conflict = |worker: &mut ProcessWorkerState| {
-        if let Some(probe) = &mut worker.isolation_probe {
-            probe.advance_selected();
-        } else if batch.len() > min as usize || !rest.is_empty() {
-            worker.isolation_probe = Some(IsolationProbe::new(
-                &process.live_cell.out_point,
-                &batch,
-                rest,
-                min as usize,
-            ));
-        } else {
-            return BatchOutcome::RetryLater;
+        if let Some(outcome) = advance_isolation(worker) {
+            return outcome;
         }
-        BatchOutcome::Continue
+        if batch.len() > min as usize || !rest.is_empty() {
+            worker.isolation_probe = Some(IsolationProbe::new(
+                batch.len() + rest.len(),
+                min as usize,
+                batch.len(),
+                budget.scan_number,
+            ));
+            BatchOutcome::RetryIsolation
+        } else {
+            BatchOutcome::IsolationExhausted
+        }
     };
 
     // Dry-run without holding the state mutex.
     match dry_run_gate(rpc.as_ref(), &skeleton.tx) {
         DryRunGate::Rejected(m) => {
             let mut worker = state.lock().expect("process worker state");
+            let outcome = advance_isolation(&mut worker).unwrap_or(BatchOutcome::Rejected);
             worker.submit.rejected_combos.insert(fp);
             tracing::warn!(
                 target: LOG_TARGET,
@@ -524,7 +540,7 @@ where
                 n = batch.len(),
             );
             report.last_error = Some(format!("dry-run rejected: {m}"));
-            return (BatchOutcome::Rejected, report);
+            return (outcome, report);
         }
         DryRunGate::Skip(RpcError::Conflict(m)) => {
             let mut worker = state.lock().expect("process worker state");
@@ -560,8 +576,8 @@ where
                 tx_hash = %hex_pref(tx_hash.as_slice()),
             );
             report.submitted += 1;
+            worker.isolation_probe = None;
             if consumed_process {
-                worker.isolation_probe = None;
                 (BatchOutcome::SubmittedProcess, report)
             } else {
                 (BatchOutcome::Submitted, report)
@@ -579,6 +595,7 @@ where
             (outcome, report)
         }
         Err(RpcError::SubmitRejected(m)) => {
+            let outcome = advance_isolation(&mut worker).unwrap_or(BatchOutcome::Rejected);
             worker.submit.rejected_combos.insert(fp);
             tracing::warn!(
                 target: LOG_TARGET,
@@ -587,7 +604,7 @@ where
                 n = batch.len(),
             );
             report.last_error = Some(format!("submit rejected: {m}"));
-            (BatchOutcome::Rejected, report)
+            (outcome, report)
         }
         Err(e) => {
             tracing::warn!(
@@ -657,184 +674,36 @@ fn prepare_execution(
     Ok(skeleton)
 }
 
-/// Back off after exhausting the subsets. The candidate set may be rotated
-/// by the window cursor, so key it independently of that order.
-pub(crate) struct ExhaustedIsolation {
-    fingerprint: Vec<u8>,
-    pub(crate) polls_remaining: u8,
-}
-
-impl ExhaustedIsolation {
-    pub(crate) fn new<'a>(
-        process: &ResolvedProcess,
-        execution_code_key: &[u8],
-        items: impl Iterator<Item = &'a ScannedIntention>,
-    ) -> Self {
-        Self {
-            fingerprint: Self::fingerprint(process, execution_code_key, items),
-            // Skip the next three successful scans and retry on the fourth.
-            polls_remaining: 4,
-        }
-    }
-
-    pub(crate) fn matches(
-        &self,
-        process: &ResolvedProcess,
-        execution_code_key: &[u8],
-        items: &[ScannedIntention],
-    ) -> bool {
-        self.fingerprint == Self::fingerprint(process, execution_code_key, items.iter())
-    }
-
-    fn fingerprint<'a>(
-        process: &ResolvedProcess,
-        execution_code_key: &[u8],
-        items: impl Iterator<Item = &'a ScannedIntention>,
-    ) -> Vec<u8> {
-        let mut ops: Vec<_> = items.map(|item| item.out_point.clone()).collect();
-        ops.sort_unstable_by(|a, b| a.as_slice().cmp(b.as_slice()));
-        combo_fingerprint(&ops, Some(&process.live_cell.out_point), execution_code_key)
-    }
-}
-
-/// Keep positions stable across scans. The original search and each group of
-/// arrivals cover disjoint subsets of the same list. Within the arrival
-/// budget, give the newest group the first turn and rotate through the rest.
+/// Enumerate subsets within one tick. The digest loop redispatches the same
+/// window and rest when an isolated subset conflicts or is rejected.
 pub(crate) struct IsolationProbe {
-    process: OutPoint,
-    candidates: Vec<OutPoint>,
-    min: usize,
+    order: Vec<usize>,
     max: usize,
-    older: SubsetSearch,
-    arrivals: VecDeque<SubsetSearch>,
-    selected_from_arrivals: Option<bool>,
-}
-
-struct SubsetSearch {
-    end: usize,
-    /// If set, enumerate from the newest end and require an arrival.
-    arrival_count: Option<usize>,
     indices: Option<Vec<usize>>,
 }
 
 impl IsolationProbe {
-    fn new(
-        process: &OutPoint,
-        batch: &[ScannedIntention],
-        rest: &[ScannedIntention],
-        min: usize,
-    ) -> Self {
-        let candidates: Vec<_> = batch
-            .iter()
-            .chain(rest)
-            .map(|item| item.out_point.clone())
-            .collect();
-        let max = batch.len();
-        let mut older = SubsetSearch::new(candidates.len(), min, None);
-        if max == min {
-            older.advance(max);
+    fn new(count: usize, min: usize, max: usize, scan_number: u64) -> Self {
+        let mut order: Vec<_> = (0..count).collect();
+        // Keep nearby candidates first. For large searches, vary the rest
+        // with the scan number so a fixed prefix cannot claim every tick.
+        if scan_number != 0 && exceeds_probe_budget(count, min, max) {
+            order[(min + 1).min(count)..].sort_by_cached_key(|index| {
+                let mut hasher = DefaultHasher::new();
+                (scan_number, index).hash(&mut hasher);
+                hasher.finish()
+            });
         }
-        Self {
-            process: process.clone(),
-            candidates,
-            min,
+        let mut probe = Self {
+            order,
             max,
-            older,
-            arrivals: VecDeque::new(),
-            selected_from_arrivals: None,
-        }
-    }
-
-    pub(crate) fn matches(&self, process: &OutPoint, min: u32) -> bool {
-        self.process == *process && self.min == min as usize
-    }
-
-    fn has_work(&self) -> bool {
-        self.older.has_work() || !self.arrivals.is_empty()
-    }
-
-    fn advance_selected(&mut self) {
-        match self.selected_from_arrivals.take() {
-            Some(true) => {
-                let group = self.arrivals.back_mut().expect("selected arrival group");
-                group.advance(self.max);
-                if !group.has_work() {
-                    self.arrivals.pop_back();
-                }
-            }
-            Some(false) => self.older.advance(self.max),
-            None => {}
-        }
-    }
-
-    fn include_arrivals<'a>(&mut self, current: impl Iterator<Item = &'a ScannedIntention>) {
-        let known: HashSet<_> = self.candidates.iter().collect();
-        let arrivals: Vec<_> = current
-            .filter(|item| !known.contains(&item.out_point))
-            .map(|item| item.out_point.clone())
-            .collect();
-        if arrivals.is_empty() {
-            return;
-        }
-        self.arrivals.push_front(SubsetSearch::new(
-            self.candidates.len() + arrivals.len(),
-            self.min,
-            Some(arrivals.len()),
-        ));
-        self.candidates.extend(arrivals);
-    }
-
-    fn search<T>(
-        &mut self,
-        candidates: &HashMap<&OutPoint, &ScannedIntention>,
-        budget: &mut ProbeBudget,
-        attempt: &mut impl FnMut(&[ScannedIntention]) -> Result<Option<T>, SsriError>,
-    ) -> Result<Option<(Vec<ScannedIntention>, T)>, SsriError> {
-        self.selected_from_arrivals = None;
-        let snapshot: Vec<_> = self
-            .candidates
-            .iter()
-            .map(|op| candidates.get(op).copied())
-            .collect();
-        let arrival_budget = if self.older.has_work() {
-            budget.remaining.min(budget.arrivals)
-        } else {
-            budget.remaining
-        };
-        for _ in 0..arrival_budget {
-            let Some(mut group) = self.arrivals.pop_front() else {
-                break;
-            };
-            let mut turn = 1;
-            let result = group.search(&snapshot, self.max, &mut turn, attempt);
-            let used = 1 - turn;
-            budget.remaining -= used;
-            budget.arrivals = budget.arrivals.saturating_sub(used);
-            if group.has_work() {
-                self.arrivals.push_back(group);
-            }
-            if let Some(found) = result? {
-                self.selected_from_arrivals = Some(true);
-                return Ok(Some(found));
-            }
-        }
-        let result = self
-            .older
-            .search(&snapshot, self.max, &mut budget.remaining, attempt)?;
-        if result.is_some() {
-            self.selected_from_arrivals = Some(false);
-        }
-        Ok(result)
-    }
-}
-
-impl SubsetSearch {
-    fn new(end: usize, min: usize, arrival_count: Option<usize>) -> Self {
-        Self {
-            end,
-            arrival_count,
             indices: Some((0..min).collect()),
+        };
+        if max == min {
+            // The first subset is the original window and was already tried.
+            probe.advance();
         }
+        probe
     }
 
     fn has_work(&self) -> bool {
@@ -843,68 +712,74 @@ impl SubsetSearch {
 
     fn search<T>(
         &mut self,
-        snapshot: &[Option<&ScannedIntention>],
-        max: usize,
-        budget: &mut usize,
+        candidates: &[&ScannedIntention],
+        budget: &mut ProbeBudget,
         attempt: &mut impl FnMut(&[ScannedIntention]) -> Result<Option<T>, SsriError>,
     ) -> Result<Option<(Vec<ScannedIntention>, T)>, SsriError> {
-        while let Some(indices) = self.indices.as_ref().filter(|_| *budget > 0) {
-            *budget -= 1;
-            let items: Option<Vec<_>> = if self.arrival_count.is_some() {
-                indices
-                    .iter()
-                    .rev()
-                    .map(|&i| snapshot[self.end - 1 - i].cloned())
-                    .collect()
-            } else {
-                indices.iter().map(|&i| snapshot[i].cloned()).collect()
-            };
-            if let Some(items) = items {
-                let mut locks = HashSet::new();
-                if !items.iter().all(|item| locks.insert(item.lock_group_key())) {
-                    self.advance(max);
-                    continue;
-                }
+        while let Some(indices) = self.indices.as_ref().filter(|_| budget.remaining > 0) {
+            budget.remaining -= 1;
+            let mut positions: Vec<_> = indices.iter().map(|&i| self.order[i]).collect();
+            positions.sort_unstable(); // Preserve the candidate order within each batch.
+            let mut locks = HashSet::new();
+            if positions
+                .iter()
+                .all(|&i| locks.insert(candidates[i].lock_group_key()))
+            {
+                let items: Vec<_> = positions.iter().map(|&i| candidates[i].clone()).collect();
                 if let Some(assembled) = attempt(&items)? {
-                    // Keep this position for transient RPC errors. A conflict
-                    // advances it and a cached rejection skips it on resume.
                     return Ok(Some((items, assembled)));
                 }
             }
-            self.advance(max);
+            self.advance();
         }
         Ok(None)
     }
 
-    fn advance(&mut self, max: usize) {
+    fn advance(&mut self) {
         let indices = self.indices.as_mut().expect("active subset search");
-        if !advance_probe_indices(indices, self.end, self.arrival_count.unwrap_or(self.end)) {
-            let next_size = indices.len() + 1;
-            self.indices = (next_size <= self.end.min(max)).then(|| (0..next_size).collect());
+        // Exhaust nearby subsets before including a later candidate.
+        for i in 0..indices.len() {
+            let limit = indices.get(i + 1).copied().unwrap_or(self.order.len());
+            if indices[i] + 1 < limit {
+                indices[i] += 1;
+                for (initial, index) in indices[..i].iter_mut().enumerate() {
+                    *index = initial;
+                }
+                return;
+            }
         }
+        let next_size = indices.len() + 1;
+        self.indices = (next_size <= self.max).then(|| (0..next_size).collect());
     }
 }
 
-/// Exhaust nearby subsets before including a later candidate.
-fn advance_probe_indices(
-    indices: &mut [usize],
-    candidate_count: usize,
-    first_limit: usize,
-) -> bool {
-    for i in 0..indices.len() {
-        let mut limit = indices.get(i + 1).copied().unwrap_or(candidate_count);
-        if i == 0 {
-            limit = limit.min(first_limit);
-        }
-        if indices[i] + 1 < limit {
-            indices[i] += 1;
-            for (initial, index) in indices[..i].iter_mut().enumerate() {
-                *index = initial;
+fn exceeds_probe_budget(count: usize, min: usize, max: usize) -> bool {
+    let mut remaining = MAX_COMPARISON_PROBES;
+    for size in min..=max {
+        let mut subsets = 1usize;
+        for i in 0..size.min(count - size) {
+            subsets = subsets.saturating_mul(count - i) / (i + 1);
+            if subsets > remaining {
+                return true;
             }
-            return true;
         }
+        let Some(next) = remaining.checked_sub(subsets) else {
+            return true;
+        };
+        remaining = next;
     }
     false
+}
+
+fn advance_isolation(worker: &mut ProcessWorkerState) -> Option<BatchOutcome> {
+    let probe = worker.isolation_probe.as_mut()?;
+    probe.advance();
+    if probe.has_work() {
+        Some(BatchOutcome::RetryIsolation)
+    } else {
+        worker.isolation_probe = None;
+        Some(BatchOutcome::IsolationExhausted)
+    }
 }
 
 fn mark_process_unhealthy(
@@ -918,8 +793,6 @@ fn mark_process_unhealthy(
         code = PROCESS_LOCK_ARGS_INVALID, reason = "ProcessLockArgsInvalid");
     let mut worker = state.lock().expect("process worker state");
     worker.quarantine_process(process);
-    worker.isolate_pending.clear();
-    worker.isolate_resume = None;
     worker.isolation_probe = None;
     (
         BatchOutcome::Continue,

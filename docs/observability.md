@@ -24,7 +24,7 @@ Stable field `event` (target `cid_backend`):
 | `assemble.batch_failed` | Assembly error and attempted Intention outpoints |
 | `assemble.probe_failed` | Assembly error for a subset examined during isolation |
 | `assemble.invalid` | The assembled transaction failed structural or funding-input validation |
-| `assemble.process_unfunded` | Exit 37 and zero state fee headroom paused assembly for the state and code |
+| `assemble.process_unfunded` | Exit 37 from the audited v0.1.4 example ELF with zero state fee headroom paused assembly for the state and code |
 | `assemble.batch_isolated` | Working subset found during isolation |
 | `process.unhealthy` | Exit 41 quarantined the Process state/code pair and paused its filter refunds |
 | `ssri.filter_failed` | Filter error deferred the Process bucket |

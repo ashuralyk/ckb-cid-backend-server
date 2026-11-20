@@ -150,6 +150,12 @@ fn main() {
                 config.cid_lock_code_hash,
                 config.hash_type,
             ),
+            get_live_cell: {
+                let rpc = registry_rpc.clone();
+                Arc::new(move |out_point| {
+                    cid_backend_core::HostQueryRpc::get_live_cell(rpc.as_ref(), out_point)
+                })
+            },
             find_process_state: Arc::new(move |script| {
                 cid_backend_core::Rpc::find_live_cells_by_type_script(
                     registry_rpc.as_ref(),

@@ -170,10 +170,8 @@ mod tests {
         assert!(seen.iter().all(|b| b != &state_elf));
     }
 
-    /// Type-ID execution_code_key rotation must clear isolate_pending and
-    /// isolate_resume (same as rejected_combos / isolate_expanded).
     #[test]
-    fn type_id_execution_code_key_rotation_clears_isolate_pending_and_resume() {
+    fn type_id_execution_code_key_rotation_clears_rejected_combos() {
         let cid_args = [0xa9; 32];
         let code_args = worker_code_args();
         let rpc = FakeRpc::new();
@@ -200,9 +198,6 @@ mod tests {
 
         loop_.workers().get(&hash).unwrap().with_state_mut(|s| {
             s.submit.rejected_combos.insert(vec![0xAA]);
-            s.isolate_expanded.insert(vec![0xBB]);
-            s.isolate_pending.push(Vec::new());
-            s.isolate_resume = Some(vec![0xCC]);
         });
 
         loop_.rpc().consume(&cid_v1.out_point);
@@ -215,18 +210,6 @@ mod tests {
             assert!(
                 s.submit.rejected_combos.is_empty(),
                 "rejected_combos must clear on Type-ID code rotation"
-            );
-            assert!(
-                s.isolate_expanded.is_empty(),
-                "isolate_expanded must clear on Type-ID code rotation"
-            );
-            assert!(
-                s.isolate_pending.is_empty(),
-                "isolate_pending must clear on Type-ID code rotation"
-            );
-            assert!(
-                s.isolate_resume.is_none(),
-                "isolate_resume must clear on Type-ID code rotation"
             );
         });
     }

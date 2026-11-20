@@ -1,4 +1,5 @@
 use crate::fee::CidLockIdentity;
+use crate::host_query::HostQueryRpc;
 use crate::rpc::{out_point_key, script_hash32, LiveCell, Rpc, RpcError};
 use crate::type_id::{TypeIdIdentity, TYPE_ID_CODE_HASH};
 use cid_process_example_policy::ProcessLockArgs;
@@ -93,7 +94,7 @@ impl ProcessResolver {
         self.tick_process_code = code.cloned();
     }
 
-    pub fn resolve<R: Rpc>(
+    pub fn resolve<R: Rpc + HostQueryRpc>(
         &mut self,
         rpc: &R,
         process_type_hash: &[u8; 32],
@@ -121,6 +122,13 @@ impl ProcessResolver {
             return Ok(None);
         }
         let cell = matches.into_iter().next().expect("len==1");
+        if rpc.get_live_cell(&cell.out_point)?.as_ref() != Some(&cell) {
+            log::warn!(
+                "node could not confirm indexed Process state {:?}",
+                cell.out_point
+            );
+            return Ok(None);
+        }
         if !state_is_process_lock(&self.entry, &cell) {
             log::warn!("live Process cell failed Process-as-lock validation");
             return Ok(None);
@@ -325,6 +333,35 @@ mod tests {
         }
     }
 
+    impl crate::host_query::HostQueryRpc for TestRpc {
+        fn get_live_cell(&self, op: &OutPoint) -> Result<Option<LiveCell>, RpcError> {
+            Ok(self
+                .cell
+                .borrow()
+                .clone()
+                .filter(|cell| &cell.out_point == op))
+        }
+
+        fn get_block_hash(&self, _: u64) -> Result<Option<[u8; 32]>, RpcError> {
+            unreachable!()
+        }
+        fn get_header_by_number(&self, _: u64) -> Result<Option<Vec<u8>>, RpcError> {
+            unreachable!()
+        }
+        fn get_header(&self, _: &[u8; 32]) -> Result<Option<Vec<u8>>, RpcError> {
+            unreachable!()
+        }
+        fn get_cells_page(
+            &self,
+            _: &[u8],
+            _: u64,
+            _: u32,
+            _: &[u8],
+        ) -> Result<(Vec<crate::host_query::IndexedLiveCell>, Vec<u8>), RpcError> {
+            unreachable!()
+        }
+    }
+
     fn test_entry(state_args: [u8; 32], code_args: [u8; 32]) -> ProcessEntry {
         ProcessEntry {
             identity_type_hash: type_id_script_hash(&state_args),
@@ -480,6 +517,31 @@ mod tests {
             }
         }
         let code = code_live(0x10, vec![0x7f, b'E', b'L', b'F']);
+        impl crate::host_query::HostQueryRpc for AmbiguousRpc {
+            fn get_live_cell(&self, _: &OutPoint) -> Result<Option<LiveCell>, RpcError> {
+                unreachable!("ambiguous indexer result must defer before checking the node")
+            }
+
+            fn get_block_hash(&self, _: u64) -> Result<Option<[u8; 32]>, RpcError> {
+                unreachable!()
+            }
+            fn get_header_by_number(&self, _: u64) -> Result<Option<Vec<u8>>, RpcError> {
+                unreachable!()
+            }
+            fn get_header(&self, _: &[u8; 32]) -> Result<Option<Vec<u8>>, RpcError> {
+                unreachable!()
+            }
+            fn get_cells_page(
+                &self,
+                _: &[u8],
+                _: u64,
+                _: u32,
+                _: &[u8],
+            ) -> Result<(Vec<crate::host_query::IndexedLiveCell>, Vec<u8>), RpcError> {
+                unreachable!()
+            }
+        }
+
         let rpc = AmbiguousRpc {
             cells: vec![cell_a, cell_b],
         };

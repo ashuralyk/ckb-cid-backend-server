@@ -5,8 +5,8 @@ use crate::host_query::HostQueryRpc;
 use crate::process::ResolvedProcess;
 use crate::process::{ProcessEntry, ProcessResolver};
 use crate::process_batch::{
-    run_process_batch, BatchMode, BatchOutcome, BatchReportDelta, ExhaustedIsolation,
-    IsolationProbe, ProbeBudget, ProcessBatchParams,
+    run_process_batch, BatchMode, BatchOutcome, BatchReportDelta, IsolationProbe, ProbeBudget,
+    ProcessBatchParams,
 };
 use crate::rpc::{LiveCell, Rpc};
 use crate::scan::ScannedIntention;
@@ -14,7 +14,7 @@ use crate::ssri::SsriHost;
 use crate::submit::SubmitState;
 use crate::worker_commands::WorkerCommands;
 use ckb_types::packed::{CellDep, OutPoint};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -43,19 +43,13 @@ pub struct ProcessWorkerState {
     pub entry: ProcessEntry,
     pub resolver: ProcessResolver,
     pub submit: SubmitState,
-    pub isolate_resume: Option<Vec<u8>>,
-    pub isolate_expanded: HashSet<Vec<u8>>,
-    /// Stack frames queued by async Rejected/CachedRejected (drop_first + shrink)
-    /// or leftover frames saved on ProcessOccupied. Consumed by the next
-    /// `isolate_window` instead of re-deriving via `already`.
-    pub isolate_pending: Vec<Vec<ScannedIntention>>,
     pub(crate) refund_cursor: Option<OutPoint>,
     pub(crate) filter_refund_deferred: bool,
     pub(crate) refund_assembly_checked: bool,
     /// State dependencies of submitted filter refunds, keyed by transaction.
     pub(crate) refund_state_deps: HashMap<Vec<u8>, OutPoint>,
+    /// Subset progress for follow-up worker jobs within the current tick.
     pub(crate) isolation_probe: Option<IsolationProbe>,
-    pub(crate) exhausted_isolation: Option<ExhaustedIsolation>,
     unfunded_process: Option<(OutPoint, Option<OutPoint>)>,
     pub(crate) probe_budget: ProbeBudget,
     pub generation: u64,
@@ -77,15 +71,11 @@ impl ProcessWorkerState {
             entry,
             resolver,
             submit: SubmitState::default(),
-            isolate_resume: None,
-            isolate_expanded: HashSet::new(),
-            isolate_pending: Vec::new(),
             refund_cursor: None,
             filter_refund_deferred: false,
             refund_assembly_checked: false,
             refund_state_deps: HashMap::new(),
             isolation_probe: None,
-            exhausted_isolation: None,
             unfunded_process: None,
             probe_budget: ProbeBudget::default(),
             generation,
@@ -100,6 +90,7 @@ impl ProcessWorkerState {
             if self.last_process_code.as_ref() != Some(&cell.out_point) {
                 self.last_process_code = Some(cell.out_point.clone());
                 self.filter_missing_logged = false;
+                self.unfunded_process = None;
                 self.clear_execution_rejections();
             }
         }
@@ -145,13 +136,8 @@ impl ProcessWorkerState {
 
     pub(crate) fn clear_execution_rejections(&mut self) {
         self.submit.rejected_combos.clear();
-        self.isolate_expanded.clear();
-        self.isolate_pending.clear();
-        self.isolate_resume = None;
         self.refund_cursor = None;
         self.isolation_probe = None;
-        self.exhausted_isolation = None;
-        self.unfunded_process = None;
     }
 
     pub(crate) fn has_pending_filter_refund(&self, state: &OutPoint) -> bool {
@@ -191,8 +177,6 @@ struct PendingBatch {
     reply: Receiver<(BatchOutcome, BatchReportDelta)>,
     /// Isolate window fingerprint for the outstanding batch (digest loop).
     window_fp: Vec<u8>,
-    /// Resume key after Continue/Submitted (first of `rest`); Rejected keeps window.
-    resume_on_continue: Option<Vec<u8>>,
     /// Window + rest + min so Rejected can push the sync drop_first/shrink frames.
     window: Vec<ScannedIntention>,
     rest: Arc<[ScannedIntention]>,
@@ -205,7 +189,6 @@ pub struct PolledBatch {
     pub outcome: BatchOutcome,
     pub delta: BatchReportDelta,
     pub window_fp: Vec<u8>,
-    pub resume_on_continue: Option<Vec<u8>>,
     pub window: Vec<ScannedIntention>,
     pub rest: Arc<[ScannedIntention]>,
     pub min: u32,
@@ -222,7 +205,7 @@ pub struct ProcessWorker {
     epoch: Arc<AtomicU64>,
     /// True while a RunBatch is outstanding (sent, reply not yet consumed).
     batch_outstanding: Arc<AtomicBool>,
-    /// Non-blocking reply slot — digest loop polls next ticks (P1).
+    /// Non-blocking reply slot — digest loop polls within the tick (P1).
     pending: Mutex<Option<PendingBatch>>,
 }
 
@@ -271,7 +254,6 @@ impl ProcessWorker {
                     outcome: result.0,
                     delta: result.1,
                     window_fp: pending.window_fp,
-                    resume_on_continue: pending.resume_on_continue,
                     window: pending.window,
                     rest: pending.rest,
                     min: pending.min,
@@ -289,7 +271,6 @@ impl ProcessWorker {
                         ..BatchReportDelta::default()
                     },
                     window_fp: pending.window_fp,
-                    resume_on_continue: pending.resume_on_continue,
                     window: pending.window,
                     rest: pending.rest,
                     min: pending.min,
@@ -302,7 +283,7 @@ impl ProcessWorker {
     /// Dispatch RunBatch without blocking the digest loop (P1).
     ///
     /// One in-flight batch per Process (`batch_outstanding`). Outcomes are
-    /// collected via [`try_poll_batch`] on later ticks.
+    /// collected via [`try_poll_batch`] within the same tick.
     #[allow(clippy::too_many_arguments)]
     pub fn start_batch(
         &self,
@@ -314,7 +295,6 @@ impl ProcessWorker {
         refund_policy: RefundPolicy,
         max_assembled_tx_bytes: usize,
         window_fp: Vec<u8>,
-        resume_on_continue: Option<Vec<u8>>,
         rest: Vec<ScannedIntention>,
         min: u32,
         mode: BatchMode,
@@ -356,7 +336,6 @@ impl ProcessWorker {
         *slot = Some(PendingBatch {
             reply: reply_rx,
             window_fp,
-            resume_on_continue,
             window: batch,
             rest,
             min,
@@ -607,6 +586,7 @@ where
                     if code_changed {
                         state.last_process_code = None;
                         state.filter_missing_logged = false;
+                        state.unfunded_process = None;
                         state.clear_execution_rejections();
                     }
                 });
@@ -759,7 +739,6 @@ mod tests {
         assert!(pool.register(e1.clone()).unwrap());
         pool.get(&hash).unwrap().with_state_mut(|w| {
             w.submit.in_flight.insert(vec![0xaa]);
-            w.isolate_resume = Some(vec![0xbb]);
         });
 
         let mut e1b = e1.clone();
@@ -767,12 +746,11 @@ mod tests {
         assert!(!pool.register(e1b).unwrap());
         pool.get(&hash).unwrap().with_state(|w| {
             assert!(w.submit.in_flight.contains(&vec![0xaa]));
-            assert_eq!(w.isolate_resume.as_deref(), Some(&[0xbb][..]));
         });
     }
 
     #[test]
-    fn register_code_change_clears_rejected_combos_and_isolate_expanded() {
+    fn register_code_change_clears_rejected_combos() {
         let mut pool = WorkerPool::from_entries(
             vec![entry([0x10; 32], [0x20; 32])],
             Arc::new(EmptyRpc),
@@ -781,16 +759,10 @@ mod tests {
         let hash = type_id_script_hash(&[0x10; 32]);
         pool.get(&hash).unwrap().with_state_mut(|w| {
             w.submit.rejected_combos.insert(vec![0x01]);
-            w.isolate_expanded.insert(vec![0x02]);
-            w.isolate_pending.push(Vec::new());
-            w.isolate_resume = Some(vec![0x03]);
         });
         assert!(!pool.register(entry([0x10; 32], [0x21; 32])).unwrap());
         pool.get(&hash).unwrap().with_state(|w| {
             assert!(w.submit.rejected_combos.is_empty());
-            assert!(w.isolate_expanded.is_empty());
-            assert!(w.isolate_pending.is_empty());
-            assert!(w.isolate_resume.is_none());
         });
     }
 

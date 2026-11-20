@@ -74,7 +74,9 @@ The state cell lock uses `code_hash` equal to `code_type_id` above and `hash_typ
 - `code_*` = Process **code** cell Type ID (lock `code_hash` + SSRI ELF).
 - Optional `*_type_id` fields fail-closed if they disagree with derived hashes.
 - Idempotent re-register; replacing `code_*` for the same identity updates the
-  binding. Bounded by `registry.max_entries` (default 64).
+  binding. The node must confirm the indexer's Process state outpoint, output,
+  and data before the API persists either operation. Bounded by
+  `registry.max_entries` (default 64).
 - DELETE returns 404 if missing. After deletion is queued, the worker stops
   accepting new batches. It continues tracking pending transactions until it
   can shut down (`process.delete_deferred`).
@@ -84,7 +86,8 @@ register/delete persist immediately and enqueue live worker spawn/stop.
 
 ## Host queries
 
-During `Process.assemble`, the live digest path passes an RPC-backed
+The daemon loads the SSRI ELF from the registered Process code cell. During
+`Process.assemble`, the live digest path passes an RPC-backed
 `RpcHostQuery` into `ProcessExecutor::assemble` (generic over `HostQuery`).
 Every host-query syscall (`find_cell_by_out_point` 2287, `find_cell_data`
 2297, `get_live_cell` 2317, `get_header` 2327, `get_header_by_number` 2337,
@@ -97,9 +100,9 @@ script raw bytes then block/tx/output index (see contract
 
 Pinned `cid_process_example` pays the digest fee from Process state and rejects extra funding inputs with exit 38 (`UnsupportedFundingLock`).
 
-Assembly errors log `assemble.batch_failed`. Exit 21 can report a batch mismatch and exit 37 can report insufficient state capacity. The worker probes legal subsets of the filter-accepted cells, starting at the minimum size and including shifted batches across window boundaries. Windows and probes take at most one input per full CID lock script. A dry-run or submit conflict starts or advances isolation when alternatives are available. Exits 32, 36, 39, 40 and other assembly errors use the same search. Each assembled subset goes through validation and guest-added funding checks before dry-run. When a funding input is non-live, isolation skips the subset. When the lookup is unavailable, isolation keeps its position for retry. A structurally invalid transaction advances the subset cursor during a deferred refund’s assembly check. Excluded cells stay live and are eligible for a fresh filter pass on later ticks.
+Assembly errors log `assemble.batch_failed`. Exit 21 can report a batch mismatch and exit 37 can report insufficient state capacity. The worker probes legal subsets of the filter-accepted cells, starting at the minimum size and including shifted batches across window boundaries. Windows and probes take at most one input per full CID lock script. A dry-run or submit conflict starts or advances isolation within the tick when alternatives and budget are available. Probes skip non-live Intentions and subsets with non-live guest-added funding inputs. If a funding lookup is unavailable, the search defers to the next tick. During a deferred refund’s assembly check, a structurally invalid transaction advances the search to the next subset.
 
-Each Process gets 64 subset probes per tick. While the original search runs, up to 16 go to subsets containing arrivals, paired with each other or with existing candidates. The newest group gets the first turn and earlier arrival groups resume in rotation. Both searches retain their cursors across ticks for the same Process snapshot. Natural exhaustion pauses assembly for the next three successful scans. Exit 37 on a state with zero fee headroom pauses assembly until the state or execution code changes, even if new Intentions arrive.
+Each Process gets 64 subset probes per tick. Each tick starts a fresh scan of the current candidates, including Intentions revived by a reorg. For large candidate sets, probe order varies between ticks. Exit 37 pauses assembly only for the audited v0.1.4 example ELF on a state with zero fee headroom. The pause lasts until the state or Process code changes. Other guests continue through capped isolation. Excluded cells stay live and are eligible for a fresh filter pass on later ticks.
 
 Exit 41 (invalid Process state lock args) from either initial assembly or a probe logs `process.unhealthy`, clears pending isolation work, and pauses assembly and filter refunds for that state and code version.
 

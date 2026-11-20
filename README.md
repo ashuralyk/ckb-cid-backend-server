@@ -205,8 +205,10 @@ flowchart TD
   scan -->|Unavailable| endScan["tick.end / keep occupancy"]
   scan --> filter["filter in_flight / rejected"]
   filter --> bucket["bucket by process_type_hash"]
-  bucket --> resolve["ProcessResolver SSRI source:<br/>Type-ID code ELF or legacy state ELF"]
-  resolve --> verdict["SSRI Process.filter"]
+  bucket --> resolve["Resolve Process state and verify it with the node"]
+  resolve -->|Missing or mismatched state| deferred
+  resolve --> code["Load SSRI ELF from the registered Process code cell"]
+  code --> verdict["SSRI Process.filter"]
   verdict -->|0| bounds["SSRI Process.batch → min,max"]
   verdict -->|1| logOnly["Log and leave cell live"]
   verdict -->|4–7| refund["Verify live snapshots and pin Process deps"]
@@ -224,7 +226,8 @@ flowchart TD
   gate --> send["send_transaction"]
   send -->|ok| pending["pending occupancy<br/>wait confirmation_depth"]
   send -->|SubmitRejected| combo["record combo fingerprint and keep splitting"]
-  send -->|Conflict / Unavailable| retry["no occupancy this tick; retry next tick"]
+  send -->|Conflict| isolate
+  send -->|Unavailable| retry["Defer without taking occupancy"]
   split --> isolate
   combo --> isolate
 ```
@@ -234,12 +237,12 @@ Each tick ([`digest_loop.rs`](crates/cid-backend-core/src/digest_loop.rs)):
 1. Refresh tip and reconcile `pending` (confirmation / reorg) **before** Type-ID code-dep refresh, so unavailable code deps never stall settlement.
 2. Resolve Type-ID code cells with a bounded exact search and merge their dependencies with static extras. SSRI uses the live Process code-cell ELF. The Process state lock references that code Type ID with `hash_type=type`.
 3. Scan live Intentions; skip cells whose lock args fail to decode.
-4. Filter each Process bucket before selecting legal `[min, max]` sub-batches. Transaction rejection fingerprints include Type-ID code outpoints so code upgrades clear stale `CachedRejected` without dropping `pending` / `in_flight`.
+4. Resolve the indexed Process state and confirm its outpoint, output, and data with the node. Filter each Process bucket before selecting legal `[min, max]` sub-batches. Transaction rejection fingerprints include Type-ID code outpoints so code upgrades clear stale `CachedRejected` without dropping `pending` / `in_flight`.
 5. Resolve assembly outcomes before submitting filter refunds. Exit 41 also blocks that state's filter refunds.
 
 ### Memory-only state and restart
 
-Occupancy, rejected combinations, isolation progress, and refund retry state are held in memory. After restart, the daemon rescans from the indexer head. A transaction still in the mempool may be submitted again (D6). Already-spent cells surface as `Conflict`.
+Occupancy, rejected combinations, and refund retry state are held in memory. After restart, the daemon rescans from the indexer head. A transaction still in the mempool may be submitted again (D6). Already-spent cells surface as `Conflict`.
 
 ### Confirmation depth and reorg
 
@@ -272,13 +275,10 @@ Committed status requires a valid `block_hash`. The adapter uses the reported `b
 
 `SubmitRejected` fingerprints the ordered Intention outpoints, the Process state outpoint, and the execution code identity. Rejected digest windows split into legal `[min, max]` sub-batches so a valid sibling can still submit.
 
-- At most **64** new `send_transaction` or assemble-skip attempts per bucket per tick. Hits on `rejected_combos` do **not** consume that budget.
-- A separate cap of **256** cached splits per bucket per tick bounds exponential diamond expansion of already-rejected windows.
-- Each window fingerprint is expanded at most once per isolate sweep (`isolate_expanded`). When a budget cuts the tick, that set is kept with the resume cursor so the next tick continues remaining unique windows instead of re-walking the tree from the ASC head.
-- Assembly failures share a separate budget of **64** subset probes per Process per tick. The search starts at the minimum batch size and can try larger legal subsets. Unfinished searches resume with the same Process state. Up to **16** probes go to combinations containing new arrivals while the original search runs. Arrival groups rotate through that share, and can use the full budget once the original search is exhausted.
-- The probe skips duplicate CID lock groups and subsets with non-live guest-added funding inputs. A dry-run or submit conflict starts or advances subset isolation when alternatives are available. An unavailable funding lookup preserves the probe position for retry. During a deferred refund’s assembly check, an invalid transaction advances the search to the next subset.
-- The worker keeps the subset cursor across ticks until the search exhausts or the Process snapshot changes. Natural exhaustion pauses assembly for three successful scans.
-- Exit 37 on a Process state with zero fee headroom pauses assembly until the state or execution code changes. The affected Intentions stay live.
+- At most **64** assembly worker jobs and **256** cached window splits per Process per tick. Each rejected window is expanded at most once per tick.
+- Assembly failures share a separate budget of **64** subset probes per Process per tick. The search starts at the minimum batch size and can try larger legal subsets. Each tick starts a fresh search over the current accepted candidates, including cells revived by a reorg. For large candidate sets, probe order varies between ticks so the same prefix cannot take the entire budget.
+- Probes skip duplicate CID lock groups and subsets with non-live Intention or guest-added funding inputs. A dry-run or submit conflict starts or advances isolation within the tick when alternatives and budget are available. An unavailable funding lookup defers the search to the next tick.
+- For the audited v0.1.4 example ELF, exit 37 on a state with zero fee headroom pauses assembly until the state or Process code changes. Other guests continue through capped isolation. The affected Intentions stay live.
 
 A singleton `{A, Process}` failure does **not** prove A is permanently invalid. Details: [`docs/confirmation.md`](docs/confirmation.md).
 

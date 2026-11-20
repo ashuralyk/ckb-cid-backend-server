@@ -10,7 +10,7 @@ use cid_backend_core::{
     type_id_script_hash, CidLockIdentity, ProcessBusyMap, ProcessRegistration, ProcessRegistry,
     RegisterOutcome, RegistryError, WorkerCommand, WorkerCommands,
 };
-use ckb_types::packed::Script;
+use ckb_types::packed::{OutPoint, Script};
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
@@ -24,6 +24,7 @@ const MAX_HEADER_BYTES: usize = 8 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_API_WORKERS: usize = 32;
 
+type GetLiveCell = dyn Fn(&OutPoint) -> Result<Option<LiveCell>, RpcError> + Send + Sync;
 type FindProcessState = dyn Fn(&Script) -> Result<Vec<LiveCell>, RpcError> + Send + Sync;
 
 #[derive(Clone)]
@@ -34,6 +35,7 @@ pub struct RegistryApiState {
     pub busy: ProcessBusyMap,
     pub cid: CidLockIdentity,
     pub find_process_state: Arc<FindProcessState>,
+    pub get_live_cell: Arc<GetLiveCell>,
 }
 
 pub struct RegistryApiHandle {
@@ -224,6 +226,16 @@ fn get_process(
     }
 }
 
+fn state_lookup_unavailable(error: &RpcError) -> (u16, &'static str, &'static str, Vec<u8>) {
+    tracing::warn!(target: "cid_backend", event = "registry.state_lookup_failed", %error);
+    (
+        503,
+        "Service Unavailable",
+        "text/plain; charset=utf-8",
+        b"could not look up live Process state; retry later\n".to_vec(),
+    )
+}
+
 fn register_process(
     body: &[u8],
     state: &RegistryApiState,
@@ -244,21 +256,22 @@ fn register_process(
     };
     let cells = match (state.find_process_state)(&entry.identity.type_script()) {
         Ok(cells) => cells,
-        Err(error) => {
-            tracing::warn!(target: "cid_backend", event = "registry.state_lookup_failed", %error);
-            return Ok((
-                503,
-                "Service Unavailable",
-                "text/plain; charset=utf-8",
-                b"could not look up live Process state; retry later\n".to_vec(),
-            ));
-        }
+        Err(error) => return Ok(state_lookup_unavailable(&error)),
     };
     let [cell] = cells.as_slice() else {
         return Ok(bad_request(
             b"expected one live Process state cell for identity_type_id_args\n",
         ));
     };
+    match (state.get_live_cell)(&cell.out_point) {
+        Ok(Some(node_cell)) if node_cell == *cell => {}
+        Ok(_) => {
+            return Ok(bad_request(
+                b"node could not confirm indexed Process state\n",
+            ))
+        }
+        Err(error) => return Ok(state_lookup_unavailable(&error)),
+    }
     if !state_is_process_lock(&entry, cell) {
         return Ok(bad_request(
             b"live Process state must use the registered Process code Type-ID lock\n",
@@ -543,7 +556,7 @@ mod tests {
     use super::*;
     use cid_backend_core::{type_id_script_hash, DEFAULT_MAX_REGISTRY_ENTRIES};
     use ckb_types::core::ScriptHashType;
-    use ckb_types::packed::{CellOutput, OutPoint};
+    use ckb_types::packed::CellOutput;
     use ckb_types::prelude::*;
     use std::net::TcpStream;
 
@@ -553,27 +566,75 @@ mod tests {
     };
 
     fn api_state(registry: ProcessRegistry, lock_args: Vec<u8>) -> RegistryApiState {
+        let cell = LiveCell {
+            out_point: OutPoint::default(),
+            output: CellOutput::new_builder()
+                .lock(
+                    Script::new_builder()
+                        .code_hash(type_id_script_hash(&[0x22; 32]).pack())
+                        .hash_type(ScriptHashType::Type.into())
+                        .args(lock_args.pack())
+                        .build(),
+                )
+                .type_(Some(cid_backend_core::type_id_script(&[0x11; 32])).pack())
+                .build(),
+            data: vec![],
+        };
+        let indexed = cell.clone();
         RegistryApiState {
             registry: Arc::new(Mutex::new(registry)),
             worker_cmds: Arc::new(WorkerCommands::default()),
             busy: ProcessBusyMap::new(),
             cid: CID,
             find_process_state: Arc::new(move |typ| {
-                let lock = Script::new_builder()
-                    .code_hash(type_id_script_hash(&[0x22; 32]).pack())
-                    .hash_type(ScriptHashType::Type.into())
-                    .args(lock_args.pack())
-                    .build();
-                Ok(vec![LiveCell {
-                    out_point: OutPoint::default(),
-                    output: CellOutput::new_builder()
-                        .lock(lock)
-                        .type_(Some(typ.clone()).pack())
-                        .build(),
-                    data: vec![],
-                }])
+                assert_eq!(indexed.type_script().as_ref(), Some(typ));
+                Ok(vec![indexed.clone()])
+            }),
+            get_live_cell: Arc::new(move |op| {
+                assert_eq!(op, &cell.out_point);
+                Ok(Some(cell.clone()))
             }),
         }
+    }
+
+    #[test]
+    fn registry_node_check_rejects_stale_or_mismatched_state_before_upsert() {
+        let (reg, path) = temp_registry();
+        let mut state = api_state(reg, [CID.code_hash.as_slice(), &[1]].concat());
+        let body = serde_json::json!({
+            "identity_type_id_args": hex_pref(&[0x11; 32]),
+            "code_type_id_args": hex_pref(&[0x22; 32]),
+        })
+        .to_string();
+        let matching = state.get_live_cell.clone();
+        state.get_live_cell = Arc::new(|_| Ok(None));
+        let post = |state: &RegistryApiState| {
+            route("POST", "/v1/processes", body.as_bytes(), state)
+                .unwrap()
+                .0
+        };
+        assert_eq!(post(&state), 400);
+        assert!(state.registry.lock().unwrap().is_empty());
+        assert!(state.worker_cmds.queued().is_empty());
+        assert!(!path.exists());
+
+        state.get_live_cell = Arc::new(|_| Err(RpcError::Unavailable("node offline".into())));
+        assert_eq!(post(&state), 503);
+        assert!(state.registry.lock().unwrap().is_empty());
+        assert!(state.worker_cmds.queued().is_empty());
+
+        state.get_live_cell = matching.clone();
+        assert_eq!(post(&state), 201);
+        let persisted = std::fs::read(&path).unwrap();
+        state.get_live_cell = Arc::new(move |op| {
+            let mut cell = matching(op)?.unwrap();
+            cell.data.push(1);
+            Ok(Some(cell))
+        });
+        assert_eq!(post(&state), 400);
+        assert_eq!(state.worker_cmds.queued().len(), 1);
+        assert_eq!(std::fs::read(&path).unwrap(), persisted);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

@@ -249,7 +249,7 @@ mod tests {
             .pending_occupies(&good.out_point));
     }
 
-    /// Async Rejected must queue sync drop_first+shrink frames (isolate_pending),
+    /// Async Rejected must queue drop_first and shrink frames within the tick,
     /// not rely on `already`. min=1, [A,B,C], C poison → shrink [A,B] submits.
     #[test]
     fn async_rejected_min1_shrinks_abc_to_ab() {
@@ -270,7 +270,7 @@ mod tests {
         let first = loop_.tick();
         assert_eq!(
             first.submitted, 1,
-            "after [A,B,C] reject, shrink [A,B] must submit via isolate_pending"
+            "after [A,B,C] reject, shrink [A,B] must submit via same-tick isolation"
         );
         let submitted = &loop_.rpc().submitted()[0];
         let inputs: Vec<_> = submitted
