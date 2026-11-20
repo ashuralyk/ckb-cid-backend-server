@@ -30,10 +30,13 @@ The script inits `dev` with genesis miner lock, sets **`min_fee_rate = 0`** (D8:
 
 Before signing setup, the ignored fixture requires a numeric loopback HTTP RPC URL and checks that the node reports `ckb_dev`. The fixture disables HTTP redirects and proxies. The fixture checks the committed beneficiary output, a committed xUDT refund that preserves trailing data, and the CID lock's rejection of an untyped Intention with nonempty data.
 
-To exercise bounded refunds at a nonzero pool fee, use a fresh dev data directory
-and run the same fixture with `CID_LOCAL_CHAIN_BOUNDED_REFUNDS=1`. The script
-sets the node minimum to 1,000 shannons/KB and only allowlists the fixture's
-deployed CID lock. The fixture checks the node's active fee setting and confirms
+To exercise bounded refunds at a nonzero pool fee, stop the previous fixture
+node and miner before switching modes. Their PIDs are recorded in
+`$CKB_DIR/ckb.pid` and `$CKB_DIR/miner.pid` (default `CKB_DIR=.local-ckb`).
+A new `CKB_DATA_DIR` still uses the same RPC port. Then use a fresh dev data
+directory and run with `CID_LOCAL_CHAIN_BOUNDED_REFUNDS=1`. The script sets
+the node minimum to 1,000 shannons/kB and only allowlists the fixture's CID
+lock. The fixture verifies the node's active fee setting and confirms that
 the xUDT refund pays a positive fee.
 
 ## Daemon env (production / local)
@@ -42,17 +45,18 @@ the xUDT refund pays a positive fee.
 |----------|---------------|---------|
 | `CID_CKB_RPC_URL` | required | Node JSON-RPC |
 | `CID_INDEXER_URL` | optional | Indexer JSON-RPC (default: node URL) |
-| `CID_LOCK_CODE_HASH` | required | CID lock `code_hash` |
+| `CID_LOCK_TYPE_ID_ARGS` | optional | TYPE_ID args of the CID lock code cell |
+| `CID_LOCK_CODE_HASH` | required unless Type-ID | CID lock `code_hash`, derived when `CID_LOCK_TYPE_ID_ARGS` is set |
 | `CID_LOCK_HASH_TYPE` | optional | `type` (default), required for the primary CID lock |
 | `CID_POLL_INTERVAL_SECS` | required | ≥ 1 |
-| `CID_LOCK_CELL_DEP` | optional; needed at run | `<tx_hash>:<index>` CID lock code cell (`DepType::Code`) |
-| `CID_PROCESS_CODE_CELL_DEP` | optional; needed at run | Process type code cell |
+| `CID_LOCK_CELL_DEP` | optional static | `<tx_hash>:<index>` CID lock code cell when Type-ID discovery is disabled |
+| `CID_PROCESS_CODE_CELL_DEP` | optional static | Process code dependency in static mode. Registered workers resolve their Process code by Type ID. |
 | `CID_PROCESS_LOCK_CELL_DEP` | optional static | Extra Process lock code dependency. The local fixture resolves the Process code by Type ID. |
 | `CID_PROCESS_CODE_HASH` | deprecated | Ignored; register Processes via registry API |
 | `CID_EXTRA_CELL_DEPS` | optional | Extra `tx_hash:index` list |
 | `CID_HEALTH_BIND` | optional | Opt-in health/stats HTTP (`docs/observability.md`) |
 | `CID_CONFIRMATION_DEPTH` | optional | Blocks before a committed execution tx is settled (default 24; see `docs/confirmation.md`) |
-| `CID_FEE_RATE` | optional | Shannons/KW for bounded refunds (default 1000) |
+| `CID_FEE_RATE` | optional | Shannons per kB for bounded refunds (default 1000) |
 | `CID_BOUNDED_REFUND_LOCKS` | optional | Comma list `0xhash:hash_type` of audited locks allowed to use ≤ `MAX_REFUND_FEE` refund haircuts (default **empty** / legacy exact). Never undeployed candidates. |
 | `CID_LEGACY_SCAN_LOCKS` | optional | Scan-only CID lock identities, including legacy `data`, `data1`, and `data2` locks. |
 | `CID_LOG_FORMAT` / `RUST_LOG` | optional | Structured logs (`docs/observability.md`) |

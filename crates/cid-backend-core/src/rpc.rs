@@ -34,6 +34,8 @@ pub enum TxStatus {
         block_hash: [u8; 32],
     },
     Dropped,
+    /// The node reports a rejection for this hash, potentially from an earlier send.
+    Rejected,
     /// The node has no status for this transaction hash.
     Unknown,
 }
@@ -42,7 +44,7 @@ pub enum TxStatus {
 pub enum RpcError {
     Unavailable(String),
     SubmitRejected(String),
-    /// The node declined this transaction under its current fee or size policy.
+    /// The node declined this transaction under a retryable transaction-specific rule.
     PoolPolicyRejected(String),
     /// The node declined the transaction because of a temporary pool limit.
     PoolUnavailable(String),

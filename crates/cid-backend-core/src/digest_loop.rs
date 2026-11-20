@@ -786,7 +786,7 @@ where
                     });
                 }
                 match status {
-                    Ok(TxStatus::Unknown)
+                    Ok(TxStatus::Unknown | TxStatus::Rejected)
                         if self.workers.get(&process_hash).is_some_and(|worker| {
                             worker.with_state(|state| {
                                 state
@@ -798,10 +798,10 @@ where
                             })
                         }) =>
                     {
-                        tracing::debug!(target: LOG_TARGET, event = "pending.admission_unknown",
+                        tracing::debug!(target: LOG_TARGET, event = "pending.admission_unconfirmed",
                             tx_hash = %tx_hex);
                     }
-                    Ok(TxStatus::Unknown | TxStatus::Dropped) => {
+                    Ok(TxStatus::Unknown | TxStatus::Rejected | TxStatus::Dropped) => {
                         let Some(worker) = self.workers.get(&process_hash) else {
                             continue;
                         };

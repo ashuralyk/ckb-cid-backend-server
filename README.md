@@ -264,7 +264,7 @@ Default is 24 blocks (~3 minutes at ~8s). FakeRpc and the local-chain E2E use `1
 |---------|--------|-----------|
 | `Dropped` | yes (if cells still live) | released |
 | RPC/indexer `Unavailable` | yes | existing occupancy stays held |
-| `send_transaction` returns `Unavailable` (including duplicate `-1107`) | after rejection, eviction, or expiry of initial unknown-status grace | track the local transaction hash and hold occupancy through reconciliation |
+| `send_transaction` returns `Unavailable` (including duplicate `-1107`) | after a known drop or expiry of initial admission grace | track the local transaction hash and hold occupancy through reconciliation |
 | `PoolUnavailable` (`-1105`, `-1106`) | next tick | no new occupancy |
 | `Conflict` (`-301`, unknown-input, etc.) | yes | not taken |
 | `SubmitRejected` (`-302` / `-1102` / `-1108`) | isolate that **combo**; do not send it again this process lifetime | not taken; Process is not written to `rejected` |

@@ -422,7 +422,7 @@ impl Rpc for CkbRpc {
                 })
             }
             Some("unknown") => Ok(TxStatus::Unknown),
-            Some("rejected") => Ok(TxStatus::Dropped),
+            Some("rejected") => Ok(TxStatus::Rejected),
             _ => Err(RpcError::Unavailable(
                 "get_transaction: missing or invalid status".into(),
             )),
@@ -670,12 +670,16 @@ fn committed_block_number(
 const TX_FAILED_TO_RESOLVE: i64 = -301;
 const TX_FAILED_TO_VERIFY: i64 = -302;
 const POOL_REJECTED_BY_OUTPUTS_VALIDATOR: i64 = -1102;
+const POOL_REJECTED_BY_ILL_TRANSACTION_CHECKER: i64 = -1103;
 const POOL_REJECTED_BY_MIN_FEE_RATE: i64 = -1104;
 const POOL_REJECTED_BY_MAX_ANCESTORS: i64 = -1105;
 const POOL_IS_FULL: i64 = -1106;
 const POOL_REJECTED_DUPLICATED: i64 = -1107;
 const POOL_REJECTED_MALFORMED: i64 = -1108;
+const POOL_TRANSACTION_EXPIRED: i64 = -1109;
 const POOL_REJECTED_SIZE_LIMIT: i64 = -1110;
+const POOL_REJECTED_RBF: i64 = -1111;
+const POOL_REJECTED_INVALIDATED: i64 = -1112;
 
 fn json_rpc_code(err: &Value) -> Option<i64> {
     let c = err.get("code")?;
@@ -688,18 +692,33 @@ const JSON_RPC_METHOD_NOT_FOUND: i64 = -32601;
 
 fn map_verify_rpc_error(method: &str, code: Option<i64>, msg: &str) -> RpcError {
     match code {
-        Some(POOL_REJECTED_BY_MIN_FEE_RATE | POOL_REJECTED_SIZE_LIMIT) => {
-            RpcError::PoolPolicyRejected(msg.into())
-        }
+        Some(
+            POOL_REJECTED_BY_MIN_FEE_RATE | POOL_TRANSACTION_EXPIRED | POOL_REJECTED_SIZE_LIMIT,
+        ) => RpcError::PoolPolicyRejected(msg.into()),
         Some(POOL_REJECTED_BY_MAX_ANCESTORS | POOL_IS_FULL) => {
             RpcError::PoolUnavailable(msg.into())
         }
-        Some(TX_FAILED_TO_RESOLVE) | Some(POOL_REJECTED_DUPLICATED) => {
-            RpcError::Conflict(msg.into())
-        }
+        Some(
+            TX_FAILED_TO_RESOLVE
+            | POOL_REJECTED_DUPLICATED
+            | POOL_REJECTED_RBF
+            | POOL_REJECTED_INVALIDATED,
+        ) => RpcError::Conflict(msg.into()),
+        // The pinned node reports block/time or cellbase maturity constraints
+        // under the same verification code as permanent script failures.
         Some(TX_FAILED_TO_VERIFY)
-        | Some(POOL_REJECTED_BY_OUTPUTS_VALIDATOR)
-        | Some(POOL_REJECTED_MALFORMED) => RpcError::SubmitRejected(msg.into()),
+            if msg.contains("Immature(Inputs[")
+                || msg.contains("CellbaseImmaturity(Inputs[")
+                || msg.contains("CellbaseImmaturity(CellDeps[") =>
+        {
+            RpcError::PoolPolicyRejected(msg.into())
+        }
+        Some(
+            TX_FAILED_TO_VERIFY
+            | POOL_REJECTED_BY_OUTPUTS_VALIDATOR
+            | POOL_REJECTED_BY_ILL_TRANSACTION_CHECKER
+            | POOL_REJECTED_MALFORMED,
+        ) => RpcError::SubmitRejected(msg.into()),
         _ if is_conflict(msg) => RpcError::Conflict(msg.into()),
         _ => RpcError::Unavailable(format!("{method} {code:?}: {msg}")),
     }
@@ -751,7 +770,8 @@ impl CkbRpc {
                 .and_then(Value::as_str)
                 .and_then(|value| value.strip_prefix("0x"))
                 .is_some_and(|digits| {
-                    digits.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    (digits.len() == 1 || !digits.starts_with('0'))
+                        && digits.bytes().all(|byte| byte.is_ascii_hexdigit())
                         && u64::from_str_radix(digits, 16).is_ok()
                 })
         };
@@ -1504,6 +1524,8 @@ mod tests {
             (false, Value::Null),
             (false, json!({"cycles":"0x", "fee":""})),
             (false, json!({"cycles":"0x1", "fee":""})),
+            (false, json!({"cycles":"0x01", "fee":"0x0"})),
+            (false, json!({"cycles":"0x1", "fee":"0x00"})),
             (true, json!({})),
         ] {
             let url = spawn_mock(Arc::new(move |method, _| match method {
@@ -1593,7 +1615,7 @@ mod tests {
         );
         assert_eq!(
             rpc.get_transaction_status(&hash).unwrap(),
-            TxStatus::Dropped
+            TxStatus::Rejected
         );
         assert_eq!(
             rpc.get_transaction_status(&hash).unwrap(),
@@ -1738,7 +1760,7 @@ mod tests {
 
     #[test]
     fn fee_and_size_policy_rejections_are_transaction_specific() {
-        for code in [-1104, -1110] {
+        for code in [-1104, -1109, -1110] {
             for method in ["test_tx_pool_accept", "send_transaction"] {
                 let url = spawn_mock(Arc::new(move |actual, _| {
                     assert_eq!(actual, method);
@@ -1754,6 +1776,34 @@ mod tests {
                 } else {
                     rpc.submit_transaction(&tx).unwrap_err()
                 };
+                assert!(
+                    matches!(error, RpcError::PoolPolicyRejected(_)),
+                    "{error:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn node_rejections_distinguish_conflicts_from_retryable_maturity() {
+        for (code, message, conflict) in [
+            (-1111, "Insufficient RBF fee", true),
+            (-1112, "Referenced cell consumed", true),
+            (
+                -302,
+                "TransactionFailedToVerify: Immature(Inputs[0])",
+                false,
+            ),
+            (
+                -302,
+                "TransactionFailedToVerify: CellbaseImmaturity(CellDeps[0])",
+                false,
+            ),
+        ] {
+            let error = map_rpc_error("send_transaction", Some(code), message);
+            if conflict {
+                assert!(matches!(error, RpcError::Conflict(_)), "{error:?}");
+            } else {
                 assert!(
                     matches!(error, RpcError::PoolPolicyRejected(_)),
                     "{error:?}"
@@ -2122,14 +2172,16 @@ mod tests {
                 node_sends.fetch_add(1, Ordering::SeqCst);
                 Ok(json!(hex_bytes(&[0xab; 32])))
             }
-            "get_transaction" if node_lookups.fetch_add(1, Ordering::SeqCst) == 0 => {
-                Ok(Value::Null)
+            "get_transaction" => {
+                if node_pending.lock().unwrap().as_ref() != params.get(0) {
+                    return Ok(Value::Null);
+                }
+                match node_lookups.fetch_add(1, Ordering::SeqCst) {
+                    0 => Ok(Value::Null),
+                    1 => Ok(json!({"tx_status": {"status": "rejected"}})),
+                    _ => Ok(json!({"tx_status": {"status": "pending"}})),
+                }
             }
-            "get_transaction" => Ok(if node_pending.lock().unwrap().as_ref() == params.get(0) {
-                json!({"tx_status": {"status": "pending"}})
-            } else {
-                Value::Null // The mismatched receipt hash was never admitted.
-            }),
             "get_tip_block_number" => Ok(json!("0x0")),
             other => host_query_or_dry_run(other, &params, &[intent.clone(), proc.clone()]),
         }));
@@ -2158,6 +2210,13 @@ mod tests {
         assert_eq!(sends.load(Ordering::SeqCst), 1);
         assert_eq!(loop_.tick().submitted, 0);
         assert_eq!(lookups.load(Ordering::SeqCst), 2);
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+        assert!(
+            loop_.state().submit.unwrap().pending_occupies(&created),
+            "a prior rejection for this hash cannot settle an unanswered retry"
+        );
+        assert_eq!(loop_.tick().submitted, 0);
+        assert_eq!(lookups.load(Ordering::SeqCst), 3);
         assert!(loop_.state().submit.unwrap().pending_occupies(&created));
     }
 

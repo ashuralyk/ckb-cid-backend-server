@@ -57,7 +57,7 @@ if these checks fail or the refund returns to the pool before settlement.
 | Confirming or committed tx becomes `Dropped` | Log `pending.reorg` (if we had seen Committed) or `pending.dropped`. Release occupancy. If cells are live, the next tick retries. |
 | Commit block missing or replaced at the same height | Keep occupancy and the refund dependency interlock. Log `pending.noncanonical`. |
 | Status, tip, or block hash RPC unavailable | Keep occupancy until reconciliation succeeds. |
-| Null or unknown status after an ambiguous send | Keep occupancy for up to 30 seconds from that send while the node may still be admitting it. An explicit rejection releases occupancy immediately. |
+| Null, unknown, or rejected status after an ambiguous send | Keep occupancy for 30 seconds from that send while the node may still be admitting it. A status rejection can refer to an earlier attempt with the same hash. |
 
 Exit 41 quarantines a Process state/code pair. A replacement pair can run
 independently. The worker retains the old quarantine for its lifetime, so the
@@ -88,7 +88,7 @@ written to `rejected`.
 | `Dropped` (pool eviction / reorg) | yes, next tick if cells live | released |
 | RPC/indexer `Unavailable` | yes | existing occupancy stays held |
 | `PoolUnavailable` | yes, on the next tick | no new occupancy |
-| `send_transaction` returns `Unavailable` | after rejection, eviction, or expiry of the unknown-status grace period | held under the local transaction hash through reconciliation |
+| `send_transaction` returns `Unavailable` | after a known drop or expiry of the initial admission grace period | held under the local transaction hash through reconciliation |
 | `Conflict` | yes. During assembly isolation, try later subsets and reconsider conflicts on the next search. | not taken (`failed` is informational) |
 | `SubmitRejected` (positively identified permanent send failure of this tx) | isolate / skip that **combo** this process lifetime | not taken; Process outpoint is not blacklisted |
 | `Process.assemble` error | log and try another batch, or quarantine the state/code pair on exit 41 | affected cells stay live |
@@ -154,13 +154,17 @@ from a full indexer rescan.
 |------|-----------|-----------|
 | `-301` | `TransactionFailedToResolve` | `Conflict` (unknown-input, dead-cell, and duplicate messages can also map to `Conflict`, subject to explicit code handling) |
 | `-1107` | `PoolRejectedDuplicatedTransaction` | `Unavailable` (the node may have already admitted the transaction, so the daemon tracks the local transaction hash and reconciles its status) |
-| `-302` | `TransactionFailedToVerify` | `SubmitRejected` |
+| `-302` | `TransactionFailedToVerify` | `PoolPolicyRejected` for maturity constraints. Other validation failures map to `SubmitRejected`. |
 | `-1102` | `PoolRejectedTransactionByOutputsValidator` | `SubmitRejected` |
+| `-1103` | `PoolRejectedTransactionByIllTransactionChecker` | `SubmitRejected` |
 | `-1108` | `PoolRejectedMalformedTransaction` | `SubmitRejected` |
 | `-1106` | `PoolIsFull` | `PoolUnavailable` (retry) |
 | `-1105` | `PoolRejectedTransactionByMaxAncestorsCountLimit` | `PoolUnavailable` (retry) |
 | `-1104` | `PoolRejectedTransactionByMinFeeRate` | `PoolPolicyRejected` (keep scanning other combinations in the current tick and allow the same combination to be retried in a later tick) |
+| `-1109` | `TransactionExpired` | `PoolPolicyRejected` |
 | `-1110` | `PoolRejectedTransactionBySizeLimit` | `PoolPolicyRejected` (try other combinations and allow later retries) |
+| `-1111` | `PoolRejectedRBF` | `Conflict` |
+| `-1112` | `PoolRejectedInvalidated` | `Conflict` |
 | other / missing code | — | `Unavailable` (do **not** blacklist an Intention on an unclassified error) |
 
 A committed execution tx with a **known** `tx_status.block_number` of `0` is
