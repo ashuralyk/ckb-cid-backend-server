@@ -209,7 +209,7 @@ fn protocol_script_to_packed(script: &cid_protocol::Script) -> Script {
         .build()
 }
 
-/// User Lock refund for SSRI `Incompatible`. Does **not** spend Process.
+/// User Lock refund transaction. The Process state remains unspent.
 /// Exact Intention capacity on every refund output (paid fee 0).
 pub fn assemble_digest_incompatible(
     intentions: &[ScannedIntention],

@@ -67,7 +67,8 @@ written to `rejected`.
 | RPC/indexer `Unavailable` | yes | held if already pending; not taken on a failed submit |
 | `Conflict` | yes, next tick if cells live | not taken (`failed` is informational) |
 | `SubmitRejected` (positively identified permanent send failure of this tx) | isolate / skip that **combo** this process lifetime | not taken; Process outpoint is not blacklisted |
-| SSRI `Incompatible` | refund via User Lock (unchanged) | — |
+| `Process.assemble` error | log and try another batch, or quarantine state on exit 41 | affected cells stay live |
+| `Process.filter` reasons 4–7 | User Lock refund after matching node snapshots | Intention input occupied on successful submit |
 
 **Combo isolation.** A `SubmitRejected` batch is recorded as a fingerprint of
 the Intention outpoints in order plus the Process outpoint if `digest_ok`

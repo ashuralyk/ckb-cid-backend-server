@@ -2,8 +2,8 @@ use crate::host_query::{seed_host_for_batch, HostQueryRpc, RpcHostQuery};
 use crate::process::ResolvedProcess;
 use crate::scan::ScannedIntention;
 use cid_intention_filter::{
-    encode_filter_request, FilterCell, FilterRequest, FILTER_MAX_CELLS, FILTER_STDIN_MAX,
-    FILTER_UNSUPPORTED_ACTION,
+    encode_filter_request, FilterCell, FilterRequest, FILTER_MAX_CELLS, FILTER_RESERVED_2,
+    FILTER_RESERVED_3, FILTER_STDIN_MAX, FILTER_UNSUPPORTED_ACTION,
 };
 use cid_process_executor::{AssembledTx, DraftCell, ExecutorError, MockHost, ProcessExecutor};
 use ckb_types::core::DepType;
@@ -193,6 +193,11 @@ pub(crate) fn filter_intentions(
             if !(0..=FILTER_UNSUPPORTED_ACTION).contains(&reason) {
                 return Err(SsriError::Unusable(format!(
                     "unknown filter reason {reason}"
+                )));
+            }
+            if matches!(reason, FILTER_RESERVED_2 | FILTER_RESERVED_3) {
+                return Err(SsriError::Unusable(format!(
+                    "reserved filter reason {reason}"
                 )));
             }
             reasons[index] = Some(reason);

@@ -181,8 +181,7 @@ fn main() {
     let mut digest =
         DigestLoop::with_workers(rpc, NopClock, ssri, loop_config, workers, Some(worker_cmds))
             .with_busy_map(busy)
-            .with_missing_filter_fallback(config.allow_missing_filter)
-            .with_example_policy_data_hashes(config.example_policy_data_hashes.clone());
+            .with_missing_filter_fallback(config.allow_missing_filter);
     loop {
         let report = digest.tick();
         let pending = digest

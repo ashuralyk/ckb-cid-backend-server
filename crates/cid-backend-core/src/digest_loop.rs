@@ -12,24 +12,19 @@ use crate::type_id::TypeIdCodeDep;
 pub use crate::worker_commands::{WorkerCommand, WorkerCommands};
 use crate::workers::{WorkerPool, WorkerRemoveError};
 use cid_intention_filter::{
-    FILTER_ACCEPTED, FILTER_DEPOSIT_BELOW_MINIMUM, FILTER_MALFORMED_DIGEST, FILTER_RESERVED_2,
-    FILTER_RESERVED_3, FILTER_UNSUPPORTED_ACTION, FILTER_UNSUPPORTED_ASSET,
+    FILTER_ACCEPTED, FILTER_DEPOSIT_BELOW_MINIMUM, FILTER_MALFORMED_DIGEST,
+    FILTER_UNSUPPORTED_ACTION, FILTER_UNSUPPORTED_ASSET,
 };
 use ckb_types::core::ScriptHashType;
-use ckb_types::packed::{Byte32, CellDep, CellOutput};
+use ckb_types::packed::{Byte32, CellDep};
 use ckb_types::prelude::*;
 use std::collections::HashSet;
 use std::fmt::Write as _;
-use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 const LOG_TARGET: &str = "cid_backend";
-// cid_process_example v0.1.4 in the pinned contracts' testnet deployment record.
-const PINNED_EXAMPLE_DATA_HASH: [u8; 32] =
-    ckb_types::h256!("0x2374e455d8cdcae5d5387257ec0d5b33114d3b5338d823d5e388b5a0a767f226").0;
-
 /// Default max molecule size for guest-assembled execution txs (512 KiB).
 pub const DEFAULT_MAX_ASSEMBLED_TX_BYTES: usize = 512 * 1024;
 
@@ -140,7 +135,6 @@ where
     ssri: Arc<S>,
     config: LoopConfig,
     allow_missing_filter: bool,
-    example_policy_data_hashes: Vec<[u8; 32]>,
     workers: WorkerPool<R, S>,
     /// Optional shared command queue for live registry API updates.
     worker_cmds: Option<Arc<WorkerCommands>>,
@@ -179,7 +173,6 @@ where
             ssri,
             config,
             allow_missing_filter: false,
-            example_policy_data_hashes: Vec::new(),
             workers,
             worker_cmds,
             busy: None,
@@ -211,12 +204,6 @@ where
     /// Opt in to assembly for guests that explicitly lack Process.filter.
     pub fn with_missing_filter_fallback(mut self, allow: bool) -> Self {
         self.allow_missing_filter = allow;
-        self
-    }
-
-    /// Apply the example's state-aware checks to additional audited ELF data hashes.
-    pub fn with_example_policy_data_hashes(mut self, hashes: Vec<[u8; 32]>) -> Self {
-        self.example_policy_data_hashes = hashes;
         self
     }
 
@@ -516,45 +503,17 @@ where
             .collect();
 
         self.workers.for_each_mut(|w| {
-            const MAX_ISOLATED_PRUNE_CHECKS: usize = 16;
-            let missing: Vec<_> = w.with_state_mut(|state| {
+            w.with_state_mut(|state| {
                 let pending_occupied = state.submit.pending_occupied_keys();
                 state.submit.in_flight.retain(|k| {
                     (live_keys.contains(k) || pending_occupied.contains(k))
                         && !state.submit.rejected.contains(k)
                 });
-                state.comparison_probes_left = process_batch::MAX_COMPARISON_PROBES;
-                // A dropped refund can become visible to the node before the indexer.
-                // Rotate through absent marks so a lagging indexer cannot monopolize lookups.
-                let cursor = state.isolated_prune_cursor.as_ref();
                 state
-                    .isolated_refunds
-                    .range((cursor.map_or(Unbounded, Excluded), Unbounded))
-                    .chain(
-                        cursor
-                            .into_iter()
-                            .flat_map(|op| state.isolated_refunds.range((Unbounded, Included(op)))),
-                    )
-                    .filter(|(op, _)| {
-                        !live_keys.contains(op.as_slice())
-                            && !pending_occupied.contains(op.as_slice())
-                    })
-                    .take(MAX_ISOLATED_PRUNE_CHECKS)
-                    .map(|(op, _)| op.clone())
-                    .collect()
+                    .refund_state_deps
+                    .retain(|hash, _| state.submit.pending.contains_key(hash));
+                state.probe_budget = process_batch::ProbeBudget::default();
             });
-            for op in missing {
-                let live = self.rpc.get_live_cell(&op);
-                w.with_state_mut(|state| {
-                    if matches!(live, Ok(None)) {
-                        state.isolated_refunds.remove(&op);
-                    }
-                    state.isolated_prune_cursor = Some(op);
-                });
-                if live.is_err() {
-                    break;
-                }
-            }
         });
 
         let buckets = bucket_by_process_type_hash(scanned, &self.config.cid_code_hash);
@@ -598,14 +557,20 @@ where
             let mut started = false;
             for bucket in &buckets {
                 let hash = &bucket.process.type_hash;
-                let was_out = self
-                    .workers
-                    .get(hash)
-                    .is_some_and(|w| w.batch_outstanding());
-                if was_out {
+                let Some(worker) = self.workers.get(hash) else {
+                    continue;
+                };
+                if worker.batch_outstanding() {
                     continue;
                 }
-                self.process_bucket(&bucket.process, bucket.accepted.clone(), &mut report);
+                let mode = if !bucket.refunds.is_empty()
+                    && worker.with_state(|state| state.filter_refund_deferred)
+                {
+                    BatchMode::CheckAssembly
+                } else {
+                    BatchMode::Assemble
+                };
+                self.process_bucket(&bucket.process, bucket.accepted.clone(), mode, &mut report);
                 if self
                     .workers
                     .get(hash)
@@ -622,23 +587,8 @@ where
 
         // Wait for assembly to finish first. A Process state fault discovered
         // by assemble must also stop refunds authorized by its filter.
-        for mut bucket in buckets {
+        for bucket in buckets {
             let hash = bucket.process.type_hash;
-            if let Some(worker) = self.workers.get(&hash) {
-                let lock = bucket.process.live_cell.lock();
-                worker.with_state(|state| {
-                    bucket
-                        .refunds
-                        .extend(bucket.accepted.into_iter().filter(|item| {
-                            state
-                                .isolated_refunds
-                                .get(&item.out_point)
-                                .is_some_and(|&code| {
-                                    process_batch::audited_isolation_matches(item, code, &lock)
-                                })
-                        }));
-                });
-            }
             if !bucket.refunds.is_empty() && self.process_is_healthy(&bucket.process) {
                 self.dispatch_process_batch(
                     hash,
@@ -648,7 +598,7 @@ where
                     1,
                     None,
                     &mut report,
-                    BatchMode::PolicyRefund,
+                    BatchMode::FilterRefund,
                 );
             }
         }
@@ -691,7 +641,7 @@ where
         polled: crate::workers::PolledBatch,
     ) -> bool {
         Self::apply_batch_report(report, &polled.delta);
-        if polled.mode == BatchMode::PolicyRefund {
+        if polled.mode == BatchMode::FilterRefund {
             return false;
         }
         let mut continue_round = false;
@@ -1048,17 +998,6 @@ where
             report.skipped += bucket.len();
             return None;
         }
-        let example_policy = process.verdict_code_cell().is_some_and(|cell| {
-            let hash = CellOutput::calc_data_hash(&cell.data).unpack();
-            hash == PINNED_EXAMPLE_DATA_HASH || self.example_policy_data_hashes.contains(&hash)
-        });
-        let audited_policy_lock = example_policy.then(|| process.live_cell.lock());
-        worker.with_state_mut(|state| {
-            if state.audited_policy_lock != audited_policy_lock {
-                state.clear_isolated_refunds();
-                state.audited_policy_lock = audited_policy_lock;
-            }
-        });
         bucket.retain(|item| {
             if !item.has_supported_user_lock() {
                 tracing::warn!(target: LOG_TARGET, event = "scan.unsupported_user_lock",
@@ -1084,11 +1023,6 @@ where
                 for (item, reason) in bucket.into_iter().zip(reasons) {
                     match reason {
                         Some(FILTER_ACCEPTED) => accepted.push(item),
-                        Some(reason @ (FILTER_RESERVED_2 | FILTER_RESERVED_3)) => {
-                            tracing::error!(target: LOG_TARGET, event = "ssri.filter_reserved",
-                                process_type_hash = %hex_pref(&hash), out_point = ?item.out_point, reason);
-                            report.skipped += 1;
-                        }
                         Some(
                             reason @ (FILTER_UNSUPPORTED_ASSET
                             | FILTER_DEPOSIT_BELOW_MINIMUM
@@ -1161,7 +1095,8 @@ where
     fn process_bucket(
         &mut self,
         process: &ResolvedProcess,
-        mut bucket: Vec<ScannedIntention>,
+        bucket: Vec<ScannedIntention>,
+        mode: BatchMode,
         report: &mut TickReport,
     ) {
         if bucket.is_empty() || !self.process_is_healthy(process) {
@@ -1171,7 +1106,7 @@ where
         if self
             .workers
             .get(&hash)
-            .is_some_and(|worker| worker.with_state(|state| state.comparison_probes_left == 0))
+            .is_some_and(|worker| worker.with_state(|state| state.probe_budget.remaining == 0))
         {
             return;
         }
@@ -1218,7 +1153,7 @@ where
                 let Some(probe) = &state.isolation_probe else {
                     return false;
                 };
-                if probe.resume_bucket(&process.live_cell.out_point, min as usize, &mut bucket) {
+                if probe.matches(&process.live_cell.out_point, min) {
                     return true;
                 }
                 state.isolation_probe = None;
@@ -1240,6 +1175,7 @@ where
             &mut attempts,
             MAX_ATTEMPTS,
             resuming_probe,
+            mode,
         );
         if let Some(worker) = self.workers.get(&hash) {
             worker.with_state_mut(|state| {
@@ -1265,6 +1201,7 @@ where
         attempts: &mut u32,
         max_attempts: u32,
         resuming_probe: bool,
+        mode: BatchMode,
     ) -> Option<Vec<u8>> {
         const MAX_CACHED_SPLITS: u32 = 256;
         let mut cached_splits = 0u32;
@@ -1295,7 +1232,6 @@ where
                         .map(|w| {
                             w.with_state(|s| {
                                 !s.submit.in_flight.contains(&out_point_key(&i.out_point))
-                                    && !s.isolated_refunds.contains_key(&i.out_point)
                             })
                         })
                         .unwrap_or(true)
@@ -1315,13 +1251,13 @@ where
                 .get(&hash)
                 .map(|w| w.with_state(|s| s.isolate_expanded.contains(&fp)))
                 .unwrap_or(false);
-            if already {
+            if !resuming_probe && already {
                 // Already expanded once this sweep — do not re-push drop_first/
                 // shrink (diamond explosion). Async Rejected queues frames via
                 // isolate_pending at poll time instead of relying on this arm.
                 continue;
             }
-            let cached = self.window_combo_cached(&hash, &window, process);
+            let cached = !resuming_probe && self.window_combo_cached(&hash, &window, process);
             let outcome = if cached {
                 tracing::debug!(
                     target: LOG_TARGET,
@@ -1352,7 +1288,7 @@ where
                     min,
                     resume_on_continue,
                     report,
-                    BatchMode::Assemble,
+                    mode,
                 );
                 if !matches!(outcome, BatchOutcome::CachedRejected) {
                     *attempts += 1;

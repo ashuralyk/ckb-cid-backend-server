@@ -24,11 +24,11 @@ The daemon continuously digests CID Intentions:
 1. Scan live Intentions by the configured CID code Type ID. The shared `cid-intention-filter` routing helpers validate the CID lock identity and extract the Process state Type ID. Malformed, foreign-CID, and unregistered Intentions remain live.
 2. Resolve the registered Process state and code cells by exact Type-ID scripts. The state lock points at the Process code Type ID with `hash_type=type`, and its args bind the configured CID Type ID.
 3. Call `Process.filter` on the same code-cell ELF used by `Process.batch` and `Process.assemble`. Each request carries at most 64 cells and 64 KiB. The daemon retries the candidate window on a malformed response, a count mismatch, or an unknown reason. A cell that exceeds 64 KiB by itself stays live.
-4. Select batches from reason 0. Reasons 4–7 go through individual `digest_incompatible` refund attempts. Reason 1 and reserved reasons 2 and 3 leave those cells live and are logged. A missing filter defers the Process by default. Set `loop.allow_missing_filter = true` or `CID_ALLOW_MISSING_FILTER=true` to enable legacy assembly on the explicit SSRI method-missing exit.
-5. Validate the full `Process.assemble` transaction, dry-run it, and submit it unchanged. Guest-added funding inputs are checked against the configured CID locks and known data-hash aliases. Exits 39 and 40 trigger isolation, as does exit 32 for the audited example. If recombining the accepted cells returns exit 21 or 37, the daemon retries with the successful control subset. Isolated cells qualify for a refund only when the audited example policy confirms the verdict against the current state. Exit 41 quarantines the current Process state, clears isolation verdicts, and pauses its refunds until the state or code cell changes.
+4. Select batches from filter reason 0. Only reasons 4–7 authorize automatic User Lock refunds. Reason 1 is logged and the cell stays live. Reserved reasons 2 and 3, unknown reasons, malformed responses, and response count mismatches defer the whole Process bucket for a fresh filter pass. A missing filter defers the Process by default. Set `loop.allow_missing_filter = true` or `CID_ALLOW_MISSING_FILTER=true` to enable legacy assembly on the explicit SSRI method-missing exit.
+5. Validate the full `Process.assemble` transaction, dry-run it, and submit it unchanged. Guest-added funding inputs are checked against the configured CID locks and known data-hash aliases. Assembly failures, including exits 21, 32, 37, 39, and 40, are logged and trigger a search for a smaller or shifted batch. Excluded cells stay live. Exit 41 quarantines the current Process state and pauses its work until the state or code cell changes.
 6. Track occupied inputs until confirmation depth is met. Refunds spend the Intention and preserve its data and type, returning capacity to the User Lock in its args. The existing refund builder supports CKB and standard xUDT. It logs and leaves unsupported refund outputs live. The default fee mode returns exact capacity. A configured bounded-refund CID identity lets the daemon deduct the required transaction fee within the on-chain per-output limit.
 
-Refunds include the live Process code cell that authorized the verdict as a dependency. The daemon rechecks the live Process state before submission, considers up to 16 singleton refunds per Process per tick, resumes after the last attempt, and stops that Process's sweep when RPC is unavailable.
+For each refund, the daemon rereads the Intention at the node and requires an exact snapshot match. It also verifies the live Process code and state snapshots and includes both outpoints as cell dependencies. The worker defers refunds while it has a pending digest spending the authorizing state. On the next available state, deferred refunds get a turn after assembly checks for Process faults. A fresh filter pass must return reason 4–7 again. The worker considers up to 16 singleton refunds per Process per tick and stops its sweep when RPC is unavailable.
 
 Upstream contract pin for testnet v0.1.4 is `b2d01e0a5a9760c8ee627633365aa98dd7a99859`. For the public config, deployment outpoints, and registry POST body, see the [runbook](docs/runbook.md).
 
@@ -93,7 +93,6 @@ Static `[[cell_deps]]` can supply extra scripts such as xUDT. The primary CID lo
 | `CID_HEALTH_BIND` | optional | `host:port` (e.g. `127.0.0.1:9100`); unset or empty **disables** HTTP |
 | `CID_CONFIRMATION_DEPTH` | optional | Blocks after a committed Execution Tx before settle; default **24**, must be **≥ 1** |
 | `CID_ALLOW_MISSING_FILTER` | optional | Default `false`. Set `true` to allow fallback on explicit SSRI method-missing exit. |
-| `CID_EXAMPLE_POLICY_DATA_HASHES` | optional | Comma-separated additional audited example ELF data hashes. Overrides `process.example_policy_data_hashes`. The pinned v0.1.4 hash is built in. |
 | `CID_LOG_FORMAT` | optional | `json` (default) or `pretty` (`text` is an alias for pretty) |
 | `CID_CONFIG` | optional | TOML path if `--config` is omitted |
 | `CID_GENESIS_HASH` | optional | Overrides `network.genesis_hash` |
@@ -168,7 +167,7 @@ cargo test --locked -p cid-backend-tests -- --nocapture
 |-------|----------|
 | `cid-backend-core --include-ignored` | Library unit tests plus the **must-execute** real SSRI guest (`real_example_binary_batch_bounds_and_assemble`). Missing ELF panics; a skip that still prints `ok` is not allowed. |
 | `cid-backend-daemon` | HTTP mock: adapter mapping (including `PoolIsFull` retry vs verify/malformed reject, unknown committed height vs explicit genesis 0), indexer pagination, Pending/Dropped, health limits. `local_chain_e2e` is **ignored**. |
-| `cid-backend-tests` | FakeRpc verticals: n=1 `digest_ok`, batch bounds, Incompatible refund, conflict retry, confirmation depth, reorg, Dropped/Unavailable, `SubmitRejected` combo isolation and starvation regressions. No network. |
+| `cid-backend-tests` | FakeRpc verticals: n=1 `digest_ok`, batch bounds, filter refunds, conflict retry, confirmation depth, reorg, Dropped/Unavailable, `SubmitRejected` combo isolation and starvation regressions. No network. |
 
 The two core guest tests are opt-in. Build the pinned fixture and include the ignored tests to exercise the guest locally.
 
@@ -207,16 +206,22 @@ flowchart TD
   scan --> filter["filter in_flight / rejected"]
   filter --> bucket["bucket by process_type_hash"]
   bucket --> resolve["ProcessResolver SSRI source:<br/>Type-ID code ELF or legacy state ELF"]
-  resolve --> bounds["SSRI Process.batch → min,max"]
+  resolve --> verdict["SSRI Process.filter"]
+  verdict -->|0| bounds["SSRI Process.batch → min,max"]
+  verdict -->|1| logOnly["Log and leave cell live"]
+  verdict -->|4–7| refund["Verify live snapshots and pin Process deps"]
+  verdict -->|2, 3, invalid response| deferred["Defer the Process bucket"]
   bounds --> isolate["isolate_window legal sub-batches"]
   isolate --> peek["lookup rejected_combos fingerprint<br/>incl. Type-ID code identity"]
   peek -->|cache hit| split["CachedRejected: split window, no send"]
   peek --> assemble["SSRI Process.assemble"]
-  assemble -->|ok| dok["assemble_digest_ok<br/>Intention + Process 1in/1out"]
-  assemble -->|Incompatible| dinc["assemble_digest_incompatible<br/>User Lock refund; no Process; exact by default"]
-  assemble -->|Unusable| skip["log + skip"]
-  dok --> send["send_transaction"]
-  dinc --> send
+  assemble -->|ok| dok["Validate the guest transaction"]
+  assemble -->|exit 41| quarantine["Quarantine Process state and pause refunds"]
+  assemble -->|other error| probe["Log and probe smaller or shifted batches"]
+  probe -->|working batch| dok
+  dok --> gate["Dry-run"]
+  refund -->|healthy Process| gate
+  gate --> send["send_transaction"]
   send -->|ok| pending["pending occupancy<br/>wait confirmation_depth"]
   send -->|SubmitRejected| combo["record combo fingerprint and keep splitting"]
   send -->|Conflict / Unavailable| retry["no occupancy this tick; retry next tick"]
@@ -229,8 +234,8 @@ Each tick ([`digest_loop.rs`](crates/cid-backend-core/src/digest_loop.rs)):
 1. Refresh tip and reconcile `pending` (confirmation / reorg) **before** Type-ID code-dep refresh, so unavailable code deps never stall settlement.
 2. Resolve Type-ID code cells with a bounded exact search and merge their dependencies with static extras. SSRI uses the live Process code-cell ELF. The Process state lock references that code Type ID with `hash_type=type`.
 3. Scan live Intentions; skip cells whose lock args fail to decode.
-4. Bucket by Process; `isolate_window` splits into legal `[min, max]` sub-batches. Reject/isolate fingerprints include Type-ID code outpoints so code upgrades clear stale `CachedRejected` without dropping `pending` / `in_flight`.
-5. `digest_ok` occupies the Process recreate until settle; User Lock refunds in the same tick may still submit.
+4. Filter each Process bucket before selecting legal `[min, max]` sub-batches. Transaction rejection fingerprints include Type-ID code outpoints so code upgrades clear stale `CachedRejected` without dropping `pending` / `in_flight`.
+5. Resolve assembly outcomes before submitting filter refunds. Exit 41 also blocks that state's filter refunds.
 
 ### Memory-only state and restart
 
@@ -258,19 +263,20 @@ Default is 24 blocks (~3 minutes at ~8s). FakeRpc and the local-chain E2E use `1
 | RPC/indexer `Unavailable` (including `-1106` PoolIsFull, `-1105` ancestors, `-1104` min fee, unclassified) | yes | held if already pending; not taken on a failed submit |
 | `Conflict` (`-301`, `-1107`, unknown-input, etc.) | yes | not taken |
 | `SubmitRejected` (`-302` / `-1102` / `-1108`) | isolate that **combo**; do not send it again this process lifetime | not taken; Process is not written to `rejected` |
-| SSRI `Incompatible` | User Lock refund | does not spend Process |
+| `Process.assemble` error | Log and try smaller or shifted batches. Exit 41 quarantines the state. | Affected Intentions stay live |
+| `Process.filter` reasons 4–7 | User Lock refund after matching node snapshots | Refund occupies the Intention input and depends on the live Process state and code |
 
 Missing `block_hash` / `get_header` returning null is `Unavailable`, not fabricated genesis height 0; explicit `block_number: 0x0` is `Committed{0}`.
 
 ### Combo isolation and budgets
 
-`SubmitRejected` records a fingerprint of Intention outpoints **in order**; `digest_ok` also includes the Process outpoint, refunds omit it. The same combo is not sent again until restart (or the Process outpoint changes). The window is split into legal `[min, max]` sub-batches (shrink prefix + drop-first) so a valid sibling can still submit when `min = 1`.
+`SubmitRejected` fingerprints the ordered Intention outpoints, the Process state outpoint, and the execution code identity. Rejected digest windows split into legal `[min, max]` sub-batches so a valid sibling can still submit.
 
 - At most **64** new `send_transaction` or assemble-skip attempts per bucket per tick. Hits on `rejected_combos` do **not** consume that budget.
 - A separate cap of **256** cached splits per bucket per tick bounds exponential diamond expansion of already-rejected windows.
 - Each window fingerprint is expanded at most once per isolate sweep (`isolate_expanded`). When a budget cuts the tick, that set is kept with the resume cursor so the next tick continues remaining unique windows instead of re-walking the tree from the ASC head.
-- Uncached no-send skips (`RefundUnbuildable`, capacity shortfall, SSRI Unusable) count toward the 64 work bound and are **not** written to `rejected` / `rejected_combos`.
-- When `min > 1` and the window cannot split further, members are not written wholesale into `rejected`; a valid B that only ever appears next to a failing A may stay unsubmitted — accepted; blacklisting B would be worse.
+- Assembly failures share a separate budget of **64** subset probes per Process per tick. The search starts at the minimum batch size and can try larger legal subsets. Unfinished searches resume with the same Process state. Up to **16** probes go to combinations containing new arrivals while the original search runs. Arrival groups rotate through that share, and can use the full budget once the original search is exhausted.
+- If no working subset is found, the worker advances the window and leaves its Intentions live for future ticks.
 
 A singleton `{A, Process}` failure does **not** prove A is permanently invalid. Details: [`docs/confirmation.md`](docs/confirmation.md).
 

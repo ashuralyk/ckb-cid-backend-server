@@ -245,7 +245,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_digest_ok_still_allows_an_authorized_filter_refund() {
+    fn pending_digest_defers_the_filter_refund_until_the_state_is_recreated() {
         let rpc = FakeRpc::new();
         rpc.defer_commit();
         rpc.insert_cell(crate::helpers::code_cell(
@@ -263,13 +263,14 @@ mod tests {
         rpc.insert_cell(proc.clone());
         let mut loop_ = loop_with_resolver(
             rpc,
-            ScriptedSsri::mimic((1, 1)).with_filter(|_| Ok(vec![0, 5])),
+            ScriptedSsri::mimic((1, 1))
+                .with_filter(|n| Ok(if n == 2 { vec![0, 5] } else { vec![5; n] })),
             cfg(),
             9,
         );
 
         let first = loop_.tick();
-        assert_eq!(first.submitted, 2, "{first:?}");
+        assert_eq!(first.submitted, 1, "{first:?}");
         assert_eq!(first.conflicts, 0);
         let digest_tx = &loop_.rpc().submitted()[0];
         assert!(digest_tx
@@ -289,13 +290,9 @@ mod tests {
             "pending transactions must retain occupancy"
         );
         assert_eq!(second.conflicts, 0);
-        assert_eq!(loop_.rpc().submitted().len(), 2);
-        let refund_tx = &loop_.rpc().submitted()[1];
-        assert_eq!(refund_tx.inputs().len(), 1, "refund does not spend Process");
-        assert_eq!(
-            refund_tx.inputs().get(0).unwrap().previous_output(),
-            refund_intent.out_point
-        );
+        assert_eq!(loop_.rpc().submit_attempts(), 1);
+        assert_eq!(loop_.rpc().dry_run_attempts(), 1);
+        assert!(loop_.rpc().has_cell(&refund_intent.out_point));
         assert_eq!(
             loop_
                 .rpc()
@@ -306,11 +303,18 @@ mod tests {
             proc.out_point,
             "Process stays live under pending digest_ok"
         );
-        assert!(loop_
-            .state()
-            .submit
-            .as_ref()
-            .unwrap()
-            .pending_occupies(&proc.out_point));
+        loop_.rpc().commit_pending(&digest_tx.hash());
+        assert_eq!(loop_.tick().submitted, 1);
+        let refund_tx = &loop_.rpc().submitted()[1];
+        assert_eq!(refund_tx.inputs().len(), 1, "refund does not spend Process");
+        assert_eq!(
+            refund_tx.inputs().get(0).unwrap().previous_output(),
+            refund_intent.out_point
+        );
+        assert!(refund_tx
+            .cell_deps()
+            .into_iter()
+            .any(|dep| dep.out_point().tx_hash() == digest_tx.hash()));
+        assert_eq!(loop_.ssri().filter_requests.lock().unwrap().len(), 3);
     }
 }

@@ -5,16 +5,16 @@ use crate::host_query::HostQueryRpc;
 use crate::process::ResolvedProcess;
 use crate::process::{ProcessEntry, ProcessResolver};
 use crate::process_batch::{
-    run_process_batch, BatchMode, BatchOutcome, BatchReportDelta, IsolationProbe,
-    ProcessBatchParams, MAX_COMPARISON_PROBES,
+    run_process_batch, BatchMode, BatchOutcome, BatchReportDelta, IsolationProbe, ProbeBudget,
+    ProcessBatchParams,
 };
 use crate::rpc::{LiveCell, Rpc};
 use crate::scan::ScannedIntention;
 use crate::ssri::SsriHost;
 use crate::submit::SubmitState;
 use crate::worker_commands::WorkerCommands;
-use ckb_types::packed::{CellDep, OutPoint, Script};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use ckb_types::packed::{CellDep, OutPoint};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -39,13 +39,12 @@ pub struct ProcessWorkerState {
     /// or leftover frames saved on ProcessOccupied. Consumed by the next
     /// `isolate_window` instead of re-deriving via `already`.
     pub isolate_pending: Vec<Vec<ScannedIntention>>,
-    /// Isolated assembly rejections for revalidation under the audited policy.
-    pub(crate) isolated_refunds: BTreeMap<OutPoint, i8>,
-    pub(crate) audited_policy_lock: Option<Script>,
-    pub(crate) isolated_prune_cursor: Option<OutPoint>,
     pub(crate) refund_cursor: Option<OutPoint>,
+    pub(crate) filter_refund_deferred: bool,
+    /// State dependencies of submitted filter refunds, keyed by transaction.
+    pub(crate) refund_state_deps: HashMap<Vec<u8>, OutPoint>,
     pub(crate) isolation_probe: Option<IsolationProbe>,
-    pub(crate) comparison_probes_left: usize,
+    pub(crate) probe_budget: ProbeBudget,
     pub generation: u64,
     /// State out point quarantined after Process.assemble exit 41.
     pub unhealthy_state: Option<OutPoint>,
@@ -67,12 +66,11 @@ impl ProcessWorkerState {
             isolate_resume: None,
             isolate_expanded: HashSet::new(),
             isolate_pending: Vec::new(),
-            isolated_refunds: BTreeMap::new(),
-            audited_policy_lock: None,
-            isolated_prune_cursor: None,
             refund_cursor: None,
+            filter_refund_deferred: false,
+            refund_state_deps: HashMap::new(),
             isolation_probe: None,
-            comparison_probes_left: MAX_COMPARISON_PROBES,
+            probe_budget: ProbeBudget::default(),
             generation,
             unhealthy_state: None,
             filter_missing_logged: false,
@@ -97,15 +95,15 @@ impl ProcessWorkerState {
         self.isolate_expanded.clear();
         self.isolate_pending.clear();
         self.isolate_resume = None;
-        self.clear_isolated_refunds();
-        self.audited_policy_lock = None;
         self.refund_cursor = None;
         self.isolation_probe = None;
     }
 
-    pub(crate) fn clear_isolated_refunds(&mut self) {
-        self.isolated_refunds.clear();
-        self.isolated_prune_cursor = None;
+    pub(crate) fn has_pending_filter_refund(&self, state: &OutPoint) -> bool {
+        self.submit
+            .pending
+            .iter()
+            .any(|(hash, tx)| !tx.seen_committed && self.refund_state_deps.get(hash) == Some(state))
     }
 
     pub fn process_type_hash(&self) -> [u8; 32] {
@@ -733,7 +731,6 @@ mod tests {
             w.isolate_expanded.insert(vec![0x02]);
             w.isolate_pending.push(Vec::new());
             w.isolate_resume = Some(vec![0x03]);
-            w.isolated_refunds.insert(OutPoint::default(), 39);
         });
         assert!(!pool.register(entry([0x10; 32], [0x21; 32])).unwrap());
         pool.get(&hash).unwrap().with_state(|w| {
@@ -741,7 +738,6 @@ mod tests {
             assert!(w.isolate_expanded.is_empty());
             assert!(w.isolate_pending.is_empty());
             assert!(w.isolate_resume.is_none());
-            assert!(w.isolated_refunds.is_empty());
         });
     }
 

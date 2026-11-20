@@ -21,8 +21,12 @@ Stable field `event` (target `cid_backend`):
 | `tick.start` / `tick.end` | Each digest tick (`scanned`, `skipped`, `submitted`, `conflicts`, `scan_ok`) |
 | `scan.unavailable` | Indexer/RPC scan failed |
 | `process.resolve_miss` | No usable live Process binary |
-| `ssri.incompatible` | SSRI `Incompatible(code)` |
-| `refund.path` | User-lock refund assemble (`path=user_lock`, includes `fee`, `bounded`, `n`) |
+| `assemble.batch_failed` | Assembly error and attempted Intention outpoints |
+| `assemble.batch_isolated` | Working subset found during isolation |
+| `process.unhealthy` | Exit 41 quarantined the state and paused its filter refunds |
+| `ssri.filter_failed` | Filter error deferred the Process bucket |
+| `refund.process_state_pending` | Refund deferred while a pending digest spends its state dependency |
+| `refund.path` | User Lock refund construction (`path=user_lock`, `out_point`, `fee`) |
 | `refund.partition` | DigestIncompatible refunds split by lock identity (Exact vs Bounded kept separate; no mixed-identity Bounded tx) |
 | `refund.zero_fee` | Legacy exact Incompatible refund submitted with fee 0 (public-net gap vs `min_fee_rate`; default when allowlist empty / lock not listed) |
 | `tick.skip` (`reason=fee_unaffordable`) | Process recreate cannot fund fee for this window; isolate/shrink (non-permanent) |

@@ -47,7 +47,6 @@ pub struct DaemonConfig {
     /// Confirmation depth for submitted execution txs. Default 24.
     pub confirmation_depth: u64,
     pub allow_missing_filter: bool,
-    pub example_policy_data_hashes: Vec<[u8; 32]>,
     /// Fee rate for allowlisted bounded refunds. The guest sets DigestOk fees.
     pub fee_rate: u64,
     /// Audited CID lock identities that may use bounded refund fee mode.
@@ -306,8 +305,9 @@ struct LockIdentityFile {
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProcessSection {
-    #[serde(default)]
-    example_policy_data_hashes: Vec<String>,
+    // Accept the obsolete option so existing configurations still load.
+    #[serde(default, rename = "example_policy_data_hashes")]
+    _obsolete_example_policy_data_hashes: Option<serde::de::IgnoredAny>,
     #[serde(default)]
     type_code_hashes: Vec<String>,
     #[serde(default)]
@@ -781,15 +781,6 @@ fn merge<F: Fn(&str) -> Option<String>>(
         Some(s) => parse_bool_flag(&s, "CID_ALLOW_MISSING_FILTER")?,
         None => digest.allow_missing_filter,
     };
-    let example_policy_data_hashes = match nonempty(&get, "CID_EXAMPLE_POLICY_DATA_HASHES") {
-        Some(raw) => parse_hash_list(Some(raw))?,
-        None => process
-            .example_policy_data_hashes
-            .iter()
-            .map(|hash| parse_hex32(hash))
-            .collect::<Result<_, _>>()?,
-    };
-
     Ok(DaemonConfig {
         node_url,
         indexer_url,
@@ -806,7 +797,6 @@ fn merge<F: Fn(&str) -> Option<String>>(
         registry_max_entries,
         confirmation_depth,
         allow_missing_filter,
-        example_policy_data_hashes,
         fee_rate,
         bounded_refund_locks,
         extra_scan_locks,
@@ -1211,7 +1201,7 @@ log_format = "pretty"
     }
 
     #[test]
-    fn audited_example_hashes_load_from_toml_and_env() {
+    fn obsolete_example_policy_setting_does_not_prevent_startup() {
         let body = minimal_toml().replace(
             "[process]",
             &format!(
@@ -1220,23 +1210,10 @@ log_format = "pretty"
             ),
         );
         let path = write_toml(&body);
-        assert_eq!(
-            DaemonConfig::from_file_and_vars(Some(&path), |_| None)
-                .unwrap()
-                .example_policy_data_hashes,
-            [[0x11; 32]],
-        );
-        let cfg = DaemonConfig::from_file_and_vars(Some(&path), |key| {
-            (key == "CID_EXAMPLE_POLICY_DATA_HASHES")
-                .then(|| format!("{},{}", "22".repeat(32), "33".repeat(32)))
+        assert!(DaemonConfig::from_file_and_vars(Some(&path), |key| {
+            (key == "CID_EXAMPLE_POLICY_DATA_HASHES").then(|| "obsolete".into())
         })
-        .unwrap();
-        assert_eq!(cfg.example_policy_data_hashes, [[0x22; 32], [0x33; 32]]);
-        assert!(DaemonConfig::from_vars(|key| match key {
-            "CID_EXAMPLE_POLICY_DATA_HASHES" => Some("invalid".into()),
-            _ => required_env(key),
-        })
-        .is_err());
+        .is_ok());
     }
 
     #[test]
