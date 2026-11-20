@@ -188,4 +188,4 @@ Intentions again.
 | `reorg.tip_rewind` | Tip height moved backwards |
 | `pending.tip_rewind` | Committed status observed a tip rewind; occupancy kept this tick |
 | `submit.rejected_combo` | Cached combo skipped without a new submit (`debug`) |
-| `submit.rejected` | Transaction-level send_transaction reject (`-302` / `-1102` / `-1108`); combo skipped, sub-batches may still run |
+| `dry_run.rejected` / `submit.rejected` | Permanent transaction validation rejection. The combination is cached and other eligible combinations can still run. |
