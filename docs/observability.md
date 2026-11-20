@@ -1,7 +1,7 @@
 # Observability (phase 4)
 
-Digest correctness is unchanged. Logs, health, and counters are memory-only: a
-restart drops occupancy and readiness until the next successful indexer scan.
+The daemon holds occupancy and readiness in memory. After a restart, readiness
+returns with the next successful indexer scan.
 
 ## Logs
 
@@ -18,14 +18,15 @@ Stable field `event` (target `cid_backend`):
 
 | `event` | When |
 |---------|------|
-| `tick.start` / `tick.end` | Each digest tick (`scanned`, `skipped`, `submitted`, `conflicts`, `scan_ok`) |
+| `tick.start` / `tick.end` | Each digest tick (`scanned`, `skipped`, `submitted`, `conflicts`, `scan_ok`, `isolate_windows`) |
 | `scan.unavailable` | Indexer/RPC scan failed |
 | `process.resolve_miss` | No usable live Process binary |
 | `assemble.batch_failed` | Assembly error and attempted Intention outpoints |
 | `assemble.probe_failed` | Assembly error for a subset examined during isolation |
+| `assemble.probe_deferred` | A candidate liveness lookup was unavailable |
 | `assemble.invalid` | The assembled transaction failed structural or funding-input validation |
 | `assemble.process_unfunded` | Exit 37 from the audited v0.1.4 example ELF with zero state fee headroom paused assembly for the state and code |
-| `assemble.batch_isolated` | Working subset found during isolation |
+| `assemble.batch_isolated` | An assembled subset passed transaction validation |
 | `process.unhealthy` | Exit 41 quarantined the Process state/code pair and paused its filter refunds |
 | `ssri.filter_failed` | Filter error deferred the Process bucket |
 | `refund.process_state_pending` | Refund deferred while a pending digest spends or creates its state dependency |
@@ -46,6 +47,13 @@ Stable field `event` (target `cid_backend`):
 | `config.load_failed` | Illegal env / TOML / health bind failure (process exits) |
 | `config.loaded` | Successful load: path, `network_name`, declared `genesis_hash`, `genesis_status` (`declared_unverified` / `declared_will_verify` / `unset`), rpc/indexer **host only** (no userinfo) |
 | `genesis.verified` | `validate_genesis=true` and `get_block_hash(0x0)` matched (fail-closed otherwise: `genesis.mismatch`) |
+
+Each tick starts a fresh assembly scan of the current filter-accepted candidates,
+capped at 64 subset probes per Process. `isolate_windows` counts dispatched
+assembly jobs, and the assembly events identify attempted subsets. Some
+combinations may repeatedly fall outside the cap. This bounded-search starvation
+is accepted by design. Filter reasons 4–7 can authorize refunds after node
+re-reads and interlock checks, independently of assembly progress.
 
 ## Health HTTP
 

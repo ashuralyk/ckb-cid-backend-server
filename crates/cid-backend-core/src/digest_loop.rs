@@ -10,13 +10,13 @@ use crate::ssri::{filter_intentions, SsriError, SsriHost};
 use crate::submit::{execution_code_key, SubmitState};
 use crate::type_id::TypeIdCodeDep;
 pub use crate::worker_commands::{WorkerCommand, WorkerCommands};
-use crate::workers::{IsolationContext, IsolationExecution, WorkerPool, WorkerRemoveError};
+use crate::workers::{WorkerPool, WorkerRemoveError};
 use cid_intention_filter::{
     FILTER_ACCEPTED, FILTER_DEPOSIT_BELOW_MINIMUM, FILTER_MALFORMED_DIGEST,
     FILTER_UNSUPPORTED_ACTION, FILTER_UNSUPPORTED_ASSET,
 };
 use ckb_types::core::ScriptHashType;
-use ckb_types::packed::{Byte32, CellDep, CellOutput};
+use ckb_types::packed::{Byte32, CellDep};
 use ckb_types::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -106,12 +106,6 @@ struct FilteredBucket {
     refunds: Vec<ScannedIntention>,
 }
 
-struct WindowSearch {
-    pending: Option<Vec<ScannedIntention>>,
-    probe_pending: bool,
-    mode: BatchMode,
-}
-
 pub trait Clock {
     fn sleep(&self, duration: Duration);
 }
@@ -149,6 +143,8 @@ where
     last_tip: Option<u64>,
     /// Varies probe order for large candidate sets independently of search results.
     scan_number: u64,
+    /// Indexer membership from the previous scan, used only to spot arrivals.
+    previous_live_keys: HashSet<Vec<u8>>,
     tick_cell_deps: Vec<CellDep>,
     tick_cid_locks: Arc<[CidLockIdentity]>,
     execution_code_key: Vec<u8>,
@@ -186,6 +182,7 @@ where
             busy: None,
             last_tip: None,
             scan_number: 0,
+            previous_live_keys: HashSet::new(),
             tick_cell_deps: Vec::new(),
             tick_cid_locks: Arc::from([]),
             execution_code_key: Vec::new(),
@@ -430,7 +427,7 @@ where
         self.drain_worker_commands();
         let mut report = TickReport::default();
         let tip = self.refresh_tip();
-        self.reconcile_pending(tip);
+        let released_digests = self.reconcile_pending(tip);
 
         let resolved = match self.refresh_cell_deps() {
             Ok(deps) => deps,
@@ -442,7 +439,6 @@ where
                 );
                 report.last_error = Some(format!("code deps: {e}"));
                 self.clear_worker_tick_code();
-                self.clear_isolation_contexts();
                 self.tick_cell_deps.clear();
                 self.sync_busy_map();
                 return report;
@@ -488,7 +484,6 @@ where
                 report.last_error = Some(format!("scan unavailable: {m}"));
                 self.tick_cell_deps.clear();
                 self.clear_worker_tick_code();
-                self.clear_isolation_contexts();
                 self.sync_busy_map();
                 return report;
             }
@@ -501,7 +496,6 @@ where
                 report.last_error = Some(format!("scan error: {e}"));
                 self.tick_cell_deps.clear();
                 self.clear_worker_tick_code();
-                self.clear_isolation_contexts();
                 self.sync_busy_map();
                 return report;
             }
@@ -516,6 +510,14 @@ where
 
         let scan_number = self.scan_number;
         self.scan_number = self.scan_number.wrapping_add(1);
+        let arrivals = Arc::new(if scan_number == 0 {
+            HashSet::new()
+        } else {
+            live_keys
+                .difference(&self.previous_live_keys)
+                .cloned()
+                .collect()
+        });
         self.workers.for_each_mut(|w| {
             w.with_state_mut(|state| {
                 let pending_occupied = state.submit.pending_occupied_keys();
@@ -526,15 +528,18 @@ where
                 state
                     .refund_state_deps
                     .retain(|hash, _| state.submit.pending.contains_key(hash));
-                state.probe_budget = process_batch::ProbeBudget::for_scan(scan_number);
-                state.refund_assembly_checked = false;
+                state.probe_budget = Some(process_batch::ProbeBudget::for_scan(
+                    scan_number,
+                    arrivals.clone(),
+                ));
             });
         });
 
+        self.previous_live_keys = live_keys;
         let buckets = bucket_by_process_type_hash(scanned, &self.config.cid_code_hash);
         report.skipped +=
             report.scanned - buckets.iter().map(|(_, cells)| cells.len()).sum::<usize>();
-        let buckets: Vec<_> = buckets
+        let mut buckets: Vec<_> = buckets
             .into_iter()
             .filter_map(|(hash, mut bucket)| {
                 let Some(worker) = self.workers.get(&hash) else {
@@ -567,51 +572,24 @@ where
             })
             .collect();
         let mut searches: HashMap<_, _> = buckets
-            .iter()
+            .iter_mut()
+            .filter(|bucket| !bucket.accepted.is_empty())
             .map(|bucket| {
-                let process = &bucket.process;
-                let worker = self.workers.get(&process.type_hash).expect("bucket worker");
-                let mode = worker.with_state_mut(|state| {
-                    let mode = if !bucket.refunds.is_empty() && state.filter_refund_deferred {
-                        BatchMode::CheckAssembly
-                    } else {
-                        BatchMode::Assemble
-                    };
-                    state.set_isolation_context(Some(IsolationContext {
-                        accepted: bucket
-                            .accepted
-                            .iter()
-                            .map(|item| item.out_point.clone())
-                            .collect(),
-                        execution: IsolationExecution {
-                            process: process.live_cell.out_point.clone(),
-                            guest_hash: CellOutput::calc_data_hash(&process.binary).unpack(),
-                            code_key: self.batch_code_key(process),
-                            deps: self.tick_cell_deps.clone(),
-                            cid_locks: self.tick_cid_locks.clone(),
-                            max_tx_bytes: self.config.max_assembled_tx_bytes,
-                            mode,
-                        },
-                    }));
-                    mode
-                });
                 (
-                    process.type_hash,
-                    WindowSearch {
-                        pending: Some(bucket.accepted.clone()),
-                        probe_pending: false,
-                        mode,
-                    },
+                    bucket.process.type_hash,
+                    std::mem::take(&mut bucket.accepted),
                 )
             })
             .collect();
-        self.workers.for_each_mut(|worker| {
-            worker.with_state_mut(|state| {
-                if !searches.contains_key(&state.process_type_hash()) {
-                    state.set_isolation_context(None);
-                }
-            });
-        });
+
+        // Let an eligible refund use the state just released by a pending
+        // digest before another digest can occupy it.
+        for bucket in &mut buckets {
+            if released_digests.contains(&bucket.process.type_hash) {
+                self.dispatch_filter_refunds(bucket, &mut report);
+            }
+        }
+        self.wait_all_batches(&mut report, &mut searches);
 
         // Give each Process one worker job per round, then handle its result.
         for _ in 0..64 {
@@ -621,9 +599,8 @@ where
                 let Some(worker) = self.workers.get(hash) else {
                     continue;
                 };
-                let search = searches.get_mut(hash).expect("scan window search");
-                if search.pending.is_some() {
-                    self.process_bucket(&bucket.process, search, &mut report);
+                if let Some(items) = searches.remove(hash) {
+                    self.process_bucket(&bucket.process, items, &mut report);
                     started |= worker.batch_outstanding();
                 }
             }
@@ -633,97 +610,39 @@ where
             self.wait_all_batches(&mut report, &mut searches);
         }
 
-        // Give assembly the first turn to find a Process fault. A bounded
-        // second pass lets a fresh filter verdict proceed even under churn.
-        for bucket in buckets {
-            let hash = bucket.process.type_hash;
-            let search = &searches[&hash];
-            let pending = search.probe_pending
-                || search
-                    .pending
-                    .as_ref()
-                    .is_some_and(|items| !items.is_empty());
-            let can_refund = self.workers.get(&hash).is_some_and(|worker| {
-                worker.with_state_mut(|state| {
-                    let had_probe_turn = pending && state.refund_probe_waited;
-                    state.refund_probe_waited = pending && !bucket.refunds.is_empty();
-                    !state.is_process_quarantined(&bucket.process)
-                        && (!pending || had_probe_turn)
-                        && (!state.filter_refund_deferred
-                            || state.refund_assembly_checked
-                            || had_probe_turn
-                            || bucket.accepted.is_empty())
-                })
-            });
-            if !bucket.refunds.is_empty() && can_refund {
-                self.dispatch_process_batch(
-                    hash,
-                    &bucket.process,
-                    bucket.refunds,
-                    Vec::new(),
-                    1,
-                    &mut report,
-                    BatchMode::FilterRefund,
-                );
-            }
+        for bucket in &mut buckets {
+            self.dispatch_filter_refunds(bucket, &mut report);
         }
         self.wait_all_batches(&mut report, &mut searches);
 
+        self.workers.for_each_mut(|worker| {
+            worker.with_state_mut(|state| state.probe_budget = None);
+        });
         self.tick_cell_deps.clear();
         self.clear_worker_tick_code();
         self.sync_busy_map();
         report
     }
 
-    fn apply_polled_batch(
-        worker: &crate::workers::ProcessWorker,
-        report: &mut TickReport,
-        polled: crate::workers::PolledBatch,
-        search: Option<&mut WindowSearch>,
-    ) {
-        Self::apply_batch_report(report, &polled.delta);
-        if polled.mode == BatchMode::FilterRefund {
-            return;
+    fn dispatch_filter_refunds(&self, bucket: &mut FilteredBucket, report: &mut TickReport) {
+        if !bucket.refunds.is_empty() {
+            self.dispatch_process_batch(
+                bucket.process.type_hash,
+                &bucket.process,
+                std::mem::take(&mut bucket.refunds),
+                Vec::new(),
+                1,
+                report,
+                BatchMode::FilterRefund,
+            );
         }
-        let search = search.expect("scan window search");
-        search.pending = match polled.outcome {
-            BatchOutcome::RetryIsolation => {
-                let mut items = polled.window;
-                items.extend_from_slice(&polled.rest);
-                Some(items)
-            }
-            BatchOutcome::ProbePending => {
-                search.probe_pending = true;
-                None
-            }
-            outcome => {
-                worker.with_state_mut(|state| {
-                    state.isolation_probe = None;
-                    if outcome == BatchOutcome::AssemblyChecked {
-                        state.refund_assembly_checked = true;
-                    }
-                });
-                match outcome {
-                    BatchOutcome::Submitted => Some(polled.rest.to_vec()),
-                    BatchOutcome::Continue
-                        if polled.delta.conflicts == 0
-                            && polled.delta.last_error.is_none()
-                            && polled.delta.skipped > 0 =>
-                    {
-                        Some(polled.rest.to_vec())
-                    }
-                    _ => None,
-                }
-                .filter(|rest| !rest.is_empty())
-            }
-        };
     }
 
     /// Block until every outstanding RunBatch has an ack.
     fn wait_all_batches(
         &mut self,
         report: &mut TickReport,
-        searches: &mut HashMap<[u8; 32], WindowSearch>,
+        searches: &mut HashMap<[u8; 32], Vec<ScannedIntention>>,
     ) {
         loop {
             let mut any_outstanding = false;
@@ -738,7 +657,17 @@ where
                     ) {
                         self.sync_busy_map();
                     }
-                    Self::apply_polled_batch(worker, report, polled, searches.get_mut(&hash));
+                    Self::apply_batch_report(report, &polled.delta);
+                    if polled.mode == BatchMode::Assemble
+                        && !polled.rest.is_empty()
+                        && (polled.outcome == BatchOutcome::Submitted
+                            || (polled.outcome == BatchOutcome::Continue
+                                && polled.delta.conflicts == 0
+                                && polled.delta.last_error.is_none()
+                                && polled.delta.skipped > 0))
+                    {
+                        searches.insert(hash, polled.rest.to_vec());
+                    }
                 } else if worker.batch_outstanding() {
                     any_outstanding = true;
                 }
@@ -790,12 +719,6 @@ where
         });
     }
 
-    fn clear_isolation_contexts(&mut self) {
-        self.workers.for_each_mut(|worker| {
-            worker.with_state_mut(|state| state.set_isolation_context(None));
-        });
-    }
-
     fn refresh_cell_deps(&self) -> Result<crate::code_deps::ResolvedExecutionDeps, CodeDepError> {
         if self.config.type_id_code_deps.is_empty() {
             return Ok(crate::code_deps::ResolvedExecutionDeps {
@@ -816,7 +739,8 @@ where
         self.refresh_tip_only()
     }
 
-    fn reconcile_pending(&mut self, tip: Option<u64>) {
+    fn reconcile_pending(&mut self, tip: Option<u64>) -> HashSet<[u8; 32]> {
+        let mut released_digests = HashSet::new();
         let depth = self.config.confirmation_depth.max(1);
         let worker_hashes: Vec<[u8; 32]> = self.workers.hashes();
         for process_hash in worker_hashes {
@@ -885,6 +809,9 @@ where
                         }
                         worker.with_state_mut(|state| {
                             if let Some(p) = state.submit.pending.remove(&hash_bytes) {
+                                if !state.refund_state_deps.contains_key(&hash_bytes) {
+                                    released_digests.insert(process_hash);
+                                }
                                 for k in p.consumed {
                                     state.submit.in_flight.remove(&k);
                                 }
@@ -949,6 +876,9 @@ where
                             );
                             worker.with_state_mut(|state| {
                                 state.submit.pending.remove(&hash_bytes);
+                                if !state.refund_state_deps.contains_key(&hash_bytes) {
+                                    released_digests.insert(process_hash);
+                                }
                             });
                         } else {
                             worker.with_state_mut(|state| {
@@ -979,6 +909,7 @@ where
                 }
             }
         }
+        released_digests
     }
 
     fn refresh_tip_only(&mut self) -> Option<u64> {
@@ -1122,29 +1053,22 @@ where
     fn process_bucket(
         &self,
         process: &ResolvedProcess,
-        search: &mut WindowSearch,
+        mut items: Vec<ScannedIntention>,
         report: &mut TickReport,
     ) {
-        let Some(mut items) = search.pending.take() else {
-            return;
-        };
-        let mode = search.mode;
         let hash = process.type_hash;
         let Some(worker) = self.workers.get(&hash) else {
             return;
         };
-        let paused = worker.with_state_mut(|state| {
-            if state.is_process_unfunded(process) {
-                if mode == BatchMode::CheckAssembly {
-                    state.refund_assembly_checked = true;
-                }
-                return true;
-            }
-            if state.probe_budget.remaining == 0 {
-                search.probe_pending = !items.is_empty();
-                return true;
-            }
-            state.is_process_quarantined(process)
+        let paused = worker.with_state(|state| {
+            state.is_process_unfunded(process)
+                || state.is_process_quarantined(process)
+                || state
+                    .probe_budget
+                    .as_ref()
+                    .expect("tick probe budget")
+                    .remaining
+                    == 0
         });
         if paused {
             report.skipped += items.len();
@@ -1159,7 +1083,6 @@ where
                     reason = "batch_bounds",
                     error = %e,
                 );
-                worker.with_state_mut(|state| state.isolation_probe = None);
                 report.skipped += items.len();
                 return;
             }
@@ -1172,7 +1095,6 @@ where
                 min,
                 max,
             );
-            worker.with_state_mut(|state| state.isolation_probe = None);
             report.skipped += items.len();
             return;
         }
@@ -1196,18 +1118,20 @@ where
             }
         }
         if window.len() < min as usize {
-            worker.with_state_mut(|state| {
-                state.isolation_probe = None;
-                if mode == BatchMode::CheckAssembly {
-                    state.refund_assembly_checked = true;
-                }
-            });
             report.skipped += window.len() + rest.len();
             return;
         }
 
         report.isolate_windows += 1;
-        self.dispatch_process_batch(hash, process, window, rest, min, report, mode);
+        self.dispatch_process_batch(
+            hash,
+            process,
+            window,
+            rest,
+            min,
+            report,
+            BatchMode::Assemble,
+        );
     }
 
     fn batch_code_key(&self, process: &ResolvedProcess) -> Vec<u8> {
