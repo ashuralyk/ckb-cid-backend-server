@@ -60,6 +60,7 @@ pub use submit::{combo_fingerprint, execution_code_key, submit_execution, Pendin
 pub use type_id::{
     type_id_script, type_id_script_hash, TypeIdCodeDep, TypeIdIdentity, TYPE_ID_CODE_HASH,
 };
+pub use worker_commands::RegistrationQueueError;
 pub use workers::{
     ProcessWorker, ProcessWorkerState, WorkerPool, WorkerRegisterError, WorkerRemoveError,
 };

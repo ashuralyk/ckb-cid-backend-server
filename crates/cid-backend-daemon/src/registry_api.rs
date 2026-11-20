@@ -8,7 +8,7 @@ use cid_backend_core::process::{state_is_process_lock, validate_state_cid_bindin
 use cid_backend_core::rpc::{LiveCell, RpcError};
 use cid_backend_core::{
     type_id_script_hash, CidLockIdentity, ProcessRegistration, ProcessRegistry, RegisterOutcome,
-    RegistryError, WorkerCommand, WorkerCommands,
+    RegistrationQueueError, RegistryError, WorkerCommand, WorkerCommands,
 };
 use ckb_types::packed::{OutPoint, Script};
 use serde::{Deserialize, Serialize};
@@ -282,7 +282,6 @@ fn register_process(
     // Keep the idle check, registry write, and worker update atomic against
     // submission admission. This also covers sends whose receipt is uncertain.
     let outcome = {
-        use cid_backend_core::worker_commands::RegistrationQueueError;
         let mut reg = state.registry.lock().map_err(|_| ())?;
         let hash = reg_entry.identity_type_hash();
         let require_idle = reg.get(&hash).is_none_or(|existing| {
