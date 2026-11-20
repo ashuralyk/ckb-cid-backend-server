@@ -4,7 +4,9 @@ use crate::fee::RefundPolicy;
 use crate::host_query::HostQueryRpc;
 use crate::process::ResolvedProcess;
 use crate::process::{ProcessEntry, ProcessResolver};
-use crate::process_batch::{run_process_batch, BatchOutcome, BatchReportDelta, ProcessBatchParams};
+use crate::process_batch::{
+    run_process_batch, BatchMode, BatchOutcome, BatchReportDelta, ProcessBatchParams,
+};
 use crate::rpc::{LiveCell, Rpc};
 use crate::scan::ScannedIntention;
 use crate::ssri::SsriHost;
@@ -40,6 +42,9 @@ pub struct ProcessWorkerState {
     /// legal `[min,max]` assemble window.
     pub pending_incompatible_refund: HashSet<Vec<u8>>,
     pub generation: u64,
+    /// State out point quarantined after Process.assemble exit 41.
+    pub unhealthy_state: Option<OutPoint>,
+    pub(crate) filter_missing_logged: bool,
     last_process_code: Option<OutPoint>,
 }
 
@@ -59,6 +64,8 @@ impl ProcessWorkerState {
             isolate_pending: Vec::new(),
             pending_incompatible_refund: HashSet::new(),
             generation,
+            unhealthy_state: None,
+            filter_missing_logged: false,
             last_process_code: None,
         }
     }
@@ -67,6 +74,8 @@ impl ProcessWorkerState {
         if let Some(cell) = cell {
             if self.last_process_code.as_ref() != Some(&cell.out_point) {
                 self.last_process_code = Some(cell.out_point.clone());
+                self.unhealthy_state = None;
+                self.filter_missing_logged = false;
                 self.clear_execution_rejections();
             }
         }
@@ -95,11 +104,13 @@ enum ProcessWorkerJob {
         job_epoch: u64,
         process: ResolvedProcess,
         batch: Vec<ScannedIntention>,
+        rest: Arc<[ScannedIntention]>,
         execution_code_key: Vec<u8>,
         tick_cell_deps: Vec<CellDep>,
         refund_policy: RefundPolicy,
         max_assembled_tx_bytes: usize,
-        refund_only: bool,
+        min: u32,
+        mode: BatchMode,
         reply: SyncSender<(BatchOutcome, BatchReportDelta)>,
     },
 }
@@ -112,9 +123,9 @@ struct PendingBatch {
     resume_on_continue: Option<Vec<u8>>,
     /// Window + rest + min so Rejected can push the sync drop_first/shrink frames.
     window: Vec<ScannedIntention>,
-    rest: Vec<ScannedIntention>,
+    rest: Arc<[ScannedIntention]>,
     min: u32,
-    refund_only: bool,
+    mode: BatchMode,
 }
 
 /// Completed RunBatch poll result for the digest loop.
@@ -124,9 +135,9 @@ pub struct PolledBatch {
     pub window_fp: Vec<u8>,
     pub resume_on_continue: Option<Vec<u8>>,
     pub window: Vec<ScannedIntention>,
-    pub rest: Vec<ScannedIntention>,
+    pub rest: Arc<[ScannedIntention]>,
     pub min: u32,
-    pub refund_only: bool,
+    pub mode: BatchMode,
 }
 
 /// Handle to a Process worker thread.
@@ -192,7 +203,7 @@ impl ProcessWorker {
                     window: pending.window,
                     rest: pending.rest,
                     min: pending.min,
-                    refund_only: pending.refund_only,
+                    mode: pending.mode,
                 })
             }
             Err(mpsc::TryRecvError::Empty) => None,
@@ -210,7 +221,7 @@ impl ProcessWorker {
                     window: pending.window,
                     rest: pending.rest,
                     min: pending.min,
-                    refund_only: pending.refund_only,
+                    mode: pending.mode,
                 })
             }
         }
@@ -233,7 +244,7 @@ impl ProcessWorker {
         resume_on_continue: Option<Vec<u8>>,
         rest: Vec<ScannedIntention>,
         min: u32,
-        refund_only: bool,
+        mode: BatchMode,
     ) -> Result<(), StartBatchError> {
         if self
             .batch_outstanding
@@ -243,6 +254,7 @@ impl ProcessWorker {
             return Err(StartBatchError::AlreadyOutstanding);
         }
         let job_epoch = self.epoch.load(Ordering::SeqCst);
+        let rest: Arc<[_]> = rest.into();
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         if self
             .job_tx
@@ -250,11 +262,13 @@ impl ProcessWorker {
                 job_epoch,
                 process,
                 batch: batch.clone(),
+                rest: rest.clone(),
                 execution_code_key,
                 tick_cell_deps,
                 refund_policy,
                 max_assembled_tx_bytes,
-                refund_only,
+                min,
+                mode,
                 reply: reply_tx,
             })
             .is_err()
@@ -270,7 +284,7 @@ impl ProcessWorker {
             window: batch,
             rest,
             min,
-            refund_only,
+            mode,
         });
         Ok(())
     }
@@ -323,11 +337,13 @@ fn worker_thread_main<R, S>(
                 job_epoch,
                 process,
                 batch,
+                rest,
                 execution_code_key,
                 tick_cell_deps,
                 refund_policy,
                 max_assembled_tx_bytes,
-                refund_only,
+                min,
+                mode,
                 reply,
             } => {
                 if epoch.load(Ordering::SeqCst) != job_epoch {
@@ -355,13 +371,15 @@ fn worker_thread_main<R, S>(
                         state: state.clone(),
                         process: &process,
                         batch,
+                        rest: &rest,
                         execution_code_key: &execution_code_key,
                         tick_cell_deps: &tick_cell_deps,
                         refund_policy: &refund_policy,
                         max_assembled_tx_bytes,
                         job_epoch,
                         epoch: epoch.clone(),
-                        refund_only,
+                        min,
+                        mode,
                     },
                 );
                 // Always forward the real outcome — especially Submitted* after
@@ -508,6 +526,8 @@ where
                     state.resolver = ProcessResolver::for_entry(entry);
                     if code_changed {
                         state.last_process_code = None;
+                        state.unhealthy_state = None;
+                        state.filter_missing_logged = false;
                         state.clear_execution_rejections();
                     }
                 });

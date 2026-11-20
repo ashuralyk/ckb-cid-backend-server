@@ -2,14 +2,15 @@ use crate::code_deps::{resolve_execution_cell_deps, resolve_type_id_code_cell, C
 use crate::fee::{CidLockIdentity, RefundPolicy};
 use crate::host_query::HostQueryRpc;
 use crate::process::{ProcessEntry, ProcessResolver, ResolvedProcess};
-use crate::process_batch::{self, BatchOutcome, BatchReportDelta};
+use crate::process_batch::{self, BatchMode, BatchOutcome, BatchReportDelta};
 use crate::process_busy::ProcessBusyMap;
 use crate::rpc::{out_point_key, Rpc, RpcError, TxStatus};
 use crate::scan::{bucket_by_process_type_hash, scan_intentions_multi, ScannedIntention};
-use crate::ssri::SsriHost;
+use crate::ssri::{filter_intentions, SsriError, SsriHost};
 use crate::submit::{combo_fingerprint, execution_code_key, SubmitState};
 use crate::type_id::TypeIdCodeDep;
 use crate::workers::{WorkerPool, WorkerRemoveError};
+use cid_intention_filter::{FILTER_ACCEPTED, FILTER_RESERVED_2, FILTER_RESERVED_3};
 use ckb_types::core::ScriptHashType;
 use ckb_types::packed::{Byte32, CellDep};
 use ckb_types::prelude::*;
@@ -96,6 +97,12 @@ pub struct TickReport {
     pub isolate_windows: usize,
 }
 
+struct FilteredBucket {
+    process: ResolvedProcess,
+    accepted: Vec<ScannedIntention>,
+    refunds: Vec<ScannedIntention>,
+}
+
 pub trait Clock {
     fn sleep(&self, duration: Duration);
 }
@@ -153,6 +160,7 @@ where
     clock: C,
     ssri: Arc<S>,
     config: LoopConfig,
+    allow_missing_filter: bool,
     workers: WorkerPool<R, S>,
     /// Optional shared command queue for live registry API updates.
     worker_cmds: Option<Arc<Mutex<Vec<WorkerCommand>>>>,
@@ -189,6 +197,7 @@ where
             clock,
             ssri,
             config,
+            allow_missing_filter: false,
             workers,
             worker_cmds,
             busy: None,
@@ -213,6 +222,12 @@ where
 
     pub fn with_busy_map(mut self, busy: ProcessBusyMap) -> Self {
         self.busy = Some(busy);
+        self
+    }
+
+    /// Opt in to assembly for guests that explicitly lack Process.filter.
+    pub fn with_missing_filter_fallback(mut self, allow: bool) -> Self {
+        self.allow_missing_filter = allow;
         self
     }
 
@@ -530,39 +545,43 @@ where
             .and_then(|cmds| cmds.lock().ok())
             .map(|cmds| cmds.iter().map(WorkerCommand::identity).collect())
             .unwrap_or_default();
-        let mut eligible = Vec::new();
-        for i in scanned {
-            if queued_updates.contains(&i.args.process_type_hash) {
-                report.skipped += 1;
-                continue;
-            }
-            if self.workers.get(&i.args.process_type_hash).is_none() {
-                report.skipped += 1;
-                tracing::debug!(
-                    target: LOG_TARGET,
-                    event = "process.unregistered",
-                    process_type_hash = %hex_pref(&i.args.process_type_hash),
-                );
-                continue;
-            }
-            let k = out_point_key(&i.out_point);
-            let blocked = self
-                .workers
-                .get(&i.args.process_type_hash)
-                .expect("checked")
-                .with_state(|w| w.submit.in_flight.contains(&k) || w.submit.rejected.contains(&k));
-            if blocked {
-                continue;
-            }
-            eligible.push(i);
-        }
-
-        let buckets = bucket_by_process_type_hash(&eligible);
+        let buckets = bucket_by_process_type_hash(scanned, &self.config.cid_code_hash);
+        report.skipped +=
+            report.scanned - buckets.iter().map(|(_, cells)| cells.len()).sum::<usize>();
+        let buckets: Vec<_> = buckets
+            .into_iter()
+            .filter_map(|(hash, mut bucket)| {
+                let Some(worker) = self.workers.get(&hash) else {
+                    tracing::warn!(target: LOG_TARGET, event = "process.unregistered",
+                        process_type_hash = %hex_pref(&hash), count = bucket.len());
+                    report.skipped += bucket.len();
+                    return None;
+                };
+                if queued_updates.contains(&hash) {
+                    report.skipped += bucket.len();
+                    return None;
+                }
+                worker.with_state(|state| {
+                    let pending = state.submit.pending_occupied_keys();
+                    bucket.retain(|item| {
+                        let key = out_point_key(&item.out_point);
+                        !pending.contains(&key)
+                            && !state.submit.in_flight.contains(&key)
+                            && !state.submit.rejected.contains(&key)
+                    });
+                });
+                if bucket.is_empty() {
+                    return None;
+                }
+                self.prepare_bucket(hash, bucket, &mut report)
+            })
+            .collect();
         // Multi-round only for reject-isolate expansions. Transient Continue /
         // Conflict wait for the next tick (same as pre-async semantics).
         for _round in 0..64 {
             let mut started = false;
-            for (hash, bucket) in &buckets {
+            for bucket in &buckets {
+                let hash = &bucket.process.type_hash;
                 let was_out = self
                     .workers
                     .get(hash)
@@ -570,7 +589,7 @@ where
                 if was_out {
                     continue;
                 }
-                self.process_bucket(*hash, bucket.clone(), &mut report);
+                self.process_bucket(&bucket.process, bucket.accepted.clone(), &mut report);
                 if self
                     .workers
                     .get(hash)
@@ -584,6 +603,25 @@ where
                 break;
             }
         }
+
+        // Wait for assembly to finish first. A Process state fault discovered
+        // by assemble must also stop refunds authorized by its filter.
+        for bucket in buckets {
+            let hash = bucket.process.type_hash;
+            if !bucket.refunds.is_empty() && self.process_is_healthy(&bucket.process) {
+                self.dispatch_process_batch(
+                    hash,
+                    &bucket.process,
+                    bucket.refunds,
+                    Vec::new(),
+                    1,
+                    None,
+                    &mut report,
+                    BatchMode::FilterRefund,
+                );
+            }
+        }
+        self.wait_all_batches(&mut report);
 
         self.tick_cell_deps.clear();
         self.clear_worker_tick_code();
@@ -641,6 +679,9 @@ where
         polled: crate::workers::PolledBatch,
     ) -> bool {
         Self::apply_batch_report(report, &polled.delta);
+        if polled.mode == BatchMode::FilterRefund {
+            return false;
+        }
         let mut continue_round = false;
         match polled.outcome {
             BatchOutcome::Submitted | BatchOutcome::SubmittedProcess => {
@@ -657,7 +698,7 @@ where
                 });
             }
             BatchOutcome::Rejected | BatchOutcome::CachedRejected => {
-                if polled.refund_only {
+                if polled.mode.refund_only() {
                     // Permanent refund_only failure is combo-cached in process_batch;
                     // never isolate-split below-min leftovers (P3).
                     continue_round = worker.with_state(|s| !s.isolate_pending.is_empty());
@@ -699,7 +740,7 @@ where
                 }
             }
             BatchOutcome::Continue => {
-                if polled.refund_only {
+                if polled.mode.refund_only() {
                     // Cached / permanent refund_only soft-skip must not re-enter
                     // isolate rounds (would burn up to 64 RunBatch/tick).
                 } else if polled.delta.conflicts == 0
@@ -981,66 +1022,128 @@ where
         }
     }
 
+    fn process_is_healthy(&self, process: &ResolvedProcess) -> bool {
+        self.workers.get(&process.type_hash).is_some_and(|worker| {
+            worker.with_state(|state| {
+                state.unhealthy_state.as_ref() != Some(&process.live_cell.out_point)
+            })
+        })
+    }
+
+    fn prepare_bucket(
+        &self,
+        hash: [u8; 32],
+        mut bucket: Vec<ScannedIntention>,
+        report: &mut TickReport,
+    ) -> Option<FilteredBucket> {
+        let worker = self.workers.get(&hash)?;
+        let cid = CidLockIdentity::new(self.config.cid_code_hash, self.config.hash_type);
+        let process = match worker
+            .with_state_mut(|state| state.resolver.resolve(self.rpc.as_ref(), &hash, cid))
+        {
+            Ok(Some(process)) => process,
+            result => {
+                tracing::warn!(target: LOG_TARGET, event = "process.resolve_miss",
+                    process_type_hash = %hex_pref(&hash), error = ?result.err());
+                report.skipped += bucket.len();
+                return None;
+            }
+        };
+        if !self.process_is_healthy(&process) {
+            report.skipped += bucket.len();
+            return None;
+        }
+        bucket.retain(
+            |item| match item.belongs_to_process(&cid.code_hash, &process.type_hash) {
+                Ok(()) => true,
+                Err(reason) => {
+                    tracing::warn!(target: LOG_TARGET, event = "scan.unroutable",
+                    out_point = ?item.out_point, ?reason);
+                    report.skipped += 1;
+                    false
+                }
+            },
+        );
+
+        let mut accepted = Vec::new();
+        let mut refunds = Vec::new();
+        match filter_intentions(self.ssri.as_ref(), &process.binary, &bucket) {
+            Ok(reasons) => {
+                for (item, reason) in bucket.into_iter().zip(reasons) {
+                    match reason {
+                        Some(FILTER_ACCEPTED) => accepted.push(item),
+                        Some(reason @ (FILTER_RESERVED_2 | FILTER_RESERVED_3)) => {
+                            tracing::error!(target: LOG_TARGET, event = "ssri.filter_reserved",
+                                process_type_hash = %hex_pref(&hash), out_point = ?item.out_point, reason);
+                            report.skipped += 1;
+                        }
+                        Some(reason) => {
+                            tracing::info!(target: LOG_TARGET, event = "ssri.filter_refund",
+                                process_type_hash = %hex_pref(&hash), out_point = ?item.out_point, reason);
+                            refunds.push(item);
+                        }
+                        None => {
+                            tracing::warn!(target: LOG_TARGET, event = "ssri.filter_cell_too_large",
+                                process_type_hash = %hex_pref(&hash), out_point = ?item.out_point);
+                            report.skipped += 1;
+                        }
+                    }
+                }
+            }
+            Err(SsriError::MethodNotFound) => {
+                worker.with_state_mut(|state| {
+                    if !state.filter_missing_logged {
+                        tracing::warn!(target: LOG_TARGET, event = "ssri.filter_missing",
+                            process_type_hash = %hex_pref(&hash),
+                            fallback = self.allow_missing_filter);
+                        state.filter_missing_logged = true;
+                    }
+                });
+                if !self.allow_missing_filter {
+                    report.skipped += bucket.len();
+                    report.last_error = Some("Process.filter is missing".into());
+                    return None;
+                }
+                accepted = bucket;
+            }
+            Err(error) => {
+                tracing::warn!(target: LOG_TARGET, event = "ssri.filter_failed",
+                    process_type_hash = %hex_pref(&hash), %error);
+                report.skipped += bucket.len();
+                report.last_error = Some(format!("Process.filter: {error}"));
+                return None;
+            }
+        }
+
+        // Old isolate frames may contain cells that failed this tick's filter,
+        // or disappeared from the live set. Keep only this tick's accepted cells.
+        let keys: HashSet<_> = accepted
+            .iter()
+            .map(|i| out_point_key(&i.out_point))
+            .collect();
+        worker.with_state_mut(|state| {
+            for frame in &mut state.isolate_pending {
+                frame.retain(|i| keys.contains(&out_point_key(&i.out_point)));
+            }
+            state.isolate_pending.retain(|frame| !frame.is_empty());
+        });
+        Some(FilteredBucket {
+            process,
+            accepted,
+            refunds,
+        })
+    }
+
     fn process_bucket(
         &mut self,
-        hash: [u8; 32],
+        process: &ResolvedProcess,
         bucket: Vec<ScannedIntention>,
         report: &mut TickReport,
     ) {
-        if bucket.is_empty() {
+        if bucket.is_empty() || !self.process_is_healthy(process) {
             return;
         }
-        if self.workers.get(&hash).is_none() {
-            report.skipped += bucket.len();
-            return;
-        }
-
-        // Collect async RunBatch outcomes without blocking other Processes (P1).
-        if let Some(worker) = self.workers.get(&hash) {
-            if let Some(polled) = worker.try_poll_batch() {
-                if matches!(
-                    polled.outcome,
-                    BatchOutcome::Submitted | BatchOutcome::SubmittedProcess
-                ) {
-                    self.sync_busy_map();
-                }
-                let outcome = polled.outcome;
-                Self::apply_polled_batch(worker, report, polled);
-                if matches!(outcome, BatchOutcome::SubmittedProcess) {
-                    return;
-                }
-            }
-            if worker.batch_outstanding() {
-                return;
-            }
-        }
-
-        let process = {
-            let worker = self.workers.get(&hash).expect("exists");
-            match worker.with_state_mut(|state| state.resolver.resolve(self.rpc.as_ref(), &hash)) {
-                Ok(Some(p)) => p,
-                Ok(None) => {
-                    tracing::warn!(
-                        target: LOG_TARGET,
-                        event = "process.resolve_miss",
-                        process_type_hash = %hex_pref(&hash),
-                    );
-                    report.skipped += bucket.len();
-                    return;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        target: LOG_TARGET,
-                        event = "process.resolve_miss",
-                        process_type_hash = %hex_pref(&hash),
-                        error = %e,
-                    );
-                    report.skipped += bucket.len();
-                    return;
-                }
-            }
-        };
-
+        let hash = process.type_hash;
         let (min, max) = match self.ssri.get_batch_bounds(&process.binary) {
             Ok(b) => b,
             Err(e) => {
@@ -1082,7 +1185,7 @@ where
         let bucket = Self::rotate_bucket(bucket, resume_key.as_ref());
         let resume = self.isolate_window(
             hash,
-            &process,
+            process,
             bucket,
             min,
             max,
@@ -1232,7 +1335,11 @@ where
                     min,
                     resume_on_continue,
                     report,
-                    refund_only,
+                    if refund_only {
+                        BatchMode::RetryRefund
+                    } else {
+                        BatchMode::Assemble
+                    },
                 );
                 if !matches!(outcome, BatchOutcome::CachedRejected) {
                     *attempts += 1;
@@ -1399,7 +1506,7 @@ where
         min: u32,
         resume_on_continue: Option<Vec<u8>>,
         report: &mut TickReport,
-        refund_only: bool,
+        mode: BatchMode,
     ) -> BatchOutcome {
         let worker = match self.workers.get(&hash) {
             Some(w) => w,
@@ -1432,7 +1539,7 @@ where
             resume_on_continue,
             rest,
             min,
-            refund_only,
+            mode,
         ) {
             Ok(()) => BatchOutcome::ProcessOccupied,
             Err(crate::workers::StartBatchError::AlreadyOutstanding) => {

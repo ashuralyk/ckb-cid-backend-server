@@ -5,10 +5,16 @@ use cid_backend_core::type_id::TYPE_ID_CODE_HASH;
 use cid_process_executor::{AssembledTx, HostCell, MockHost};
 use cid_protocol::CidArgs;
 use ckb_types::core::ScriptHashType;
-use ckb_types::packed::{CellOutput, RawTransaction, Script, Transaction};
+use ckb_types::packed::{CellInput, CellOutput, OutPoint, RawTransaction, Script, Transaction};
 use ckb_types::prelude::*;
 
+type FilterScript = Box<dyn FnMut(usize) -> Result<Vec<i8>, SsriError> + Send>;
+
 pub struct ScriptedSsri {
+    filter_script: Mutex<Option<FilterScript>>,
+    pub filter_requests: Mutex<Vec<Vec<u8>>>,
+    intention_errors: Vec<(OutPoint, i8)>,
+    additional_input: Option<OutPoint>,
     pub bounds: (u32, u32),
     pub mode: Mode,
     /// Binaries observed by `get_batch_bounds` / `assemble` (SSRI source tests).
@@ -30,6 +36,10 @@ pub enum Mode {
 impl ScriptedSsri {
     fn base(bounds: (u32, u32), mode: Mode) -> Self {
         Self {
+            filter_script: Mutex::new(None),
+            filter_requests: Mutex::new(Vec::new()),
+            intention_errors: Vec::new(),
+            additional_input: None,
             bounds,
             mode,
             seen_binaries: Mutex::new(Vec::new()),
@@ -62,12 +72,42 @@ impl ScriptedSsri {
         Self::base(bounds, Mode::FixedBeneficiary(capacity))
     }
 
+    pub fn with_filter(
+        self,
+        filter: impl FnMut(usize) -> Result<Vec<i8>, SsriError> + Send + 'static,
+    ) -> Self {
+        *self.filter_script.lock().unwrap() = Some(Box::new(filter));
+        self
+    }
+
+    pub fn with_intention_error(mut self, op: OutPoint, code: i8) -> Self {
+        self.intention_errors.push((op, code));
+        self
+    }
+
+    pub fn with_added_input(mut self, op: OutPoint) -> Self {
+        self.additional_input = Some(op);
+        self
+    }
+
     fn note_binary(&self, binary: &[u8]) {
         self.seen_binaries.lock().unwrap().push(binary.to_vec());
     }
 }
 
 impl SsriHost for ScriptedSsri {
+    fn filter(&self, _: &[u8], request: &[u8]) -> Result<Vec<i8>, SsriError> {
+        self.filter_requests.lock().unwrap().push(request.to_vec());
+        let count = cid_intention_filter::decode_filter_request(request)
+            .unwrap()
+            .cells
+            .len();
+        match self.filter_script.lock().unwrap().as_mut() {
+            Some(script) => script(count),
+            None => Ok(vec![0; count]),
+        }
+    }
+
     fn get_batch_bounds(&self, binary: &[u8]) -> Result<(u32, u32), SsriError> {
         self.note_binary(binary);
         match &self.mode {
@@ -83,10 +123,33 @@ impl SsriHost for ScriptedSsri {
         host: MockHost,
     ) -> Result<AssembledTx, SsriError> {
         self.note_binary(binary);
+        if !self.intention_errors.is_empty() {
+            let draft = Transaction::from_slice(draft_tx).unwrap();
+            for input in draft.raw().inputs() {
+                let op = input.previous_output();
+                if let Some((_, code)) = self.intention_errors.iter().find(|(bad, _)| *bad == op) {
+                    return Err(SsriError::Incompatible(*code));
+                }
+            }
+        }
         match &self.mode {
             Mode::AlwaysIncompatible(c) => Err(SsriError::Incompatible(*c)),
             Mode::Unusable => Err(SsriError::Unusable("scripted".into())),
-            Mode::MimicExample => mimic_assemble(draft_tx, host, None),
+            Mode::MimicExample => {
+                let assembled = mimic_assemble(draft_tx, host, None)?;
+                let Some(op) = &self.additional_input else {
+                    return Ok(assembled);
+                };
+                let tx = Transaction::from_slice(assembled.as_molecule_bytes()).unwrap();
+                let mut inputs: Vec<_> = tx.raw().inputs().into_iter().collect();
+                inputs.push(CellInput::new_builder().previous_output(op.clone()).build());
+                let mut witnesses: Vec<_> = tx.witnesses().into_iter().collect();
+                witnesses.push(Default::default());
+                let raw = tx.raw().as_builder().inputs(inputs.pack()).build();
+                let tx = tx.as_builder().raw(raw).witnesses(witnesses.pack()).build();
+                AssembledTx::from_bytes(tx.as_slice())
+                    .map_err(|error| SsriError::Unusable(error.to_string()))
+            }
             Mode::FixedBeneficiary(cap) => mimic_assemble(draft_tx, host, Some(*cap)),
             Mode::OkThenIncompatible { remaining_ok, code } => {
                 let mut n = remaining_ok.lock().unwrap();

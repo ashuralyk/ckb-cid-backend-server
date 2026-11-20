@@ -47,6 +47,7 @@ pub struct DaemonConfig {
     pub registry_max_entries: usize,
     /// Confirmation depth for submitted execution txs. Default 24.
     pub confirmation_depth: u64,
+    pub allow_missing_filter: bool,
     /// Fee rate for allowlisted bounded refunds. The guest sets DigestOk fees.
     pub fee_rate: u64,
     /// Audited CID lock identities that may use bounded refund fee mode.
@@ -217,11 +218,10 @@ pub fn usage() -> &'static str {
      Precedence: defaults < TOML file < non-empty CID_* process env.\n\
      File mode requires [network].genesis_hash (declared identity, not verified\n\
      unless network.validate_genesis = true).\n\
-     Type-ID (preferred): cid_lock/process/process_lock type_id_args (+ optional\n\
-     type_id full hash). Scan lock code_hash = derived TYPE_ID script hash,\n\
-     hash_type=type; CellDeps refreshed each tick. data/data1/data2 primaries\n\
-     remain for local fixtures only; old Intentions use legacy_scan_locks.\n\
-     Static [[cell_deps]] remain for extras / local fixtures.\n"
+     Routing uses cid_lock.type_id_args (+ optional type_id full hash).\n\
+     Register Process state and code Type IDs through the HTTP API.\n\
+     Type-ID CellDeps refresh each tick. Static [[cell_deps]] supply extras.\n\
+     loop.allow_missing_filter defaults to false.\n"
 }
 
 #[derive(Default, Deserialize)]
@@ -344,6 +344,8 @@ struct LoopSection {
     poll_interval_secs: Option<u64>,
     #[serde(default)]
     confirmation_depth: Option<u64>,
+    #[serde(default)]
+    allow_missing_filter: bool,
     #[serde(default)]
     fee_rate: Option<u64>,
 }
@@ -782,6 +784,11 @@ fn merge<F: Fn(&str) -> Option<String>>(
         ));
     }
 
+    let allow_missing_filter = match nonempty(&get, "CID_ALLOW_MISSING_FILTER") {
+        Some(s) => parse_bool_flag(&s, "CID_ALLOW_MISSING_FILTER")?,
+        None => digest.allow_missing_filter,
+    };
+
     Ok(DaemonConfig {
         node_url,
         indexer_url,
@@ -797,6 +804,7 @@ fn merge<F: Fn(&str) -> Option<String>>(
         registry_path,
         registry_max_entries,
         confirmation_depth,
+        allow_missing_filter,
         fee_rate,
         bounded_refund_locks,
         extra_scan_locks,
@@ -1973,6 +1981,31 @@ poll_interval_secs = 1
         );
         let err = DaemonConfig::from_file_and_vars(Some(&p), |_| None).unwrap_err();
         assert!(matches!(err, ConfigError::Invalid(_)));
+    }
+
+    #[test]
+    fn testnet_v014_example_loads_with_current_cid_type_id() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/cid.testnet.toml");
+        let cfg = DaemonConfig::from_file_and_vars(Some(&path), |_| None).unwrap();
+        assert!(cfg.validate_genesis);
+        assert!(!cfg.allow_missing_filter);
+        assert_eq!(
+            hex::encode(cfg.cid_lock_code_hash),
+            "f3f8a56c2594030f99f05b09ff1b6a1b07e6e07ed04309c1c4e246561faad326"
+        );
+        assert_eq!(cfg.hash_type, ScriptHashType::Type);
+        assert_eq!(
+            cfg.bounded_refund_locks,
+            [CidLockIdentity::new(
+                cfg.cid_lock_code_hash,
+                ScriptHashType::Type
+            )]
+        );
+        let cfg = DaemonConfig::from_file_and_vars(Some(&path), |key| {
+            (key == "CID_ALLOW_MISSING_FILTER").then(|| "true".into())
+        })
+        .unwrap();
+        assert!(cfg.allow_missing_filter);
     }
 
     #[test]

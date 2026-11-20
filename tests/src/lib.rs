@@ -9,6 +9,7 @@ pub mod vertical_confirm;
 pub mod vertical_embedded_ssri;
 pub mod vertical_failure;
 pub mod vertical_fee;
+pub mod vertical_filter;
 pub mod vertical_incompatible;
 pub mod vertical_n1;
 pub mod vertical_reorg;

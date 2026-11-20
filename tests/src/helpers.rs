@@ -195,7 +195,7 @@ pub fn process_cell_for_code(
     let lock = Script::new_builder()
         .code_hash(entry.code.type_script_hash().pack())
         .hash_type(ScriptHashType::Type.into())
-        .args(Vec::<u8>::new().pack())
+        .args([CID_CODE.as_slice(), &[1, unique]].concat().pack())
         .build();
     let ts = type_id_script(&entry.identity.args);
     live_cell(

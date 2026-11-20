@@ -10,4 +10,5 @@ ckb-types = { workspace = true }
 ckb-hash = "0.119.0"
 cid-protocol = { workspace = true }
 cid-process-executor = { workspace = true }
+cid-intention-filter = { workspace = true }
 serde_molecule = "1.1"

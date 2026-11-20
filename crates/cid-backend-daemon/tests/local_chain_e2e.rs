@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use cid_backend_core::digest_loop::{DigestLoop, NopClock};
 use cid_backend_core::rpc::{script_hash32, Rpc, TxStatus};
 use cid_backend_core::ssri::EmbeddedSsri;
+use cid_backend_core::{ProcessEntry, TypeIdCodeDep, TypeIdIdentity};
 use cid_backend_daemon::{CkbRpc, DaemonConfig};
 use cid_protocol::{CidArgs, Payload, Script as CidScript};
 use ckb_hash::{blake2b_256, new_blake2b};
@@ -90,14 +91,6 @@ fn secp_lock() -> Script {
         .code_hash(SECP_TYPE_HASH.pack())
         .hash_type(ScriptHashType::Type.into())
         .args(ISSUED_ARGS.to_vec().pack())
-        .build()
-}
-
-fn data1_script(code_hash: [u8; 32], args: Vec<u8>) -> Script {
-    Script::new_builder()
-        .code_hash(code_hash.pack())
-        .hash_type(ScriptHashType::Data1.into())
-        .args(args.pack())
         .build()
 }
 
@@ -302,12 +295,13 @@ fn change_output(lock: &Script, cap: u64) -> CellOutput {
         .build()
 }
 
-fn code_output(lock: &Script, data: &[u8]) -> (CellOutput, u64) {
-    let cap = occupied(lock, None, data) + 200_0000_0000;
+fn code_output(lock: &Script, type_script: Option<Script>, data: &[u8]) -> (CellOutput, u64) {
+    let cap = occupied(lock, type_script.as_ref(), data) + 200_0000_0000;
     (
         CellOutput::new_builder()
             .capacity(cap.pack())
             .lock(lock.clone())
+            .type_(type_script.pack())
             .build(),
         cap,
     )
@@ -330,24 +324,27 @@ fn scan_resolve_ssri_submit_confirms_on_local_dev_chain() {
     assert_eq!(&cid_elf[..4], b"\x7fELF");
     assert_eq!(&always_elf[..4], b"\x7fELF");
 
-    let process_code_hash = blake2b_256(&process_elf);
-    let cid_code_hash = blake2b_256(&cid_elf);
     let always_code_hash = blake2b_256(&always_elf);
 
-    let rpc = CkbRpc::with_process_code_hashes(&rpc_url, &rpc_url, vec![process_code_hash]);
+    let rpc = CkbRpc::new(&rpc_url, &rpc_url);
     let secp_lock = secp_lock();
     let (secp_code_dep, secp_data_dep) = genesis_deps(&rpc);
     let (issued_op, issued_cap) = live_funding_cell(&rpc);
 
-    let (as_out, as_cap) = code_output(&secp_lock, &always_elf);
-    let (cid_out, cid_cap) = code_output(&secp_lock, &cid_elf);
-    let (proc_code_out, proc_code_cap) = code_output(&secp_lock, &process_elf);
+    let funding_input = input(issued_op);
+    let cid_code = TypeIdIdentity::new(calc_type_id(&funding_input, 1));
+    let cid_code_hash = cid_code.type_script_hash();
+    let process_code = TypeIdIdentity::new(calc_type_id(&funding_input, 2));
+    let (as_out, as_cap) = code_output(&secp_lock, None, &always_elf);
+    let (cid_out, cid_cap) = code_output(&secp_lock, Some(cid_code.type_script()), &cid_elf);
+    let (proc_code_out, proc_code_cap) =
+        code_output(&secp_lock, Some(process_code.type_script()), &process_elf);
     let spent = as_cap + cid_cap + proc_code_cap;
     assert!(issued_cap > spent + 1_000_0000_0000, "genesis capacity");
     let change_cap = issued_cap - spent - 1_0000_0000; // 1 CKB fee buffer even with min_fee_rate=0
 
     let tx1 = TransactionBuilder::default()
-        .input(input(issued_op.clone()))
+        .input(funding_input)
         .output(as_out)
         .output(cid_out)
         .output(proc_code_out)
@@ -378,20 +375,17 @@ fn scan_resolve_ssri_submit_confirms_on_local_dev_chain() {
         .index(3u32.pack())
         .build();
 
-    let always_lock = data1_script(always_code_hash, vec![]);
-    let first_in = input(change_op.clone());
-    let type_id = calc_type_id(&first_in, 0);
-    let process_type = data1_script(process_code_hash, type_id.to_vec());
+    let first_in = input(change_op);
+    let process_state = TypeIdIdentity::new(calc_type_id(&first_in, 0));
+    let process_type = process_state.type_script();
     let process_type_hash = script_hash32(&process_type);
 
-    let proc_data_cap = occupied(&always_lock, Some(&process_type), &process_elf) + 200_0000_0000;
-    let proc_out = {
-        let mut b = CellOutput::new_builder()
-            .capacity(proc_data_cap.pack())
-            .lock(always_lock.clone());
-        b = b.type_(Some(process_type.clone()).pack());
-        b.build()
-    };
+    let process_lock = Script::new_builder()
+        .code_hash(process_code.type_script_hash().pack())
+        .hash_type(ScriptHashType::Type.into())
+        .args([cid_code_hash.as_slice(), &[1, 0xEE]].concat().pack())
+        .build();
+    let (proc_out, proc_data_cap) = code_output(&process_lock, Some(process_type), &[]);
     let payload = Payload::from_script(&CidScript {
         code_hash: always_code_hash,
         hash_type: 2,
@@ -406,8 +400,12 @@ fn scan_resolve_ssri_submit_confirms_on_local_dev_chain() {
     let intent_args = CidArgs::new(process_type_hash, user, payload)
         .encode()
         .unwrap();
-    let cid_lock = data1_script(cid_code_hash, intent_args);
-    let intent_cap = occupied(&cid_lock, None, &[]) + 50_0000_0000;
+    let cid_lock = Script::new_builder()
+        .code_hash(cid_code_hash.pack())
+        .hash_type(ScriptHashType::Type.into())
+        .args(intent_args.pack())
+        .build();
+    let intent_cap = 600_0000_0000_u64;
     let intent_out = CellOutput::new_builder()
         .capacity(intent_cap.pack())
         .lock(cid_lock)
@@ -421,7 +419,7 @@ fn scan_resolve_ssri_submit_confirms_on_local_dev_chain() {
         .output(proc_out)
         .output(intent_out)
         .output(change_output(&secp_lock, change2))
-        .output_data(process_elf.pack())
+        .output_data(Vec::<u8>::new().pack())
         .output_data(Vec::<u8>::new().pack())
         .output_data(Vec::<u8>::new().pack())
         .cell_dep(secp_code_dep)
@@ -452,17 +450,21 @@ fn scan_resolve_ssri_submit_confirms_on_local_dev_chain() {
         node_url: rpc_url.clone(),
         indexer_url: rpc_url.clone(),
         cid_lock_code_hash: cid_code_hash,
-        hash_type: ScriptHashType::Data1,
+        hash_type: ScriptHashType::Type,
         poll_interval: Duration::from_secs(1),
-        extra_cell_deps: vec![cell_dep(cid_op), cell_dep(proc_code_op), cell_dep(as_op)],
-        type_id_code_deps: vec![],
-        process_type_code_hashes: vec![process_code_hash],
+        extra_cell_deps: vec![cell_dep(as_op)],
+        type_id_code_deps: vec![TypeIdCodeDep {
+            label: "cid_lock".into(),
+            identity: cid_code,
+        }],
+        process_type_code_hashes: vec![],
         health_bind: None,
         api_bind: None,
         allow_non_loopback_api: false,
         registry_path: std::env::temp_dir().join("cid-local-e2e-registry.json"),
         registry_max_entries: 64,
         confirmation_depth: 1,
+        allow_missing_filter: false,
         fee_rate: cid_backend_core::DEFAULT_FEE_RATE,
         bounded_refund_locks: vec![],
         extra_scan_locks: vec![],
@@ -472,10 +474,13 @@ fn scan_resolve_ssri_submit_confirms_on_local_dev_chain() {
         log_format: cid_backend_daemon::logging::LogFormat::Json,
     };
     let live_rpc = CkbRpc::from_config(&cfg);
-    // Local e2e still uses data1 fixtures; register Process after Process-as-lock
-    // cutover lands on the local chain script set. Until then, empty workers
-    // will skip Intentions — this suite is #[ignore] without a live node.
     let mut loop_ = DigestLoop::new(live_rpc, NopClock, EmbeddedSsri, cfg.to_loop_config());
+    assert!(loop_.register_process(ProcessEntry {
+        identity_type_hash: process_type_hash,
+        identity: process_state,
+        code: process_code,
+        ssri_elf_path: None,
+    }));
 
     let mut submitted_hash: Option<Byte32> = None;
     for i in 0..20 {

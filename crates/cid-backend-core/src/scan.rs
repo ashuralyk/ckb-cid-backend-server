@@ -1,5 +1,8 @@
 use crate::rpc::{LiveCell, Rpc, RpcError};
-use cid_protocol::CidArgs;
+use cid_intention_filter::{
+    intention_belongs_to_process, intention_process_type_id, IntentionRouteError,
+};
+use cid_protocol::{CidArgs, Script as CidScript};
 use ckb_types::core::ScriptHashType;
 use ckb_types::packed::{OutPoint, Script};
 use ckb_types::prelude::*;
@@ -20,6 +23,22 @@ pub struct ScannedIntention {
 }
 
 impl ScannedIntention {
+    fn protocol_lock(&self) -> CidScript {
+        CidScript {
+            code_hash: self.lock_code_hash,
+            hash_type: self.lock_hash_type as u8,
+            args: self.lock_args.clone(),
+        }
+    }
+
+    pub fn belongs_to_process(
+        &self,
+        cid_code_hash: &[u8; 32],
+        process_type_hash: &[u8; 32],
+    ) -> Result<(), IntentionRouteError> {
+        intention_belongs_to_process(&self.protocol_lock(), cid_code_hash, process_type_hash)
+    }
+
     pub fn lock_identity(&self) -> crate::fee::CidLockIdentity {
         crate::fee::CidLockIdentity::new(self.lock_code_hash, self.lock_hash_type)
     }
@@ -90,16 +109,24 @@ pub fn scan_intentions_multi<R: Rpc>(
 }
 
 pub fn bucket_by_process_type_hash(
-    intentions: &[ScannedIntention],
+    intentions: Vec<ScannedIntention>,
+    cid_code_hash: &[u8; 32],
 ) -> Vec<([u8; 32], Vec<ScannedIntention>)> {
     let mut first_seen: Vec<[u8; 32]> = Vec::new();
     let mut map: HashMap<[u8; 32], Vec<ScannedIntention>> = HashMap::new();
     for item in intentions {
-        let hash = item.args.process_type_hash;
+        let hash = match intention_process_type_id(&item.protocol_lock(), cid_code_hash) {
+            Ok(hash) => hash,
+            Err(reason) => {
+                tracing::warn!(target: "cid_backend", event = "scan.unroutable",
+                    out_point = ?item.out_point, ?reason);
+                continue;
+            }
+        };
         if !map.contains_key(&hash) {
             first_seen.push(hash);
         }
-        map.entry(hash).or_default().push(item.clone());
+        map.entry(hash).or_default().push(item);
     }
     first_seen
         .into_iter()
@@ -175,7 +202,7 @@ mod tests {
             cell(3, cid_args(p_a)),
         ];
         let decoded = decode_cells(cells);
-        let buckets = bucket_by_process_type_hash(&decoded);
+        let buckets = bucket_by_process_type_hash(decoded, &[0xC1; 32]);
         assert_eq!(buckets.len(), 2);
         assert_eq!(buckets[0].0, p_a);
         assert_eq!(buckets[1].0, p_b);

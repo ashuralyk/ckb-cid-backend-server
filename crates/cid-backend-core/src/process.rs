@@ -1,5 +1,7 @@
+use crate::fee::CidLockIdentity;
 use crate::rpc::{out_point_key, script_hash32, LiveCell, Rpc, RpcError};
 use crate::type_id::{TypeIdIdentity, TYPE_ID_CODE_HASH};
+use cid_process_example_policy::ProcessLockArgs;
 use ckb_types::core::ScriptHashType;
 use ckb_types::prelude::*;
 use std::collections::HashMap;
@@ -86,6 +88,7 @@ impl ProcessResolver {
         &mut self,
         rpc: &R,
         process_type_hash: &[u8; 32],
+        cid: CidLockIdentity,
     ) -> Result<Option<ResolvedProcess>, RpcError> {
         if process_type_hash != &self.entry.identity_type_hash {
             return Ok(None);
@@ -111,6 +114,11 @@ impl ProcessResolver {
         let cell = matches.into_iter().next().expect("len==1");
         if !state_is_process_lock(&self.entry, &cell) {
             log::warn!("live Process cell failed Process-as-lock validation");
+            return Ok(None);
+        }
+        if let Err(reason) = validate_state_cid_binding(&cell, cid) {
+            tracing::error!(target: "cid_backend", event = "process.incompatible_state",
+                process_type_hash = ?process_type_hash, out_point = ?cell.out_point, %reason);
             return Ok(None);
         }
         let source_key = self
@@ -222,6 +230,22 @@ pub fn state_is_process_lock(entry: &ProcessEntry, cell: &LiveCell) -> bool {
     true
 }
 
+/// Validate the Process lock's binding to the configured CID Type-ID.
+pub fn validate_state_cid_binding(cell: &LiveCell, cid: CidLockIdentity) -> Result<(), String> {
+    let args = ProcessLockArgs::decode(&cell.lock().args().raw_data()).map_err(|e| {
+        format!("invalid Process state lock args ({e:?}); expected CID code hash, hash type and optional salt")
+    })?;
+    if cid.hash_type != ScriptHashType::Type
+        || !args.matches_intention_lock(&cid.code_hash, ScriptHashType::Type as u8)
+    {
+        return Err(
+            "Process state lock args must bind the configured CID Type-ID with hash_type=type"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 fn looks_like_elf(data: &[u8]) -> bool {
     data.len() >= 4 && data[0] == 0x7f && data[1] == b'E' && data[2] == b'L' && data[3] == b'F'
 }
@@ -235,6 +259,11 @@ mod tests {
     use ckb_types::packed::Script;
     use ckb_types::packed::{Byte32, CellOutput, OutPoint};
     use std::cell::RefCell;
+
+    const CID: CidLockIdentity = CidLockIdentity {
+        code_hash: [0xC1; 32],
+        hash_type: ScriptHashType::Type,
+    };
 
     struct TestRpc {
         cell: RefCell<Option<LiveCell>>,
@@ -301,7 +330,7 @@ mod tests {
         let lock = Script::new_builder()
             .code_hash(entry.code.type_script_hash().pack())
             .hash_type(ScriptHashType::Type.into())
-            .args(Vec::<u8>::new().pack())
+            .args([[0xC1; 32].as_slice(), &[1]].concat().pack())
             .build();
         let ts = type_id_script(&entry.identity.args);
         let op = OutPoint::new_builder()
@@ -341,6 +370,31 @@ mod tests {
     }
 
     #[test]
+    fn process_state_binding_validates_cid_hash_and_hash_type() {
+        let entry = test_entry([0xab; 32], [0xcd; 32]);
+        let (_, state) = process_state_cell(&entry, vec![]);
+        let cid = CID;
+        assert_eq!(validate_state_cid_binding(&state, cid), Ok(()));
+
+        for (args, message) in [
+            (vec![1], "TooShort"),
+            ([[0xC2; 32].as_slice(), &[1]].concat(), "configured CID"),
+            ([[0xC1; 32].as_slice(), &[2]].concat(), "hash_type=type"),
+            (
+                [[0xC1; 32].as_slice(), &[3]].concat(),
+                "UnsupportedHashType",
+            ),
+        ] {
+            let mut state = state.clone();
+            let lock = state.lock().as_builder().args(args.pack()).build();
+            state.output = state.output.as_builder().lock(lock).build();
+            assert!(validate_state_cid_binding(&state, cid)
+                .unwrap_err()
+                .contains(message));
+        }
+    }
+
+    #[test]
     fn resolve_uses_code_cell_elf_not_state_data() {
         let entry = test_entry([0xab; 32], [0xcd; 32]);
         let (hash, state) = process_state_cell(&entry, vec![0x7f, b'E', b'L', b'F', 0xAA]);
@@ -350,7 +404,10 @@ mod tests {
         };
         let mut resolver = ProcessResolver::for_entry(entry);
         resolver.set_tick_process_code(Some(&code));
-        let got = resolver.resolve(&rpc, &hash).unwrap().expect("resolved");
+        let got = resolver
+            .resolve(&rpc, &hash, CID)
+            .unwrap()
+            .expect("resolved");
         assert_eq!(got.binary, vec![0x7f, b'E', b'L', b'F', 0xBB]);
         assert_eq!(got.type_hash, hash);
         assert!(got.code_cell.is_some());
@@ -419,7 +476,7 @@ mod tests {
         };
         let mut resolver = ProcessResolver::for_entry(entry);
         resolver.set_tick_process_code(Some(&code));
-        assert!(resolver.resolve(&rpc, &hash).unwrap().is_none());
+        assert!(resolver.resolve(&rpc, &hash, CID).unwrap().is_none());
     }
 
     #[test]
@@ -429,12 +486,12 @@ mod tests {
             cell: RefCell::new(None),
         };
         let mut resolver = ProcessResolver::for_entry(entry);
-        assert!(resolver.resolve(&rpc, &[0x11; 32]).unwrap().is_none());
+        assert!(resolver.resolve(&rpc, &[0x11; 32], CID).unwrap().is_none());
 
         let wrong_entry = test_entry([0x33; 32], [0x44; 32]);
         let (_, cell) = process_state_cell(&wrong_entry, vec![]);
         *rpc.cell.borrow_mut() = Some(cell);
-        assert!(resolver.resolve(&rpc, &[0x99; 32]).unwrap().is_none());
+        assert!(resolver.resolve(&rpc, &[0x99; 32], CID).unwrap().is_none());
     }
 
     #[test]
@@ -445,7 +502,7 @@ mod tests {
         let bad_lock = Script::new_builder()
             .code_hash([0x99u8; 32].pack())
             .hash_type(ScriptHashType::Type.into())
-            .args(Vec::<u8>::new().pack())
+            .args([[0xC1; 32].as_slice(), &[1]].concat().pack())
             .build();
         state.output = CellOutput::new_builder()
             .capacity(state.capacity().pack())
@@ -458,7 +515,7 @@ mod tests {
         };
         let mut resolver = ProcessResolver::for_entry(entry);
         resolver.set_tick_process_code(Some(&code));
-        assert!(resolver.resolve(&rpc, &hash).unwrap().is_none());
+        assert!(resolver.resolve(&rpc, &hash, CID).unwrap().is_none());
     }
 
     #[test]
@@ -472,7 +529,10 @@ mod tests {
         let mut resolver =
             ProcessResolver::for_entry(entry).with_fallback_binary(vec![0x7f, b'E', b'L', b'F']);
         resolver.set_tick_process_code(Some(&code));
-        let got = resolver.resolve(&rpc, &hash).unwrap().expect("fallback");
+        let got = resolver
+            .resolve(&rpc, &hash, CID)
+            .unwrap()
+            .expect("fallback");
         assert_eq!(got.binary, vec![0x7f, b'E', b'L', b'F']);
     }
 
@@ -486,14 +546,14 @@ mod tests {
         };
         let mut resolver = ProcessResolver::for_entry(entry);
         resolver.set_tick_process_code(Some(&code));
-        let first = resolver.resolve(&rpc, &hash).unwrap().unwrap();
+        let first = resolver.resolve(&rpc, &hash, CID).unwrap().unwrap();
         let mut cell2 = cell;
         cell2.out_point = OutPoint::new_builder()
             .tx_hash(Byte32::from_slice(&[0x88; 32]).unwrap())
             .index(1u32.pack())
             .build();
         *rpc.cell.borrow_mut() = Some(cell2.clone());
-        let second = resolver.resolve(&rpc, &hash).unwrap().unwrap();
+        let second = resolver.resolve(&rpc, &hash, CID).unwrap().unwrap();
         assert_eq!(second.live_cell.out_point, cell2.out_point);
         assert_eq!(second.binary, first.binary);
     }
@@ -511,7 +571,7 @@ mod tests {
         resolver.set_tick_process_code(Some(&code_v1));
         assert_eq!(
             resolver
-                .resolve(&rpc, &hash)
+                .resolve(&rpc, &hash, CID)
                 .unwrap()
                 .unwrap()
                 .binary
@@ -521,7 +581,7 @@ mod tests {
         resolver.set_tick_process_code(Some(&code_v2));
         assert_eq!(
             resolver
-                .resolve(&rpc, &hash)
+                .resolve(&rpc, &hash, CID)
                 .unwrap()
                 .unwrap()
                 .binary
@@ -538,7 +598,7 @@ mod tests {
             cell: RefCell::new(Some(state)),
         };
         let mut resolver = ProcessResolver::for_entry(entry);
-        assert!(resolver.resolve(&rpc, &hash).unwrap().is_none());
+        assert!(resolver.resolve(&rpc, &hash, CID).unwrap().is_none());
     }
 
     #[test]
@@ -563,6 +623,6 @@ mod tests {
         };
         let mut resolver = ProcessResolver::for_entry(entry);
         resolver.set_tick_process_code(Some(&code));
-        assert!(resolver.resolve(&rpc, &hash).unwrap().is_none());
+        assert!(resolver.resolve(&rpc, &hash, CID).unwrap().is_none());
     }
 }

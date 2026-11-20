@@ -141,10 +141,22 @@ fn main() {
     let registry = Arc::new(Mutex::new(registry));
 
     if let Some(addr) = config.api_bind {
+        let registry_rpc = rpc.clone();
         let state = RegistryApiState {
             registry: registry.clone(),
             worker_cmds: worker_cmds.clone(),
             busy: busy.clone(),
+            cid: cid_backend_core::CidLockIdentity::new(
+                config.cid_lock_code_hash,
+                config.hash_type,
+            ),
+            find_process_state: Arc::new(move |script| {
+                cid_backend_core::Rpc::find_live_cells_by_type_script(
+                    registry_rpc.as_ref(),
+                    script,
+                    2,
+                )
+            }),
         };
         match spawn_registry_api(addr, state) {
             Ok(h) => tracing::info!(
@@ -168,7 +180,8 @@ fn main() {
     let poll = config.poll_interval;
     let mut digest =
         DigestLoop::with_workers(rpc, NopClock, ssri, loop_config, workers, Some(worker_cmds))
-            .with_busy_map(busy);
+            .with_busy_map(busy)
+            .with_missing_filter_fallback(config.allow_missing_filter);
     loop {
         let report = digest.tick();
         let pending = digest

@@ -4,10 +4,13 @@
 //! / `CID_API_BIND`. Updates the on-disk registry and enqueues live worker
 //! spawn/stop commands for the digest loop.
 
+use cid_backend_core::process::{state_is_process_lock, validate_state_cid_binding};
+use cid_backend_core::rpc::{LiveCell, RpcError};
 use cid_backend_core::{
-    type_id_script_hash, ProcessBusyMap, ProcessRegistration, ProcessRegistry, RegisterOutcome,
-    RegistryError, WorkerCommand,
+    type_id_script_hash, CidLockIdentity, ProcessBusyMap, ProcessRegistration, ProcessRegistry,
+    RegisterOutcome, RegistryError, WorkerCommand,
 };
+use ckb_types::packed::Script;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
@@ -21,12 +24,16 @@ const MAX_HEADER_BYTES: usize = 8 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_API_WORKERS: usize = 32;
 
+type FindProcessState = dyn Fn(&Script) -> Result<Vec<LiveCell>, RpcError> + Send + Sync;
+
 #[derive(Clone)]
 pub struct RegistryApiState {
     pub registry: Arc<Mutex<ProcessRegistry>>,
     pub worker_cmds: Arc<Mutex<Vec<WorkerCommand>>>,
     /// Shared with the digest loop for pending/idle checks (P1-6).
     pub busy: ProcessBusyMap,
+    pub cid: CidLockIdentity,
+    pub find_process_state: Arc<FindProcessState>,
 }
 
 pub struct RegistryApiHandle {
@@ -235,6 +242,32 @@ fn register_process(
             return Ok(bad_request(format!("{e}\n").as_bytes()));
         }
     };
+    let cells = match (state.find_process_state)(&entry.identity.type_script()) {
+        Ok(cells) => cells,
+        Err(error) => {
+            tracing::warn!(target: "cid_backend", event = "registry.state_lookup_failed", %error);
+            return Ok((
+                503,
+                "Service Unavailable",
+                "text/plain; charset=utf-8",
+                b"could not look up live Process state; retry later\n".to_vec(),
+            ));
+        }
+    };
+    let [cell] = cells.as_slice() else {
+        return Ok(bad_request(
+            b"expected one live Process state cell for identity_type_id_args\n",
+        ));
+    };
+    if !state_is_process_lock(&entry, cell) {
+        return Ok(bad_request(
+            b"live Process state must use the registered Process code Type-ID lock\n",
+        ));
+    }
+    if let Err(reason) = validate_state_cid_binding(cell, state.cid) {
+        return Ok(bad_request(format!("{reason}\n").as_bytes()));
+    }
+
     // Single critical section: registry persist + worker-cmd enqueue (P0-2).
     // Lock order: registry → workers → worker_cmds.
     let outcome = {
@@ -511,7 +544,59 @@ fn close_stream(stream: TcpStream) {
 mod tests {
     use super::*;
     use cid_backend_core::{type_id_script_hash, DEFAULT_MAX_REGISTRY_ENTRIES};
+    use ckb_types::core::ScriptHashType;
+    use ckb_types::packed::{CellOutput, OutPoint};
+    use ckb_types::prelude::*;
     use std::net::TcpStream;
+
+    const CID: CidLockIdentity = CidLockIdentity {
+        code_hash: [0xC1; 32],
+        hash_type: ScriptHashType::Type,
+    };
+
+    fn api_state(registry: ProcessRegistry, lock_args: Vec<u8>) -> RegistryApiState {
+        RegistryApiState {
+            registry: Arc::new(Mutex::new(registry)),
+            worker_cmds: Arc::new(Mutex::new(Vec::new())),
+            busy: ProcessBusyMap::new(),
+            cid: CID,
+            find_process_state: Arc::new(move |typ| {
+                let lock = Script::new_builder()
+                    .code_hash(type_id_script_hash(&[0x22; 32]).pack())
+                    .hash_type(ScriptHashType::Type.into())
+                    .args(lock_args.pack())
+                    .build();
+                Ok(vec![LiveCell {
+                    out_point: OutPoint::default(),
+                    output: CellOutput::new_builder()
+                        .lock(lock)
+                        .type_(Some(typ.clone()).pack())
+                        .build(),
+                    data: vec![],
+                }])
+            }),
+        }
+    }
+
+    #[test]
+    fn registry_rejects_legacy_state_without_persisting_or_starting_worker() {
+        let (reg, path) = temp_registry();
+        let state = api_state(reg, vec![1]);
+        let body = serde_json::json!({
+            "identity_type_id_args": hex_pref(&[0x11; 32]),
+            "code_type_id_args": hex_pref(&[0x22; 32]),
+        })
+        .to_string();
+        let (status, _, _, response) =
+            route("POST", "/v1/processes", body.as_bytes(), &state).unwrap();
+        assert_eq!(status, 400);
+        assert!(String::from_utf8(response)
+            .unwrap()
+            .contains("Process state lock args (TooShort)"));
+        assert!(state.registry.lock().unwrap().is_empty());
+        assert!(state.worker_cmds.lock().unwrap().is_empty());
+        assert!(!path.exists());
+    }
     use std::time::Duration;
 
     fn temp_registry() -> (ProcessRegistry, std::path::PathBuf) {
@@ -558,11 +643,7 @@ mod tests {
     #[test]
     fn register_list_get_delete_round_trip() {
         let (reg, path) = temp_registry();
-        let state = RegistryApiState {
-            registry: Arc::new(Mutex::new(reg)),
-            worker_cmds: Arc::new(Mutex::new(Vec::new())),
-            busy: ProcessBusyMap::new(),
-        };
+        let state = api_state(reg, [CID.code_hash.as_slice(), &[1]].concat());
         let handle = spawn_registry_api("127.0.0.1:0".parse().unwrap(), state.clone()).unwrap();
         std::thread::sleep(Duration::from_millis(50));
 
@@ -614,11 +695,7 @@ mod tests {
     #[test]
     fn invalid_hex_rejected() {
         let (reg, path) = temp_registry();
-        let state = RegistryApiState {
-            registry: Arc::new(Mutex::new(reg)),
-            worker_cmds: Arc::new(Mutex::new(Vec::new())),
-            busy: ProcessBusyMap::new(),
-        };
+        let state = api_state(reg, [CID.code_hash.as_slice(), &[1]].concat());
         let handle = spawn_registry_api("127.0.0.1:0".parse().unwrap(), state).unwrap();
         std::thread::sleep(Duration::from_millis(50));
         let body = r#"{"identity_type_id_args":"0xzz","code_type_id_args":"0x11"}"#;

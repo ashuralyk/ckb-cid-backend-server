@@ -1205,6 +1205,11 @@ mod tests {
 
     struct StubSsri;
     impl SsriHost for StubSsri {
+        fn filter(&self, _: &[u8], request: &[u8]) -> Result<Vec<i8>, SsriError> {
+            let count = u32::from_le_bytes(request[..4].try_into().unwrap());
+            Ok(vec![0; count as usize])
+        }
+
         fn get_batch_bounds(&self, _: &[u8]) -> Result<(u32, u32), SsriError> {
             Ok((1, 1))
         }
@@ -1868,7 +1873,7 @@ mod tests {
         let proc = indexer_cell(
             0x50,
             0,
-            lock_json(code_hash, &[]),
+            lock_json(code_hash, &[CID_CODE.as_slice(), &[1]].concat()),
             Some(type_json),
             200_0000_0000,
             &[0x7f, b'E', b'L', b'F', 1],
@@ -2096,7 +2101,7 @@ mod tests {
         let proc = indexer_cell(
             0x50,
             0,
-            lock_json(code_hash, &[]),
+            lock_json(code_hash, &[CID_CODE.as_slice(), &[1]].concat()),
             Some(type_json),
             200_0000_0000,
             &[0x7f, b'E', b'L', b'F', 1],
@@ -2324,7 +2329,7 @@ mod tests {
         let proc = indexer_cell(
             0x50,
             0,
-            lock_json(code_hash, &[]),
+            lock_json(code_hash, &[CID_CODE.as_slice(), &[1]].concat()),
             Some(type_json),
             200_0000_0000,
             &[0x7f, b'E', b'L', b'F', 1],
@@ -2514,13 +2519,19 @@ mod tests {
         .encode()
         .unwrap();
         let out_point = |tag: u8| OutPoint::new_builder().tx_hash([tag; 32].pack()).build();
+        let cid_lock = Script::new_builder()
+            .code_hash(CID_CODE.pack())
+            .hash_type(ScriptHashType::Type.into())
+            .args(cid_args.pack())
+            .build();
         let intention =
-            intention_draft_cell(out_point(0x10), cid_args, 100_0000_0000, None, vec![0xab]);
+            intention_draft_cell(out_point(0x10), cid_lock, 600_0000_0000, None, vec![]);
         let state = process_draft_cell(
             out_point(0x11),
             Script::new_builder()
                 .code_hash(PROC_CODE.pack())
                 .hash_type(ScriptHashType::Type.into())
+                .args([CID_CODE.as_slice(), &[1]].concat().pack())
                 .build(),
             state_type,
             200_0000_0000,
@@ -2565,7 +2576,7 @@ mod tests {
         let assembled = ProcessExecutor::new(binary)
             .assemble(draft.as_slice(), host)
             .unwrap();
-        assert_eq!(assembled.outputs_data, vec![vec![0xcd, 0xef], vec![0xab]]);
+        assert_eq!(assembled.outputs_data, vec![vec![0xcd, 0xef], vec![]]);
         assert_eq!(assembled.cell_deps, vec![dep]);
     }
 

@@ -78,64 +78,70 @@ mod tests {
     }
 
     #[test]
-    fn legacy_scan_and_bounded_refund_preserve_per_lock_fee_modes() {
+    fn refunds_use_the_configured_cid_fee_mode_and_leave_legacy_cells_live() {
         use crate::helpers::intention_cell_with_lock;
         use cid_backend_core::{fee_for_size, tx_size_in_block, CidLockIdentity};
         use ckb_types::core::ScriptHashType;
 
-        let rpc = FakeRpc::new();
-        let hash = script_hash32(&process_type_script(3));
-        let capacity = 100_0000_0000;
-        let legacy = CidLockIdentity::new([0xd1; 32], ScriptHashType::Data1);
-        let legacy_cell =
-            intention_cell_with_lock(2, hash, capacity, legacy.code_hash, legacy.hash_type);
-        let primary = intention_cell(1, hash, capacity);
-        rpc.insert_cell(primary.clone());
-        rpc.insert_cell(legacy_cell.clone());
-        rpc.insert_cell(process_cell(3, 200_0000_0000, vec![]));
-        let mut config = default_loop_config();
-        config.extra_scan_locks = vec![legacy];
-        config.refund_policy.bounded_locks = vec![legacy];
-        config.refund_policy.fee_rate = 2500;
-        let mut loop_ = loop_with_resolver(rpc, ScriptedSsri::incompatible(21), config, 3);
-
-        let report = loop_.tick();
-        assert_eq!(report.scanned, 2);
-        assert_eq!(report.submitted, 2, "{:?}", report.last_error);
-        for tx in loop_.rpc().submitted() {
-            assert_eq!(tx.inputs().len(), 1);
-            let input = tx.inputs().get(0).unwrap().previous_output();
-            let returned: u64 = tx.outputs().get(0).unwrap().capacity().unpack();
-            if input == legacy_cell.out_point {
-                let fee = fee_for_size(tx_size_in_block(&tx), 2500);
-                assert!(fee > 0);
-                assert_eq!(capacity - returned, fee);
-            } else {
-                assert_eq!(input, primary.out_point);
-                assert_eq!(capacity, returned);
+        for bounded in [false, true] {
+            let rpc = FakeRpc::new();
+            let hash = script_hash32(&process_type_script(3));
+            let capacity = 100_0000_0000;
+            let legacy = CidLockIdentity::new([0xd1; 32], ScriptHashType::Data1);
+            let legacy_cell =
+                intention_cell_with_lock(2, hash, capacity, legacy.code_hash, legacy.hash_type);
+            let primary = intention_cell(1, hash, capacity);
+            rpc.insert_cell(primary.clone());
+            rpc.insert_cell(legacy_cell.clone());
+            rpc.insert_cell(process_cell(3, 200_0000_0000, vec![]));
+            let mut config = default_loop_config();
+            config.extra_scan_locks = vec![legacy];
+            config.refund_policy.bounded_locks = vec![legacy];
+            if bounded {
+                config
+                    .refund_policy
+                    .bounded_locks
+                    .push(config.scan_lock_identities()[0]);
             }
+            config.refund_policy.fee_rate = 2500;
+            let mut loop_ = loop_with_resolver(rpc, ScriptedSsri::incompatible(21), config, 3);
+
+            let report = loop_.tick();
+            assert_eq!(report.scanned, 2);
+            assert_eq!(report.submitted, 1, "{:?}", report.last_error);
+            assert!(loop_.rpc().has_cell(&legacy_cell.out_point));
+            let tx = &loop_.rpc().submitted()[0];
+            assert_eq!(tx.inputs().len(), 1);
+            assert_eq!(
+                tx.inputs().get(0).unwrap().previous_output(),
+                primary.out_point
+            );
+            let returned: u64 = tx.outputs().get(0).unwrap().capacity().unpack();
+            let expected_fee = if bounded {
+                fee_for_size(tx_size_in_block(tx), 2500)
+            } else {
+                0
+            };
+            assert_eq!(capacity - returned, expected_fee);
         }
     }
+
     #[test]
-    fn unaffordable_bounded_group_does_not_suppress_exact_refund() {
-        use crate::helpers::intention_cell_with_lock;
-        use cid_backend_core::{out_point_key, CidLockIdentity, DEFAULT_FEE_RATE, MAX_FEE_RATE};
-        use ckb_types::core::ScriptHashType;
+    fn unaffordable_filter_refund_does_not_suppress_an_affordable_refund() {
+        use cid_backend_core::DEFAULT_FEE_RATE;
 
         let rpc = FakeRpc::new();
         let hash = script_hash32(&process_type_script(3));
-        let capacity = 100_0000_0000;
-        let legacy = CidLockIdentity::new([0xd1; 32], ScriptHashType::Data1);
-        let bounded = intention_cell(1, hash, capacity);
-        let exact = intention_cell_with_lock(2, hash, capacity, legacy.code_hash, legacy.hash_type);
-        rpc.insert_cell(bounded.clone());
-        rpc.insert_cell(exact.clone());
+        let mut expensive = intention_cell(1, hash, 2000_0000_0000);
+        expensive.data = vec![0; 1024];
+        let affordable = intention_cell(2, hash, 100_0000_0000);
+        rpc.insert_cell(expensive.clone());
+        rpc.insert_cell(affordable.clone());
         rpc.insert_cell(process_cell(3, 200_0000_0000, vec![]));
         let mut config = default_loop_config();
         config.refund_policy.bounded_locks = vec![config.scan_lock_identities()[0]];
-        config.refund_policy.fee_rate = MAX_FEE_RATE;
-        config.extra_scan_locks = vec![legacy];
-        let ssri = ScriptedSsri::ok_then_incompatible((2, 2), 0, 21);
+        config.refund_policy.fee_rate = 1_000_000;
+        let ssri = ScriptedSsri::mimic((2, 2)).with_filter(|count| Ok(vec![4; count]));
         let mut loop_ = loop_with_resolver(rpc, ssri, config, 3);
 
         let report = loop_.tick();
@@ -143,36 +149,18 @@ mod tests {
         let tx = &loop_.rpc().submitted()[0];
         assert_eq!(
             tx.inputs().get(0).unwrap().previous_output(),
-            exact.out_point
+            affordable.out_point
         );
-        assert!(loop_.rpc().has_cell(&bounded.out_point));
-        let pending = loop_.workers().get(&hash).unwrap().with_state(|s| {
-            s.pending_incompatible_refund
-                .contains(&out_point_key(&bounded.out_point))
+        assert!(loop_.rpc().has_cell(&expensive.out_point));
+        loop_.workers().get(&hash).unwrap().with_state(|s| {
+            assert!(s.pending_incompatible_refund.is_empty());
+            assert!(s.isolate_expanded.is_empty());
         });
-        assert!(
-            pending,
-            "unaffordable identity must be marked for below-min refund retry"
-        );
-        let expanded = loop_
-            .workers()
-            .get(&hash)
-            .unwrap()
-            .with_state(|s| s.isolate_expanded.len());
-        assert_eq!(
-            expanded, 0,
-            "RefundFeeUnaffordable must not trigger isolate splits"
-        );
 
-        // P2: singleton leftover (len < min=2) must still refund once fee is affordable.
         loop_.config_mut().refund_policy.fee_rate = DEFAULT_FEE_RATE;
-        let report2 = loop_.tick();
-        assert_eq!(
-            report2.submitted, 1,
-            "below-min incompatible leftover must refund after fee becomes affordable; {:?}",
-            report2.last_error
-        );
-        assert!(!loop_.rpc().has_cell(&bounded.out_point));
+        let report = loop_.tick();
+        assert_eq!(report.submitted, 1, "{:?}", report.last_error);
+        assert!(!loop_.rpc().has_cell(&expensive.out_point));
     }
 
     #[test]
@@ -215,27 +203,25 @@ mod tests {
 
     #[test]
     fn below_min_refund_drop_restores_pending_and_retries() {
-        use crate::helpers::intention_cell_with_lock;
-        use cid_backend_core::{out_point_key, CidLockIdentity, DEFAULT_FEE_RATE, MAX_FEE_RATE};
-        use ckb_types::core::ScriptHashType;
+        use cid_backend_core::{out_point_key, DEFAULT_FEE_RATE, MAX_FEE_RATE};
 
         let rpc = FakeRpc::new();
         let hash = script_hash32(&process_type_script(3));
         let capacity = 100_0000_0000;
-        let legacy = CidLockIdentity::new([0xd1; 32], ScriptHashType::Data1);
         let bounded = intention_cell(1, hash, capacity);
-        let exact = intention_cell_with_lock(2, hash, capacity, legacy.code_hash, legacy.hash_type);
+        let companion = intention_cell(2, hash, capacity);
         rpc.insert_cell(bounded.clone());
-        rpc.insert_cell(exact.clone());
+        rpc.insert_cell(companion.clone());
         rpc.insert_cell(process_cell(3, 200_0000_0000, vec![]));
         let mut config = default_loop_config();
         config.refund_policy.bounded_locks = vec![config.scan_lock_identities()[0]];
         config.refund_policy.fee_rate = MAX_FEE_RATE;
-        config.extra_scan_locks = vec![legacy];
         let ssri = ScriptedSsri::ok_then_incompatible((2, 2), 0, 21);
         let mut loop_ = loop_with_resolver(rpc, ssri, config, 3);
 
-        assert_eq!(loop_.tick().submitted, 1);
+        assert_eq!(loop_.tick().submitted, 0);
+        // Another actor spends the companion before the next scan.
+        loop_.rpc().consume(&companion.out_point);
         loop_.config_mut().refund_policy.fee_rate = DEFAULT_FEE_RATE;
         loop_.rpc().defer_commit();
         let report2 = loop_.tick();
@@ -264,7 +250,7 @@ mod tests {
             "dropped below-min refund must retry; {:?}",
             report3.last_error
         );
-        assert_eq!(loop_.rpc().submitted().len(), 3);
+        assert_eq!(loop_.rpc().submitted().len(), 2);
         assert!(
             loop_
                 .state()
@@ -279,36 +265,28 @@ mod tests {
 
     #[test]
     fn below_min_mixed_frame_refunds_pending_subset_only() {
-        use crate::helpers::intention_cell_with_lock;
-        use cid_backend_core::{CidLockIdentity, DEFAULT_FEE_RATE, MAX_FEE_RATE};
-        use ckb_types::core::ScriptHashType;
+        use cid_backend_core::{DEFAULT_FEE_RATE, MAX_FEE_RATE};
 
         let rpc = FakeRpc::new();
         let hash = script_hash32(&process_type_script(3));
         let capacity = 100_0000_0000;
-        let legacy = CidLockIdentity::new([0xd1; 32], ScriptHashType::Data1);
         let bounded = intention_cell(1, hash, capacity);
-        let exact_a =
-            intention_cell_with_lock(2, hash, capacity, legacy.code_hash, legacy.hash_type);
-        let exact_b =
-            intention_cell_with_lock(3, hash, capacity, legacy.code_hash, legacy.hash_type);
+        let companion = intention_cell(2, hash, capacity);
+        let other_companion = intention_cell(3, hash, capacity);
         rpc.insert_cell(bounded.clone());
-        rpc.insert_cell(exact_a);
-        rpc.insert_cell(exact_b);
+        rpc.insert_cell(companion.clone());
+        rpc.insert_cell(other_companion.clone());
         rpc.insert_cell(process_cell(3, 200_0000_0000, vec![]));
         let mut config = default_loop_config();
         config.refund_policy.bounded_locks = vec![config.scan_lock_identities()[0]];
         config.refund_policy.fee_rate = MAX_FEE_RATE;
-        config.extra_scan_locks = vec![legacy];
         let ssri = ScriptedSsri::ok_then_incompatible((3, 3), 0, 21);
         let mut loop_ = loop_with_resolver(rpc, ssri, config, 3);
 
         let report = loop_.tick();
-        assert_eq!(
-            report.submitted, 1,
-            "exact identity group refunds; {:?}",
-            report.last_error
-        );
+        assert_eq!(report.submitted, 0);
+        loop_.rpc().consume(&companion.out_point);
+        loop_.rpc().consume(&other_companion.out_point);
         assert!(loop_.rpc().has_cell(&bounded.out_point));
 
         // Non-pending peer joins the below-min bucket (2 < min=3).
@@ -330,27 +308,25 @@ mod tests {
 
     #[test]
     fn refund_only_dry_run_reject_does_not_isolate_or_burn_attempts() {
-        use crate::helpers::intention_cell_with_lock;
-        use cid_backend_core::{CidLockIdentity, DEFAULT_FEE_RATE, MAX_FEE_RATE};
-        use ckb_types::core::ScriptHashType;
+        use cid_backend_core::{DEFAULT_FEE_RATE, MAX_FEE_RATE};
 
         let rpc = FakeRpc::new();
         let hash = script_hash32(&process_type_script(3));
         let capacity = 100_0000_0000;
-        let legacy = CidLockIdentity::new([0xd1; 32], ScriptHashType::Data1);
         let bounded = intention_cell(1, hash, capacity);
-        let exact = intention_cell_with_lock(2, hash, capacity, legacy.code_hash, legacy.hash_type);
+        let companion = intention_cell(2, hash, capacity);
         rpc.insert_cell(bounded.clone());
-        rpc.insert_cell(exact);
+        rpc.insert_cell(companion.clone());
         rpc.insert_cell(process_cell(3, 200_0000_0000, vec![]));
         let mut config = default_loop_config();
         config.refund_policy.bounded_locks = vec![config.scan_lock_identities()[0]];
         config.refund_policy.fee_rate = MAX_FEE_RATE;
-        config.extra_scan_locks = vec![legacy];
         let ssri = ScriptedSsri::ok_then_incompatible((2, 2), 0, 21);
         let mut loop_ = loop_with_resolver(rpc, ssri, config, 3);
 
-        assert_eq!(loop_.tick().submitted, 1);
+        assert_eq!(loop_.tick().submitted, 0);
+        // Another actor spends the companion before the next scan.
+        loop_.rpc().consume(&companion.out_point);
         loop_.config_mut().refund_policy.fee_rate = DEFAULT_FEE_RATE;
         loop_.rpc().inject_dry_run_reject_once();
         let dry_before = loop_.rpc().dry_run_attempts();

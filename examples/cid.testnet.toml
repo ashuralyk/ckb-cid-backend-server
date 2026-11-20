@@ -1,24 +1,5 @@
-# CKB testnet CID digest daemon config (read-only example).
-#
-# Values fetched read-only from https://testnet.ckb.dev/rpc (get_live_cell /
-# get_block_hash). Outpoints change after Type-ID upgrades; the daemon
-# rediscovers CID lock code cells each tick from type_id_args — do not pin
-# CellDeps here.
-#
-# Process enablement is NOT in this file. After Lucas deploys Process state /
-# code Type IDs, register them via the HTTP API:
-#   PUT/POST /v1/processes
-#   {
-#     "identity_type_id_args": "0x<PROCESS_STATE_TYPE_ID_ARGS>",
-#     "identity_type_id": "0x<PROCESS_STATE_TYPE_ID_HASH>",
-#     "code_type_id_args": "0x<PROCESS_CODE_TYPE_ID_ARGS>",
-#     "code_type_id": "0x<PROCESS_CODE_TYPE_ID_HASH>"
-#   }
-# DELETE /v1/processes/0x<identity_type_hash> disables. Registry persists under
-# [registry].path across restarts.
-#
-# Placeholders below — Lucas fills live Type IDs after deploy. Do not invent.
-# Keyless: no .env, no private keys, no signing, no chain writes.
+# Public CKB testnet config for CID / Process example v0.1.4.
+# Register an existing Process state via POST /v1/processes (see docs/runbook.md).
 
 [network]
 name = "ckb-testnet"
@@ -26,13 +7,15 @@ genesis_hash = "0x10639e0895502b5688a6be8cf69460d76541bfa4821629d86d62ba0aae3f96
 validate_genesis = true
 
 [rpc]
-url = "https://testnet.ckb.dev/rpc"
-# indexer_url omitted — same endpoint serves indexer get_cells
+url = "https://testnet.ckb.dev/"
 
 [cid_lock]
-# Live CID lock CODE cell Type ID (placeholders until redeploy):
-type_id_args = "0x<CID_LOCK_TYPE_ID_ARGS_32>"
-type_id = "0x<CID_LOCK_TYPE_ID_FULL_HASH_32>"
+type_id_args = "0xdfe0a1416c7373e8aaae5257445e940b6ff08e9cbc62ebca8541d28997370f25"
+type_id = "0xf3f8a56c2594030f99f05b09ff1b6a1b07e6e07ed04309c1c4e246561faad326"
+
+[[cid_lock.bounded_refund_locks]]
+code_hash = "0xf3f8a56c2594030f99f05b09ff1b6a1b07e6e07ed04309c1c4e246561faad326"
+hash_type = "type"
 
 [registry]
 path = "data/process-registry.json"
@@ -41,8 +24,9 @@ max_entries = 64
 [loop]
 poll_interval_secs = 5
 confirmation_depth = 24
+fee_rate = 1000
+allow_missing_filter = false
 
 [observe]
-# health_bind = "127.0.0.1:9100"
 api_bind = "127.0.0.1:9101"
 log_format = "json"

@@ -1,6 +1,10 @@
 use crate::host_query::{seed_host_for_batch, HostQueryRpc, RpcHostQuery};
 use crate::process::ResolvedProcess;
 use crate::scan::ScannedIntention;
+use cid_intention_filter::{
+    encode_filter_request, FilterCell, FilterRequest, FILTER_MAX_CELLS, FILTER_STDIN_MAX,
+    FILTER_UNSUPPORTED_ACTION,
+};
 use cid_process_executor::{AssembledTx, DraftCell, ExecutorError, MockHost, ProcessExecutor};
 use ckb_types::core::DepType;
 use ckb_types::packed::{CellDep, CellInput, RawTransaction, Script, Transaction};
@@ -11,11 +15,18 @@ use std::sync::Arc;
 /// Application-level incompatibility reported by the pinned Process protocol.
 pub const INCOMPATIBLE_BATCH: i8 = 21;
 
+/// The example guest cannot build the requested beneficiary.
+pub const BENEFICIARY_MISSING: i8 = 32;
+pub const DEPOSIT_BELOW_MINIMUM: i8 = 39;
+pub const CID_LOCK_MISMATCH: i8 = 40;
+pub const PROCESS_LOCK_ARGS_INVALID: i8 = 41;
+
 /// The pinned example Process rejected additional funding inputs.
 pub const UNSUPPORTED_FUNDING_LOCK: i8 = 38;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SsriError {
+    MethodNotFound,
     Incompatible(i8),
     Unusable(String),
 }
@@ -23,6 +34,7 @@ pub enum SsriError {
 impl fmt::Display for SsriError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            SsriError::MethodNotFound => write!(f, "ssri method not found"),
             SsriError::Incompatible(c) => write!(f, "ssri incompatible exit {c}"),
             SsriError::Unusable(m) => write!(f, "ssri unusable: {m}"),
         }
@@ -41,6 +53,11 @@ pub fn map_executor_error(err: ExecutorError) -> SsriError {
 }
 
 pub trait SsriHost {
+    /// Return per-cell reasons from the decoded Process.filter response.
+    fn filter(&self, _binary: &[u8], _request: &[u8]) -> Result<Vec<i8>, SsriError> {
+        Err(SsriError::MethodNotFound)
+    }
+
     fn get_batch_bounds(&self, binary: &[u8]) -> Result<(u32, u32), SsriError>;
     fn assemble(
         &self,
@@ -74,6 +91,19 @@ pub trait SsriHost {
 pub struct EmbeddedSsri;
 
 impl SsriHost for EmbeddedSsri {
+    fn filter(&self, binary: &[u8], request: &[u8]) -> Result<Vec<i8>, SsriError> {
+        ProcessExecutor::new(binary.to_vec())
+            .filter(request)
+            .map_err(|err| match err {
+                // Cinnabar SSRIMethodsNotFound is exit 12. The pinned executor
+                // exposes framework exits below CUSTOM_ERROR_START as VmError text.
+                ExecutorError::VmError(message) if message == "exit code 12" => {
+                    SsriError::MethodNotFound
+                }
+                err => map_executor_error(err),
+            })
+    }
+
     fn get_batch_bounds(&self, binary: &[u8]) -> Result<(u32, u32), SsriError> {
         ProcessExecutor::new(binary.to_vec())
             .get_batch_bounds()
@@ -114,17 +144,86 @@ fn intention_draft_cell(intent: &ScannedIntention) -> DraftCell {
         .hash_type(intent.lock_hash_type.into())
         .args(intent.lock_args.pack())
         .build();
-    let mut output = ckb_types::packed::CellOutput::new_builder()
-        .capacity(intent.capacity.pack())
-        .lock(lock);
-    if let Some(ts) = &intent.type_script {
-        output = output.type_(Some(ts.clone()).pack());
+    cid_process_executor::intention_draft_cell(
+        intent.out_point.clone(),
+        lock,
+        intent.capacity,
+        intent.type_script.clone(),
+        intent.data.clone(),
+    )
+}
+
+/// Filter the whole candidate window before using any results. A cell that
+/// cannot fit in an otherwise empty request has no verdict and is skipped.
+pub(crate) fn filter_intentions(
+    ssri: &impl SsriHost,
+    binary: &[u8],
+    intentions: &[ScannedIntention],
+) -> Result<Vec<Option<i8>>, SsriError> {
+    let mut reasons = vec![None; intentions.len()];
+    let mut positions = Vec::new();
+    let mut req = FilterRequest { cells: Vec::new() };
+    let mut size = 4; // count
+    let mut called = false;
+    let mut flush = |req: &FilterRequest, positions: &[usize]| -> Result<(), SsriError> {
+        if positions.is_empty() {
+            return Ok(());
+        }
+        let request = encode_filter_request(req)
+            .map_err(|e| SsriError::Unusable(format!("filter request: {e:?}")))?;
+        let result = match ssri.filter(binary, &request) {
+            Err(SsriError::MethodNotFound) if called => {
+                return Err(SsriError::Unusable(
+                    "filter method disappeared between chunks".into(),
+                ));
+            }
+            result => result?,
+        };
+        called = true;
+        if result.len() != positions.len() {
+            return Err(SsriError::Unusable(format!(
+                "filter response count {} != request cell count {}",
+                result.len(),
+                positions.len()
+            )));
+        }
+        for (&index, reason) in positions.iter().zip(result) {
+            if !(0..=FILTER_UNSUPPORTED_ACTION).contains(&reason) {
+                return Err(SsriError::Unusable(format!(
+                    "unknown filter reason {reason}"
+                )));
+            }
+            reasons[index] = Some(reason);
+        }
+        Ok(())
+    };
+
+    for (index, intent) in intentions.iter().enumerate() {
+        let draft = intention_draft_cell(intent);
+        // Three u32 length prefixes, followed by the packed values.
+        let cell_size = 12
+            + draft.out_point.as_slice().len()
+            + draft.output.as_slice().len()
+            + draft.data.len();
+        if cell_size > FILTER_STDIN_MAX - 4 {
+            continue;
+        }
+        if req.cells.len() == FILTER_MAX_CELLS as usize || size + cell_size > FILTER_STDIN_MAX {
+            flush(&req, &positions)?;
+            req.cells.clear();
+            positions.clear();
+            size = 4;
+        }
+        req.cells.push(FilterCell {
+            out_point: draft.out_point.as_slice().to_vec(),
+            output: draft.output.as_slice().to_vec(),
+            data: draft.data,
+        });
+        positions.push(index);
+        size += cell_size;
     }
-    DraftCell {
-        out_point: intent.out_point.clone(),
-        output: output.build(),
-        data: intent.data.clone(),
-    }
+    flush(&req, &positions)?;
+    Ok(reasons)
 }
 
 /// Draft input cells for one batch: intentions (ASC) then the live Process state cell.
@@ -282,7 +381,7 @@ mod tests {
         let lock = Script::new_builder()
             .code_hash(code_hash.pack())
             .hash_type(ScriptHashType::Type.into())
-            .args(Vec::<u8>::new().pack())
+            .args([[0xC1; 32].as_slice(), &[1]].concat().pack())
             .build();
         let state_type = type_id_script(&state_args);
         let state_out = OutPoint::new_builder()
@@ -325,7 +424,8 @@ mod tests {
             hash_type: 1,
             args: vec![0xEE],
         };
-        let args = CidArgs::new(type_hash, user, Payload { data: vec![0xAA] });
+        let payload = Payload::from_script(&user).unwrap();
+        let args = CidArgs::new(type_hash, user, payload);
         let lock_args = args.encode().unwrap();
         let intent_out = OutPoint::new_builder()
             .tx_hash(Byte32::from_slice(&[0x10; 32]).unwrap())
@@ -333,14 +433,24 @@ mod tests {
             .build();
         let intent = ScannedIntention {
             out_point: intent_out.clone(),
-            capacity: 100_0000_0000,
+            capacity: 600_0000_0000,
             type_script: None,
-            data: vec![0xAA],
+            data: vec![],
             lock_args,
             args,
             lock_code_hash: [0xC1; 32],
             lock_hash_type: ScriptHashType::Type,
         };
+
+        let mut below_minimum = intent.clone();
+        below_minimum.capacity -= 1;
+        assert_eq!(
+            filter_intentions(&EmbeddedSsri, &bin, &[intent.clone(), below_minimum]).unwrap(),
+            [
+                Some(cid_intention_filter::FILTER_ACCEPTED),
+                Some(cid_intention_filter::FILTER_DEPOSIT_BELOW_MINIMUM)
+            ]
+        );
 
         let code_dep = ckb_types::packed::CellDep::new_builder()
             .out_point(code_cell.out_point.clone())
@@ -385,10 +495,10 @@ mod tests {
             "Process fee deducted from recreate"
         );
         let ben_cap: u64 = assembled.outputs[1].capacity().unpack();
-        assert_eq!(ben_cap, 100_0000_0000);
+        assert_eq!(ben_cap, 600_0000_0000);
 
         // CI gate greps this exact banner under `--nocapture` (do not weaken).
-        eprintln!("real SSRI guest executed: Process.batch=({min},{max}) Process.assemble n=1 ok");
+        eprintln!("real SSRI guest executed: Process.filter=[0,5] Process.batch=({min},{max}) Process.assemble n=1 ok");
 
         let _ = ProcessResolver::for_entry(entry);
         let _ = script_hash32;
@@ -419,7 +529,7 @@ mod tests {
         let lock = Script::new_builder()
             .code_hash(code_type_hash.pack())
             .hash_type(ScriptHashType::Type.into())
-            .args(Vec::<u8>::new().pack())
+            .args([[0xC1; 32].as_slice(), &[1]].concat().pack())
             .build();
         let state_type = type_id_script(&state_args);
         let state = LiveCell {
@@ -498,7 +608,11 @@ mod tests {
         let mut resolver = ProcessResolver::for_entry(entry);
         resolver.set_tick_process_code(Some(&code));
         let resolved = resolver
-            .resolve(&rpc, &type_hash)
+            .resolve(
+                &rpc,
+                &type_hash,
+                crate::fee::CidLockIdentity::new([0xC1; 32], ScriptHashType::Type),
+            )
             .unwrap()
             .expect("resolved");
         assert_eq!(resolved.binary, bin, "SSRI binary must be code cell ELF");

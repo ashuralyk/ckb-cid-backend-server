@@ -10,7 +10,7 @@ mod tests {
         cid_lock_args, intention_cell, live_cell, lock_script, loop_with_resolver, out_point,
         process_cell, process_type_script, CID_CODE,
     };
-    use crate::scripted_ssri::{Mode, ScriptedSsri};
+    use crate::scripted_ssri::ScriptedSsri;
 
     fn cfg() -> LoopConfig {
         LoopConfig {
@@ -619,11 +619,7 @@ mod tests {
         rpc.insert_cell(proc.clone());
         let mut loop_ = loop_with_resolver(
             rpc,
-            ScriptedSsri {
-                bounds: (1, 1),
-                mode: Mode::AlwaysIncompatible(21),
-                seen_binaries: Default::default(),
-            },
+            ScriptedSsri::ok_then_incompatible((1, 1), 0, 21),
             cfg(),
             34,
         );

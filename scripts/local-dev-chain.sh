@@ -5,7 +5,7 @@
 #
 # Pins:
 #   CKB           v0.119.0  (matches workspace ckb-types 0.119)
-#   dispatcher    5ea581fad5922ad0e4104d99757be143ee6706f8
+#   dispatcher    b2d01e0a5a9760c8ee627633365aa98dd7a99859
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -13,7 +13,7 @@ CKB_VERSION="${CKB_VERSION:-v0.119.0}"
 CKB_DIR="${CKB_DIR:-$ROOT/.local-ckb}"
 DATA_DIR="${CKB_DATA_DIR:-$CKB_DIR/dev}"
 RPC_URL="${CID_CKB_RPC_URL:-http://127.0.0.1:8114}"
-PIN="${CID_DISPATCHER_REV:-5ea581fad5922ad0e4104d99757be143ee6706f8}"
+PIN="${CID_DISPATCHER_REV:-b2d01e0a5a9760c8ee627633365aa98dd7a99859}"
 CLANG="${CLANG:-clang-18}"
 
 # Genesis issued secp key from specs/dev.toml (dev chain only).
