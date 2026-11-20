@@ -53,9 +53,10 @@ The exact deployed v0.1.4 guest can also be retrieved from CKB testnet with the 
 Lookup order: `CID_PROCESS_EXAMPLE_PATH`, then
 `tests/fixtures/cid_process_example`.
 
-The standard FakeRpc suite uses `ScriptedSsri`. The opt-in regression for
-the audited guest's zero-fee-headroom pause requires the exact deployed
-v0.1.4 guest with the hash above. Run it from this repository with:
+Most FakeRpc tests use `ScriptedSsri`. The embedded SSRI vertical uses
+the built fixture when it is available. The opt-in zero-fee-headroom
+regression requires the exact deployed v0.1.4 guest with the hash above.
+Run it from this repository with:
 
 ```bash
 CID_PROCESS_EXAMPLE_PATH=/abs/path/to/deployed-v0.1.4-cid_process_example \

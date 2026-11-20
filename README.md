@@ -176,7 +176,7 @@ The two core guest tests are opt-in. Build the pinned fixture and include the ig
 cargo test --locked -p cid-backend-core -- --include-ignored --nocapture
 ```
 
-Lookup order: `CID_PROCESS_EXAMPLE_PATH`, then `tests/fixtures/cid_process_example`. The standard FakeRpc suite uses `ScriptedSsri`. Its opt-in zero-fee-headroom test requires the [exact deployed v0.1.4 ELF](tests/fixtures/README.md).
+Lookup order: `CID_PROCESS_EXAMPLE_PATH`, then `tests/fixtures/cid_process_example`. Most FakeRpc tests use `ScriptedSsri`. The embedded SSRI vertical uses the built fixture when it is available. The opt-in zero-fee-headroom test requires the [exact deployed v0.1.4 ELF](tests/fixtures/README.md).
 
 The only real local-chain evidence is ignored `local_chain_e2e` (`./scripts/local-dev-chain.sh` above).
 
