@@ -516,6 +516,11 @@ where
                     (live_keys.contains(k) || pending_occupied.contains(k))
                         && !state.submit.rejected.contains(k)
                 });
+                // Keep marks while a refund is in-flight (pending occupied) so a
+                // Drop/reorg can still take the below-min refund_only path.
+                state
+                    .pending_incompatible_refund
+                    .retain(|k| live_keys.contains(k) || pending_occupied.contains(k));
             });
         });
 
@@ -611,6 +616,25 @@ where
         (frames, skipped)
     }
 
+    /// Remove fee-unaffordable / pending-incompatible cells from isolate frames
+    /// so a sibling Rejected identity cannot shrink them away (P3).
+    fn strip_pending_incompatible_refund(
+        worker: &crate::workers::ProcessWorker,
+        window: &[ScannedIntention],
+        rest: &[ScannedIntention],
+    ) -> (Vec<ScannedIntention>, Vec<ScannedIntention>) {
+        worker.with_state(|s| {
+            let keep = |i: &ScannedIntention| {
+                !s.pending_incompatible_refund
+                    .contains(&out_point_key(&i.out_point))
+            };
+            (
+                window.iter().filter(|i| keep(i)).cloned().collect(),
+                rest.iter().filter(|i| keep(i)).cloned().collect(),
+            )
+        })
+    }
+
     fn apply_polled_batch(
         worker: &crate::workers::ProcessWorker,
         report: &mut TickReport,
@@ -633,24 +657,57 @@ where
                 });
             }
             BatchOutcome::Rejected | BatchOutcome::CachedRejected => {
-                // P0: apply the sync drop_first + shrink pushes here — do not
-                // rely on the next round's `already` branch (rest-only under-explores).
-                let (frames, skipped) =
-                    Self::reject_isolate_frames(&polled.window, &polled.rest, polled.min);
-                report.skipped += skipped;
-                continue_round = true;
-                worker.with_state_mut(|state| {
-                    state.isolate_expanded.insert(polled.window_fp);
-                    state.isolate_pending.extend(frames);
-                });
+                if polled.refund_only {
+                    // Permanent refund_only failure is combo-cached in process_batch;
+                    // never isolate-split below-min leftovers (P3).
+                    continue_round = worker.with_state(|s| !s.isolate_pending.is_empty());
+                } else {
+                    // P0: apply sync drop_first + shrink — strip fee-unaffordable
+                    // pending cells so they are not shrunk away (P3).
+                    let (iso_window, iso_rest) = Self::strip_pending_incompatible_refund(
+                        worker,
+                        &polled.window,
+                        &polled.rest,
+                    );
+                    if iso_window.is_empty() {
+                        continue_round = worker.with_state(|s| !s.isolate_pending.is_empty());
+                        if let Some(r) = polled.resume_on_continue {
+                            worker.with_state_mut(|state| {
+                                state.isolate_resume = Some(r);
+                            });
+                        }
+                    } else {
+                        let (frames, skipped) =
+                            Self::reject_isolate_frames(&iso_window, &iso_rest, polled.min);
+                        report.skipped += skipped;
+                        continue_round = true;
+                        worker.with_state_mut(|state| {
+                            state.isolate_expanded.insert(polled.window_fp);
+                            state.isolate_pending.extend(frames);
+                        });
+                    }
+                }
+            }
+            BatchOutcome::RetryLater => {
+                // Fee-unaffordable (etc.): no isolate split; keep draining any
+                // leftover isolate_pending frames this tick (P3).
+                continue_round = worker.with_state(|s| !s.isolate_pending.is_empty());
+                if let Some(r) = polled.resume_on_continue {
+                    worker.with_state_mut(|state| {
+                        state.isolate_resume = Some(r);
+                    });
+                }
             }
             BatchOutcome::Continue => {
-                // Unbuildable / soft skip: advance past window and keep isolating.
-                // Conflict / submit failure set last_error or conflicts — next tick.
-                if polled.delta.conflicts == 0
+                if polled.refund_only {
+                    // Cached / permanent refund_only soft-skip must not re-enter
+                    // isolate rounds (would burn up to 64 RunBatch/tick).
+                } else if polled.delta.conflicts == 0
                     && polled.delta.last_error.is_none()
                     && polled.delta.skipped > 0
                 {
+                    // Unbuildable / soft skip: advance past window and keep isolating.
+                    // Conflict / submit failure set last_error or conflicts — next tick.
                     continue_round = true;
                     worker.with_state_mut(|state| {
                         if let Some(r) = polled.resume_on_continue {
@@ -1091,27 +1148,60 @@ where
                         .unwrap_or(true)
                 })
                 .collect();
-            if items.len() < min as usize {
-                report.skipped += items.len();
-                continue;
-            }
-            report.isolate_windows += 1;
+            let (items, refund_only) = if items.len() < min as usize {
+                let (pending_items, non_pending): (Vec<_>, Vec<_>) = self
+                    .workers
+                    .get(&hash)
+                    .map(|w| {
+                        w.with_state(|s| {
+                            items.iter().cloned().partition(|i| {
+                                s.pending_incompatible_refund
+                                    .contains(&out_point_key(&i.out_point))
+                            })
+                        })
+                    })
+                    .unwrap_or_else(|| (Vec::new(), items));
+                report.skipped += non_pending.len();
+                if pending_items.is_empty() {
+                    continue;
+                }
+                (pending_items, true)
+            } else {
+                (items, false)
+            };
             let n = items.len().min(max as usize);
             let window = items[..n].to_vec();
             let rest = items[n..].to_vec();
+            // refund_only rejects cache with process=None; probe that fingerprint
+            // before dispatch so we soft-skip without RunBatch / isolate_windows.
+            if refund_only && self.refund_combo_cached(&hash, &window, process) {
+                tracing::debug!(
+                    target: LOG_TARGET,
+                    event = "submit.rejected_combo",
+                    path = "refund_only",
+                    n = window.len(),
+                );
+                report.skipped += window.len();
+                if !rest.is_empty() {
+                    stack.push(rest);
+                }
+                continue;
+            }
+            report.isolate_windows += 1;
             let fp = self.window_fingerprint(&window, process);
-            let already = self
-                .workers
-                .get(&hash)
-                .map(|w| w.with_state(|s| s.isolate_expanded.contains(&fp)))
-                .unwrap_or(false);
+            let already = !refund_only
+                && self
+                    .workers
+                    .get(&hash)
+                    .map(|w| w.with_state(|s| s.isolate_expanded.contains(&fp)))
+                    .unwrap_or(false);
             if already {
                 // Already expanded once this sweep — do not re-push drop_first/
                 // shrink (diamond explosion). Async Rejected queues frames via
                 // isolate_pending at poll time instead of relying on this arm.
                 continue;
             }
-            let cached = self.window_combo_cached(&hash, &window, process);
+            let cached = !refund_only && self.window_combo_cached(&hash, &window, process);
             let outcome = if cached {
                 tracing::debug!(
                     target: LOG_TARGET,
@@ -1142,6 +1232,7 @@ where
                     min,
                     resume_on_continue,
                     report,
+                    refund_only,
                 );
                 if !matches!(outcome, BatchOutcome::CachedRejected) {
                     *attempts += 1;
@@ -1188,18 +1279,33 @@ where
                     // Resume at this window after poll (do not skip to `rest`).
                     return items.first().map(|i| out_point_key(&i.out_point));
                 }
-                BatchOutcome::Submitted | BatchOutcome::Continue => {
+                BatchOutcome::Submitted | BatchOutcome::Continue | BatchOutcome::RetryLater => {
                     if !rest.is_empty() {
                         stack.push(rest);
                     }
                 }
                 BatchOutcome::Rejected | BatchOutcome::CachedRejected => {
-                    if let Some(w) = self.workers.get(&hash) {
-                        w.with_state_mut(|state| state.isolate_expanded.insert(fp));
+                    if refund_only {
+                        // Should be rare (process_batch maps these to Continue);
+                        // never isolate-split below-min refund leftovers.
+                        if !rest.is_empty() {
+                            stack.push(rest);
+                        }
+                    } else if let Some(w) = self.workers.get(&hash) {
+                        let (iso_window, iso_rest) =
+                            Self::strip_pending_incompatible_refund(w, &window, &rest);
+                        if iso_window.is_empty() {
+                            if !rest.is_empty() {
+                                // rest may still hold pending cells — keep for scan.
+                            }
+                        } else {
+                            w.with_state_mut(|state| state.isolate_expanded.insert(fp));
+                            let (frames, skipped) =
+                                Self::reject_isolate_frames(&iso_window, &iso_rest, min);
+                            report.skipped += skipped;
+                            stack.extend(frames);
+                        }
                     }
-                    let (frames, skipped) = Self::reject_isolate_frames(&window, &rest, min);
-                    report.skipped += skipped;
-                    stack.extend(frames);
                 }
             }
         }
@@ -1243,6 +1349,19 @@ where
         }
     }
 
+    fn refund_combo_cached(
+        &self,
+        hash: &[u8; 32],
+        batch: &[ScannedIntention],
+        process: &ResolvedProcess,
+    ) -> bool {
+        self.workers.get(hash).is_some_and(|w| {
+            w.with_state(|state| {
+                process_batch::refund_combo_cached(state, batch, &self.batch_code_key(process))
+            })
+        })
+    }
+
     fn window_combo_cached(
         &self,
         hash: &[u8; 32],
@@ -1280,6 +1399,7 @@ where
         min: u32,
         resume_on_continue: Option<Vec<u8>>,
         report: &mut TickReport,
+        refund_only: bool,
     ) -> BatchOutcome {
         let worker = match self.workers.get(&hash) {
             Some(w) => w,
@@ -1312,6 +1432,7 @@ where
             resume_on_continue,
             rest,
             min,
+            refund_only,
         ) {
             Ok(()) => BatchOutcome::ProcessOccupied,
             Err(crate::workers::StartBatchError::AlreadyOutstanding) => {

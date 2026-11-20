@@ -35,6 +35,10 @@ pub struct ProcessWorkerState {
     /// or leftover frames saved on ProcessOccupied. Consumed by the next
     /// `isolate_window` instead of re-deriving via `already`.
     pub isolate_pending: Vec<Vec<ScannedIntention>>,
+    /// Out-point keys that saw DigestIncompatible but could not refund yet
+    /// (e.g. fee unaffordable). Below-min leftovers retry refund without a
+    /// legal `[min,max]` assemble window.
+    pub pending_incompatible_refund: HashSet<Vec<u8>>,
     pub generation: u64,
     last_process_code: Option<OutPoint>,
 }
@@ -53,6 +57,7 @@ impl ProcessWorkerState {
             isolate_resume: None,
             isolate_expanded: HashSet::new(),
             isolate_pending: Vec::new(),
+            pending_incompatible_refund: HashSet::new(),
             generation,
             last_process_code: None,
         }
@@ -73,6 +78,7 @@ impl ProcessWorkerState {
         self.isolate_expanded.clear();
         self.isolate_pending.clear();
         self.isolate_resume = None;
+        self.pending_incompatible_refund.clear();
     }
 
     pub fn process_type_hash(&self) -> [u8; 32] {
@@ -93,6 +99,7 @@ enum ProcessWorkerJob {
         tick_cell_deps: Vec<CellDep>,
         refund_policy: RefundPolicy,
         max_assembled_tx_bytes: usize,
+        refund_only: bool,
         reply: SyncSender<(BatchOutcome, BatchReportDelta)>,
     },
 }
@@ -107,6 +114,7 @@ struct PendingBatch {
     window: Vec<ScannedIntention>,
     rest: Vec<ScannedIntention>,
     min: u32,
+    refund_only: bool,
 }
 
 /// Completed RunBatch poll result for the digest loop.
@@ -118,6 +126,7 @@ pub struct PolledBatch {
     pub window: Vec<ScannedIntention>,
     pub rest: Vec<ScannedIntention>,
     pub min: u32,
+    pub refund_only: bool,
 }
 
 /// Handle to a Process worker thread.
@@ -183,6 +192,7 @@ impl ProcessWorker {
                     window: pending.window,
                     rest: pending.rest,
                     min: pending.min,
+                    refund_only: pending.refund_only,
                 })
             }
             Err(mpsc::TryRecvError::Empty) => None,
@@ -200,6 +210,7 @@ impl ProcessWorker {
                     window: pending.window,
                     rest: pending.rest,
                     min: pending.min,
+                    refund_only: pending.refund_only,
                 })
             }
         }
@@ -222,6 +233,7 @@ impl ProcessWorker {
         resume_on_continue: Option<Vec<u8>>,
         rest: Vec<ScannedIntention>,
         min: u32,
+        refund_only: bool,
     ) -> Result<(), StartBatchError> {
         if self
             .batch_outstanding
@@ -242,6 +254,7 @@ impl ProcessWorker {
                 tick_cell_deps,
                 refund_policy,
                 max_assembled_tx_bytes,
+                refund_only,
                 reply: reply_tx,
             })
             .is_err()
@@ -257,6 +270,7 @@ impl ProcessWorker {
             window: batch,
             rest,
             min,
+            refund_only,
         });
         Ok(())
     }
@@ -313,6 +327,7 @@ fn worker_thread_main<R, S>(
                 tick_cell_deps,
                 refund_policy,
                 max_assembled_tx_bytes,
+                refund_only,
                 reply,
             } => {
                 if epoch.load(Ordering::SeqCst) != job_epoch {
@@ -346,6 +361,7 @@ fn worker_thread_main<R, S>(
                         max_assembled_tx_bytes,
                         job_epoch,
                         epoch: epoch.clone(),
+                        refund_only,
                     },
                 );
                 // Always forward the real outcome — especially Submitted* after
@@ -669,6 +685,7 @@ mod tests {
             w.isolate_expanded.insert(vec![0x02]);
             w.isolate_pending.push(Vec::new());
             w.isolate_resume = Some(vec![0x03]);
+            w.pending_incompatible_refund.insert(vec![0x04]);
         });
         assert!(!pool.register(entry([0x10; 32], [0x21; 32])).unwrap());
         pool.get(&hash).unwrap().with_state(|w| {
@@ -676,6 +693,7 @@ mod tests {
             assert!(w.isolate_expanded.is_empty());
             assert!(w.isolate_pending.is_empty());
             assert!(w.isolate_resume.is_none());
+            assert!(w.pending_incompatible_refund.is_empty());
         });
     }
 
