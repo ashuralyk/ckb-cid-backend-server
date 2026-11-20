@@ -378,8 +378,14 @@ impl Rpc for CkbRpc {
             .ok_or_else(|| RpcError::Unavailable("send_transaction: result not hex".into()))?;
         let bytes = decode_hex(hex)
             .map_err(|e| RpcError::Unavailable(format!("send_transaction hash: {e}")))?;
-        Byte32::from_slice(&bytes)
-            .map_err(|_| RpcError::Unavailable("send_transaction hash not 32 bytes".into()))
+        let receipt = Byte32::from_slice(&bytes)
+            .map_err(|_| RpcError::Unavailable("send_transaction hash not 32 bytes".into()))?;
+        if receipt != tx.hash() {
+            return Err(RpcError::Unavailable(
+                "send_transaction hash does not match the submitted transaction".into(),
+            ));
+        }
+        Ok(receipt)
     }
 
     fn get_transaction_status(&self, tx_hash: &Byte32) -> Result<TxStatus, RpcError> {
@@ -1918,6 +1924,36 @@ mod tests {
         }
     }
 
+    // The stub builds raw transactions with only inputs, outputs, and data.
+    fn stub_transaction_hash(params: &Value) -> Value {
+        let tx = &params[0];
+        assert_eq!(tx["version"], "0x0");
+        assert_eq!(tx["cell_deps"], json!([]));
+        assert_eq!(tx["header_deps"], json!([]));
+        let inputs = tx["inputs"].as_array().unwrap().iter().map(|input| {
+            CellInput::new_builder()
+                .previous_output(json_to_out_point(&input["previous_output"]).unwrap())
+                .since(parse_uint(&input["since"]).unwrap().pack())
+                .build()
+        });
+        let outputs = tx["outputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|output| json_to_output(output).unwrap());
+        let outputs_data = tx["outputs_data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|data| decode_hex(data.as_str().unwrap()).unwrap().pack());
+        let tx = ckb_types::core::TransactionBuilder::default()
+            .inputs(inputs)
+            .outputs(outputs)
+            .outputs_data(outputs_data)
+            .build();
+        json!(hex_bytes(tx.hash().as_slice()))
+    }
+
     fn live_intent_and_process() -> (Value, Value, [u8; 32]) {
         let ts = process_type_script(1);
         let hash = script_hash32(&ts);
@@ -1955,7 +1991,7 @@ mod tests {
                 if n == 0 {
                     Err((-1106, "PoolIsFull".into()))
                 } else {
-                    Ok(Value::String(hex_bytes(&[0xab; 32])))
+                    Ok(stub_transaction_hash(&params))
                 }
             }
             "get_transaction" if sends2.load(Ordering::SeqCst) == 1 => Ok(Value::Null),
@@ -1998,6 +2034,52 @@ mod tests {
     }
 
     #[test]
+    fn mismatched_send_receipt_keeps_the_locally_hashed_transaction_pending() {
+        let (intent, proc, _) = live_intent_and_process();
+        let admitted = Arc::new(Mutex::new(None));
+        let node_pending = admitted.clone();
+        let url = spawn_mock(Arc::new(move |method, params| match method {
+            "get_cells" if params[0]["script_type"] == "lock" => {
+                Ok(cells_result(vec![intent.clone()]))
+            }
+            "get_cells" => Ok(cells_result(vec![proc.clone()])),
+            "send_transaction" => {
+                let hash = stub_transaction_hash(&params);
+                assert!(node_pending.lock().unwrap().replace(hash).is_none());
+                Ok(json!(hex_bytes(&[0xab; 32])))
+            }
+            "get_transaction" => Ok(if node_pending.lock().unwrap().as_ref() == params.get(0) {
+                json!({"tx_status": {"status": "pending"}})
+            } else {
+                Value::Null // The mismatched receipt hash was never admitted.
+            }),
+            "get_tip_block_number" => Ok(json!("0x0")),
+            other => host_query_or_dry_run(other, &params, &[intent.clone(), proc.clone()]),
+        }));
+        let mut loop_ = DigestLoop::new(
+            CkbRpc::with_process_code_hashes(&url, &url, vec![PROC_CODE]),
+            NopClock,
+            StubSsri,
+            digest_loop_cfg(1),
+        );
+        register_fixture_process(&mut loop_, 1);
+        let first = loop_.tick();
+        assert_eq!(first.submitted, 0);
+        assert!(first.last_error.unwrap().contains("hash does not match"));
+        let live_hash =
+            decode_hex(admitted.lock().unwrap().as_ref().unwrap().as_str().unwrap()).unwrap();
+        let created = OutPoint::new_builder()
+            .tx_hash(Byte32::from_slice(&live_hash).unwrap())
+            .index(0u32.pack())
+            .build();
+        assert_eq!(loop_.tick().submitted, 0);
+        let state = loop_.state().submit.unwrap();
+        assert_eq!(state.pending.len(), 1);
+        assert!(state.pending.contains_key(&live_hash));
+        assert!(state.pending_occupies(&created));
+    }
+
+    #[test]
     fn digest_loop_header_null_does_not_settle_then_recovers() {
         let (intent, proc, _) = live_intent_and_process();
         let headers = Arc::new(AtomicUsize::new(0));
@@ -2013,7 +2095,7 @@ mod tests {
                     Ok(cells_result(vec![proc.clone()]))
                 }
             }
-            "send_transaction" => Ok(Value::String(hex_bytes(&[0xab; 32]))),
+            "send_transaction" => Ok(stub_transaction_hash(&params)),
             "get_transaction" => Ok(json!({
                 "tx_status": {
                     "status": "committed",
@@ -2095,7 +2177,7 @@ mod tests {
     fn indexer_lag_lists_spent_cell_until_cursor_catches_up() {
         let calls = Arc::new(Mutex::new(Vec::<String>::new()));
         let calls2 = calls.clone();
-        let url = spawn_mock(Arc::new(move |method, _params| {
+        let url = spawn_mock(Arc::new(move |method, params| {
             calls2.lock().unwrap().push(method.to_string());
             match method {
                 "get_cells" => {
@@ -2118,7 +2200,7 @@ mod tests {
                         Ok(cells_result(vec![]))
                     }
                 }
-                "send_transaction" => Ok(Value::String(hex_bytes(&[0xab; 32]))),
+                "send_transaction" => Ok(stub_transaction_hash(&params)),
                 _ => Err((-1, format!("unexpected {method}"))),
             }
         }));
@@ -2176,8 +2258,7 @@ mod tests {
             }
             "send_transaction" => {
                 *submitted2.lock().unwrap() += 1;
-                let n = *submitted2.lock().unwrap();
-                Ok(Value::String(hex_bytes(&[n as u8; 32])))
+                Ok(stub_transaction_hash(&params))
             }
             "get_transaction" => Ok(json!({"tx_status":{"status":"pending"}})),
             "get_tip_block_number" => Ok(json!("0x0")),
@@ -2427,7 +2508,7 @@ mod tests {
             }
             "send_transaction" => {
                 *submitted2.lock().unwrap() += 1;
-                Ok(Value::String(hex_bytes(&[0xab; 32])))
+                Ok(stub_transaction_hash(&params))
             }
             "get_transaction" => Ok(json!({"tx_status": {"status": "pending"}})),
             "get_tip_block_number" => Ok(json!("0x0")),

@@ -831,11 +831,146 @@ mod tests {
     }
 
     #[test]
+    fn continuous_arrivals_leave_probes_for_a_larger_batch() {
+        let (rpc, state, ops) = chain(80);
+        let arrival = filter_intention(83, 600_0000_0000);
+        let target = [ops[0].clone(), arrival.out_point.clone()];
+        let expected = [target[0].clone(), target[1].clone(), state.out_point];
+        let ssri = ScriptedSsri::mimic((1, 3)).with_assembly_error(move |inputs, _| {
+            (inputs[..inputs.len() - 1] != target).then_some(32)
+        });
+        let mut loop_ = loop_with_resolver(rpc, ssri, default_loop_config(), 1);
+
+        for tag in 81..=83 {
+            loop_
+                .rpc()
+                .insert_cell(filter_intention(tag, 600_0000_0000));
+            assert_eq!(loop_.tick().submitted, usize::from(tag == 83));
+        }
+        assert_eq!(input_sets(loop_.rpc()), [expected]);
+    }
+
+    #[test]
+    fn priority_probe_pairs_an_arrival_with_a_distinct_lock_group() {
+        let (rpc, state, ops) = chain(80);
+        let mut arrival = rpc.get_live_cell(&ops[0]).unwrap().unwrap();
+        arrival.out_point = out_point(161, 0);
+        let target = [ops[1].clone(), arrival.out_point.clone()];
+        let expected = [target[0].clone(), target[1].clone(), state.out_point];
+        let ssri = ScriptedSsri::mimic((2, 2))
+            .with_assembly_error(move |inputs, _| (inputs[..2] != target).then_some(32));
+        let mut loop_ = loop_with_resolver(rpc, ssri, default_loop_config(), 1);
+        assert_eq!(loop_.tick().submitted, 0);
+
+        for tag in 81..160 {
+            loop_
+                .rpc()
+                .insert_cell(filter_intention(tag, 600_0000_0000));
+        }
+        loop_.rpc().insert_cell(arrival);
+        assert_eq!(loop_.tick().submitted, 1);
+        assert_eq!(input_sets(loop_.rpc()), [expected]);
+    }
+
+    #[test]
+    fn continuous_arrivals_do_not_starve_a_filter_refund() {
+        let (rpc, _, ops) = chain(80);
+        // Keep the reason-5 cell first so filter chunk boundaries do not matter.
+        let mut chunk = 0;
+        let ssri = ScriptedSsri::mimic((1, 3))
+            .with_filter(move |n| {
+                let mut reasons = vec![0; n];
+                if chunk % 2 == 0 {
+                    reasons[0] = 5;
+                }
+                chunk += 1;
+                Ok(reasons)
+            })
+            .with_assembly_error(|_, _| Some(32));
+        let mut loop_ = loop_with_resolver(rpc, ssri, default_loop_config(), 1);
+        for tag in 81..=82 {
+            loop_
+                .rpc()
+                .insert_cell(filter_intention(tag, 600_0000_0000));
+            loop_.tick();
+        }
+        assert_eq!(input_sets(loop_.rpc()), [vec![ops[0].clone()]]);
+        assert!(ops[1..].iter().all(|op| loop_.rpc().has_cell(op)));
+    }
+
+    #[test]
+    fn exhausted_assembly_backs_off_on_an_unchanged_tip_and_live_set() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        for (count, max) in [(1, 1), (4, 3)] {
+            let (rpc, _, _) = chain(count);
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let calls = attempts.clone();
+            let ssri = ScriptedSsri::mimic((1, max)).with_assembly_error(move |_, _| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Some(32)
+            });
+            let mut loop_ = loop_with_resolver(rpc, ssri, default_loop_config(), 1);
+            assert_eq!(loop_.tick().submitted, 0);
+            let first = attempts.load(Ordering::Relaxed);
+            assert_eq!(loop_.tick().submitted, 0);
+            assert_eq!(attempts.load(Ordering::Relaxed), first);
+            assert_eq!(loop_.tick().submitted, 0);
+            assert!(attempts.load(Ordering::Relaxed) > first);
+        }
+    }
+
+    #[test]
+    fn revived_candidate_interrupts_an_exhausted_search_backoff() {
+        let (rpc, state, ops) = chain(2);
+        rpc.mark_indexer_cell_stale(ops[1].clone());
+        let ssri = ScriptedSsri::mimic((1, 1)).with_intention_error(ops[0].clone(), 32);
+        let mut loop_ = loop_with_resolver(rpc, ssri, default_loop_config(), 1);
+        assert_eq!(loop_.tick().submitted, 0);
+
+        loop_.rpc().restore_indexer_cell_liveness(&ops[1]);
+        assert_eq!(loop_.tick().submitted, 1);
+        assert_eq!(
+            input_sets(loop_.rpc()),
+            [vec![ops[1].clone(), state.out_point]]
+        );
+    }
+
+    #[test]
+    fn unaudited_exit_37_retries_an_unchanged_candidate_on_the_next_tick() {
+        let (rpc, _, _) = chain(1);
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let fail_once = AtomicBool::new(true);
+        let ssri = ScriptedSsri::mimic((1, 1)).with_assembly_error(move |_, _| {
+            fail_once.swap(false, Ordering::Relaxed).then_some(37)
+        });
+        let mut loop_ = loop_with_resolver(rpc, ssri, default_loop_config(), 1);
+        assert_eq!(loop_.tick().submitted, 0);
+        assert_eq!(loop_.tick().submitted, 1);
+    }
+
+    #[test]
+    fn large_search_only_checks_liveness_for_reached_candidates() {
+        let (rpc, _, ops) = chain(150);
+        let ssri = ScriptedSsri::mimic((1, 1)).with_assembly_error(|_, _| Some(32));
+        let mut loop_ = loop_with_resolver(rpc, ssri, default_loop_config(), 1);
+        for _ in 0..2 {
+            assert_eq!(loop_.tick().submitted, 0);
+            let reads = loop_.rpc().take_live_cell_reads();
+            let intention_reads: Vec<_> = ops.iter().filter_map(|op| reads.get(op)).collect();
+            assert!(intention_reads.len() <= 65);
+            assert!(intention_reads.into_iter().sum::<usize>() <= 130);
+        }
+    }
+
+    #[test]
     fn batch_search_resumes_after_failing_singletons_use_the_tick_budget() {
         let (rpc, state, ops) = chain(80);
-        let viable = [ops[0].clone(), ops[1].clone()];
-        let expected = [viable[0].clone(), viable[1].clone(), state.out_point];
-        let ssri = ScriptedSsri::mimic((1, 3))
+        let viable = [ops[65].clone()];
+        let expected = [viable[0].clone(), state.out_point];
+        let ssri = ScriptedSsri::mimic((1, 1))
             .with_filter(|n| {
                 let mut reasons = vec![0; n];
                 if n == 17 {

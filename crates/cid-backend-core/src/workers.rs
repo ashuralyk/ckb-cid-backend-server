@@ -5,8 +5,8 @@ use crate::host_query::HostQueryRpc;
 use crate::process::ResolvedProcess;
 use crate::process::{ProcessEntry, ProcessResolver};
 use crate::process_batch::{
-    run_process_batch, BatchMode, BatchOutcome, BatchReportDelta, IsolationProbe, ProbeBudget,
-    ProcessBatchParams,
+    run_process_batch, BatchMode, BatchOutcome, BatchReportDelta, ExhaustedAssembly,
+    IsolationProbe, ProbeBudget, ProcessBatchParams,
 };
 use crate::rpc::{LiveCell, Rpc};
 use crate::scan::ScannedIntention;
@@ -42,6 +42,11 @@ fn process_snapshot(process: &ResolvedProcess) -> (OutPoint, Option<OutPoint>) {
 #[derive(PartialEq, Eq)]
 pub(crate) struct IsolationContext {
     pub(crate) accepted: Vec<OutPoint>,
+    pub(crate) execution: IsolationExecution,
+}
+
+#[derive(PartialEq, Eq)]
+pub(crate) struct IsolationExecution {
     pub(crate) process: OutPoint,
     pub(crate) guest_hash: [u8; 32],
     pub(crate) code_key: Vec<u8>,
@@ -64,6 +69,9 @@ pub struct ProcessWorkerState {
     isolation_context: Option<IsolationContext>,
     /// Unfinished subset search for the current candidate and Process snapshot.
     pub(crate) isolation_probe: Option<IsolationProbe>,
+    pub(crate) isolation_arrivals: Vec<OutPoint>,
+    pub(crate) exhausted_assembly: Option<ExhaustedAssembly>,
+    pub(crate) refund_probe_waited: bool,
     unfunded_process: Option<(OutPoint, Option<OutPoint>)>,
     pub(crate) probe_budget: ProbeBudget,
     pub generation: u64,
@@ -90,6 +98,9 @@ impl ProcessWorkerState {
             refund_state_deps: HashMap::new(),
             isolation_context: None,
             isolation_probe: None,
+            isolation_arrivals: Vec::new(),
+            exhausted_assembly: None,
+            refund_probe_waited: false,
             unfunded_process: None,
             probe_budget: ProbeBudget::default(),
             generation,
@@ -120,10 +131,31 @@ impl ProcessWorkerState {
     }
 
     pub(crate) fn set_isolation_context(&mut self, context: Option<IsolationContext>) {
-        if self.isolation_context != context {
-            self.isolation_probe = None;
-            self.isolation_context = context;
+        self.isolation_arrivals.clear();
+        if self.isolation_context == context {
+            return;
         }
+        self.exhausted_assembly = None;
+        match (&self.isolation_context, &context) {
+            (Some(previous), Some(current)) if previous.execution == current.execution => {
+                let previous: HashSet<_> = previous.accepted.iter().collect();
+                self.isolation_arrivals.extend(
+                    current
+                        .accepted
+                        .iter()
+                        .filter(|op| !previous.contains(op))
+                        .cloned(),
+                );
+                if let Some(probe) = &mut self.isolation_probe {
+                    probe.restart = true;
+                }
+            }
+            _ => {
+                self.isolation_probe = None;
+                self.refund_probe_waited = false;
+            }
+        }
+        self.isolation_context = context;
     }
 
     pub(crate) fn mark_process_unfunded(&mut self, process: &ResolvedProcess) {
@@ -139,6 +171,8 @@ impl ProcessWorkerState {
         self.submit.rejected_combos.clear();
         self.refund_cursor = None;
         self.isolation_probe = None;
+        self.exhausted_assembly = None;
+        self.refund_probe_waited = false;
     }
 
     pub(crate) fn has_pending_filter_refund(&self, state: &OutPoint) -> bool {

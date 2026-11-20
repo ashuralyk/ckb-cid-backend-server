@@ -10,7 +10,7 @@ use crate::ssri::{filter_intentions, SsriError, SsriHost};
 use crate::submit::{execution_code_key, SubmitState};
 use crate::type_id::TypeIdCodeDep;
 pub use crate::worker_commands::{WorkerCommand, WorkerCommands};
-use crate::workers::{IsolationContext, WorkerPool, WorkerRemoveError};
+use crate::workers::{IsolationContext, IsolationExecution, WorkerPool, WorkerRemoveError};
 use cid_intention_filter::{
     FILTER_ACCEPTED, FILTER_DEPOSIT_BELOW_MINIMUM, FILTER_MALFORMED_DIGEST,
     FILTER_UNSUPPORTED_ACTION, FILTER_UNSUPPORTED_ASSET,
@@ -583,13 +583,15 @@ where
                             .iter()
                             .map(|item| item.out_point.clone())
                             .collect(),
-                        process: process.live_cell.out_point.clone(),
-                        guest_hash: CellOutput::calc_data_hash(&process.binary).unpack(),
-                        code_key: self.batch_code_key(process),
-                        deps: self.tick_cell_deps.clone(),
-                        cid_locks: self.tick_cid_locks.clone(),
-                        max_tx_bytes: self.config.max_assembled_tx_bytes,
-                        mode,
+                        execution: IsolationExecution {
+                            process: process.live_cell.out_point.clone(),
+                            guest_hash: CellOutput::calc_data_hash(&process.binary).unpack(),
+                            code_key: self.batch_code_key(process),
+                            deps: self.tick_cell_deps.clone(),
+                            cid_locks: self.tick_cid_locks.clone(),
+                            max_tx_bytes: self.config.max_assembled_tx_bytes,
+                            mode,
+                        },
                     }));
                     mode
                 });
@@ -631,24 +633,25 @@ where
             self.wait_all_batches(&mut report, &mut searches);
         }
 
-        // Wait for assembly to finish first. A Process state fault discovered
-        // by assemble must also stop refunds authorized by its filter.
+        // Give assembly the first turn to find a Process fault. A bounded
+        // second pass lets a fresh filter verdict proceed even under churn.
         for bucket in buckets {
             let hash = bucket.process.type_hash;
             let search = &searches[&hash];
-            if search.probe_pending
+            let pending = search.probe_pending
                 || search
                     .pending
                     .as_ref()
-                    .is_some_and(|items| !items.is_empty())
-            {
-                continue;
-            }
+                    .is_some_and(|items| !items.is_empty());
             let can_refund = self.workers.get(&hash).is_some_and(|worker| {
-                worker.with_state(|state| {
+                worker.with_state_mut(|state| {
+                    let had_probe_turn = pending && state.refund_probe_waited;
+                    state.refund_probe_waited = pending && !bucket.refunds.is_empty();
                     !state.is_process_quarantined(&bucket.process)
+                        && (!pending || had_probe_turn)
                         && (!state.filter_refund_deferred
                             || state.refund_assembly_checked
+                            || had_probe_turn
                             || bucket.accepted.is_empty())
                 })
             });

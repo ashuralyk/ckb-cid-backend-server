@@ -36,11 +36,12 @@ recreate is skipped until settlement (`process_occupied`).
 
 A filter-authorized User Lock refund spends the Intention and uses the live
 Process state and code as cell dependencies. The worker defers the refund while
-a pending digest consumes or creates its authorizing state. All refund sweeps
-wait while a bounded assembly search has probes remaining. If a legal accepted batch is
-available, the worker requires a completed assembly check before releasing the
-deferred refund. A confirming digest's recreated state stays occupied until
-settlement. In the other direction, a pending refund blocks digest submissions
+a pending digest consumes or creates its authorizing state. Assembly gets
+the first turn to detect exit 41, which blocks that state/code pair's refunds.
+If an unfinished search takes a second consecutive probe turn under the same
+Process and execution snapshot, the sweep can proceed with a fresh filter verdict
+and matching node snapshots. A confirming digest's recreated state stays
+occupied until settlement. In the other direction, a pending refund blocks digest submissions
 that would consume its state dependency.
 The worker lifts that dependency interlock after the node reports the refund
 committed, a fresh tip read places the tip at or above the commit height
@@ -108,19 +109,25 @@ for that combination. The worker uses the ELF from the registered Process
 code cell and verifies the indexed Process state against the node before
 filtering or assembly.
 
-An unfinished search resumes only if the ordered filter-accepted candidates,
-their node liveness, and the Process and execution snapshot match. Changes
-to accepted candidates, including revived cells, start a fresh search.
-The arrival of a cell excluded by the filter leaves the cursor in place.
-Large searches vary candidate order when restarting.
+An unfinished search resumes if the ordered filter-accepted candidates
+and the Process and execution snapshot match. Changes to accepted candidates
+or an observed revival start a fresh search. The arrival of a cell excluded by
+the filter leaves the cursor in place. Large searches rotate through legal batch
+sizes and give early probe slots to arrivals and observed revivals.
+
+Candidate liveness is read as a probe reaches a cell and reused within the
+search that tick. Isolation allows up to one window plus 64 new candidate
+reads per Process per tick and revisits up to 64 recently observed dead
+candidates on a new tick. An unavailable lookup defers the search. An exhausted
+assembly search over up to 64 accepted candidates can skip one tick if the
+candidate liveness, execution snapshot, and canonical tip still match. Exit 36
+and unaudited exit 37 do not trigger this backoff.
+
 Windows and probes select at most one input per full CID lock script. Probes
 skip non-live Intentions and subsets with non-live guest-added funding inputs.
 A transaction that adds an unselected Intention as funding is rejected for
-that attempt. The guest can assemble the same selection again on a later tick.
-An unavailable liveness lookup defers the search to the next tick. A
-structurally invalid transaction advances the search during a deferred
-refund’s assembly check. The refund stays deferred if the budget runs out
-before that check completes.
+that attempt. A structurally invalid transaction advances the search during
+a deferred refund’s assembly check.
 
 For the audited v0.1.4 example ELF, exit 37 on a Process state with zero fee
 headroom pauses assembly until the state or Process code changes. Other guests

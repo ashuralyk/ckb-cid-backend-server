@@ -22,6 +22,7 @@ struct Inner {
     indexer_snapshots: HashMap<OutPoint, Option<LiveCell>>,
     unavailable_submit_inputs: HashSet<OutPoint>,
     unavailable_live_cell_once: Option<OutPoint>,
+    live_cell_reads: HashMap<OutPoint, usize>,
     unavailable_next_dry_run: bool,
     reject_inputs: HashSet<Vec<u8>>,
     conflict_input: Option<(OutPoint, bool)>,
@@ -228,6 +229,10 @@ impl FakeRpc {
     /// The node rejects this dependency while the indexer still lists it.
     pub fn mark_indexer_cell_stale(&self, op: OutPoint) {
         self.inner.lock().unwrap().stale_indexer_cells.insert(op);
+    }
+
+    pub fn take_live_cell_reads(&self) -> HashMap<OutPoint, usize> {
+        std::mem::take(&mut self.inner.lock().unwrap().live_cell_reads)
     }
 
     pub fn fail_live_cell_once(&self, op: OutPoint) {
@@ -689,6 +694,7 @@ impl Rpc for FakeRpc {
 impl HostQueryRpc for FakeRpc {
     fn get_live_cell(&self, out_point: &OutPoint) -> Result<Option<LiveCell>, RpcError> {
         let mut inner = self.inner.lock().unwrap();
+        *inner.live_cell_reads.entry(out_point.clone()).or_default() += 1;
         if inner.unavailable_live_cell_once.as_ref() == Some(out_point) {
             inner.unavailable_live_cell_once = None;
             return Err(RpcError::Unavailable(

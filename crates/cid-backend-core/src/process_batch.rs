@@ -13,7 +13,7 @@ use crate::rpc::{LiveCell, Rpc, RpcError};
 use crate::scan::ScannedIntention;
 use crate::ssri::{
     build_batch_draft, draft_cell_deps_for_batch, draft_cells_for_batch, intention_draft_cell,
-    SsriError, SsriHost, PROCESS_LOCK_ARGS_INVALID, STATE_CAPACITY_INSUFFICIENT,
+    SsriError, SsriHost, HOST_QUERY_FAILED, PROCESS_LOCK_ARGS_INVALID, STATE_CAPACITY_INSUFFICIENT,
 };
 use crate::submit::{combo_fingerprint, dry_run_gate, submit_execution, DryRunGate};
 use crate::worker_commands::{Submission, WorkerCommands};
@@ -22,7 +22,7 @@ use cid_process_executor::AssembledTx;
 use cid_protocol::CidArgs;
 use ckb_types::packed::{CellDep, CellOutput, OutPoint};
 use ckb_types::prelude::{Entity, Unpack};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -39,6 +39,7 @@ const AUDITED_EXAMPLE_DATA_HASH: [u8; 32] = [
 pub(crate) struct ProbeBudget {
     pub(crate) remaining: usize,
     scan_number: u64,
+    live_reads: usize,
 }
 
 impl Default for ProbeBudget {
@@ -52,6 +53,7 @@ impl ProbeBudget {
         Self {
             remaining: MAX_COMPARISON_PROBES,
             scan_number,
+            live_reads: 0,
         }
     }
 }
@@ -270,26 +272,19 @@ where
     let prepare = |assembled: &AssembledTx, items: &[ScannedIntention]| {
         prepare_execution(rpc.as_ref(), assembled, items, process, max_size, cid_locks)
     };
-    let (mut probe, mut budget) = {
+    let (previous, mut budget, arrivals, exhausted) = {
         let mut worker = state.lock().expect("process worker state");
-        (worker.isolation_probe.take(), worker.probe_budget)
+        (
+            worker.isolation_probe.take(),
+            worker.probe_budget,
+            std::mem::take(&mut worker.isolation_arrivals),
+            worker.exhausted_assembly.take(),
+        )
     };
     let candidates: Vec<_> = batch.iter().chain(rest).collect();
     let min_size = min as usize;
     let max_size = batch.len();
     let candidate_count = candidates.len();
-    let new_probe = |scan_number, rejected| {
-        IsolationProbe::new(candidate_count, min_size, max_size, scan_number, rejected)
-    };
-    let read_liveness = || {
-        candidates
-            .iter()
-            .map(|item| {
-                rpc.get_live_cell(&item.out_point)
-                    .map(|cell| cell.is_some())
-            })
-            .collect::<Result<Vec<_>, _>>()
-    };
     let lookup_failed = |error| {
         (
             BatchOutcome::RetryLater,
@@ -301,22 +296,116 @@ where
         )
     };
 
-    let mut liveness = None;
-    if let Some(previous) = &probe {
-        if !previous.matches_shape(candidates.len(), min_size, max_size) {
-            probe = None;
-        } else if previous.scan_number != budget.scan_number {
-            let current = match read_liveness() {
-                Ok(current) => current,
+    // An exhausted search only gets a backoff when its entire candidate
+    // snapshot can be revalidated within the bounded lookup budget.
+    let chain = (mode == BatchMode::Assemble && candidate_count <= MAX_COMPARISON_PROBES)
+        .then(|| {
+            rpc.get_block_hash(tip)
+                .ok()
+                .flatten()
+                .map(|hash| (tip, hash))
+        })
+        .flatten();
+    let mut live = HashMap::new();
+    let mut watched_dead = VecDeque::new();
+    let mut revived = Vec::new();
+    if let Some(marker) = exhausted.filter(|marker| {
+        marker.skip_scan == budget.scan_number
+            && Some(marker.chain) == chain
+            && marker.live.len() == candidate_count
+    }) {
+        let mut unchanged = true;
+        for (candidate, was_live) in candidates.iter().zip(marker.live) {
+            match rpc.get_live_cell(&candidate.out_point) {
+                Ok(cell) => {
+                    let is_live = cell.is_some();
+                    unchanged &= is_live == was_live;
+                    live.insert(candidate.out_point.clone(), is_live);
+                    if is_live && !was_live {
+                        revived.push(candidate.out_point.clone());
+                    }
+                    if !is_live {
+                        watched_dead.push_back(candidate.out_point.clone());
+                    }
+                }
                 Err(error) => return lookup_failed(error),
-            };
-            if previous.live.as_ref() != Some(&current) {
-                probe = None;
             }
-            liveness = Some(current);
+        }
+        if unchanged {
+            report.skipped += batch.len();
+            return (BatchOutcome::IsolationExhausted, report);
         }
     }
 
+    let mut probe = previous;
+    if let Some(previous) = &mut probe {
+        if previous.scan_number != budget.scan_number {
+            let watched = std::mem::take(&mut previous.watched_dead);
+            let accepted: HashSet<_> = if watched.is_empty() {
+                HashSet::new()
+            } else {
+                candidates.iter().map(|item| &item.out_point).collect()
+            };
+            for op in watched {
+                if !accepted.contains(&op) {
+                    continue;
+                }
+                match rpc.get_live_cell(&op) {
+                    Ok(cell) => {
+                        live.insert(op.clone(), cell.is_some());
+                        if cell.is_some() {
+                            revived.push(op);
+                        } else {
+                            watched_dead.push_back(op);
+                        }
+                    }
+                    Err(error) => return lookup_failed(error),
+                }
+            }
+            previous.live = std::mem::take(&mut live);
+            previous.watched_dead = std::mem::take(&mut watched_dead);
+            previous.scan_number = budget.scan_number;
+            previous.cacheable &= previous.chain == chain;
+        }
+        if previous.restart
+            || !revived.is_empty()
+            || !previous.matches_shape(candidate_count, min_size, max_size)
+        {
+            let previous = probe.take().expect("active search");
+            live = previous.live;
+            watched_dead = previous.watched_dead;
+        }
+    }
+
+    let priority = if revived.is_empty() && arrivals.is_empty() {
+        Vec::new()
+    } else {
+        let positions: HashMap<_, _> = candidates
+            .iter()
+            .enumerate()
+            .map(|(i, item)| (&item.out_point, i))
+            .collect();
+        // Include both a revival and an arrival early if they occur together.
+        let mut seen = HashSet::new();
+        revived
+            .first()
+            .into_iter()
+            .chain(arrivals.iter().rev())
+            .chain(&revived)
+            .filter_map(|op| positions.get(op).copied())
+            .filter(|index| seen.insert(*index))
+            .collect()
+    };
+    let new_probe = |candidates: &[&ScannedIntention], budget: &ProbeBudget, rejected| {
+        IsolationProbe::new(
+            candidates,
+            min_size,
+            max_size,
+            budget.scan_number,
+            rejected,
+            &priority,
+        )
+    };
     let cached = |items: &[ScannedIntention]| {
         let rejected = mode != BatchMode::CheckAssembly
             && window_combo_cached(
@@ -363,25 +452,26 @@ where
         )
     };
     let initial_cached = probe.is_none() && cached(&batch);
-    let prepared = if probe.is_none()
-        && !initial_cached
-        && liveness
-            .as_ref()
-            .is_none_or(|live| live[..max_size].iter().all(|&is_live| is_live))
-    {
+    let mut cacheable = chain.is_some() && !initial_cached;
+    // The initial assembly validates its own draft inputs through the host.
+    // Isolation skips stale or already rejected subsets before running a guest.
+    let prepared = if probe.is_none() && !initial_cached {
         match attempt(&batch) {
-            Ok(assembled) => match prepare(&assembled, &batch) {
-                Err(PreparationError::NonLiveInput(op)) => {
-                    report.last_error = Some(format!("guest-added input {op:?} is not live"));
-                    None
+            Ok(assembled) => {
+                cacheable = false;
+                match prepare(&assembled, &batch) {
+                    Err(PreparationError::NonLiveInput(op)) => {
+                        report.last_error = Some(format!("guest-added input {op:?} is not live"));
+                        None
+                    }
+                    Err(PreparationError::Rejected | PreparationError::UnsafeFunding)
+                        if mode == BatchMode::CheckAssembly =>
+                    {
+                        None
+                    }
+                    result => Some(result),
                 }
-                Err(PreparationError::Rejected | PreparationError::UnsafeFunding)
-                    if mode == BatchMode::CheckAssembly =>
-                {
-                    None
-                }
-                result => Some(result),
-            },
+            }
             Err(SsriError::Incompatible(PROCESS_LOCK_ARGS_INVALID)) => {
                 return mark_process_unhealthy(hash, process, &state, batch.len());
             }
@@ -389,6 +479,7 @@ where
                 return mark_unfunded();
             }
             Err(error) => {
+                cacheable &= cacheable_assembly_exit(&error);
                 tracing::warn!(target: LOG_TARGET, event = "assemble.batch_failed",
                     process_type_hash = %hex_pref(&hash), %error,
                     intentions = ?batch.iter().map(|item| &item.out_point).collect::<Vec<_>>());
@@ -402,34 +493,35 @@ where
     let prepared = if let Some(prepared) = prepared {
         prepared
     } else {
-        let mut probe = probe.unwrap_or_else(|| new_probe(budget.scan_number, initial_cached));
-        if probe.has_work() {
-            probe.live = match liveness.or(probe.live.take()) {
-                Some(live) => Some(live),
-                None => match read_liveness() {
-                    Ok(live) => Some(live),
-                    Err(error) => return lookup_failed(error),
-                },
-            };
-            probe.scan_number = budget.scan_number;
-        }
+        let mut probe = probe.unwrap_or_else(|| {
+            let mut probe = new_probe(&candidates, &budget, initial_cached);
+            probe.live = live;
+            probe.watched_dead = watched_dead;
+            probe.cacheable = cacheable;
+            probe.chain = chain;
+            probe
+        });
+        let mut cacheable = probe.cacheable;
         let mut try_subset = |items: &[ScannedIntention]| {
             if cached(items) {
                 return Ok(None);
             }
             match attempt(items) {
-                Ok(assembled) => match prepare(&assembled, items) {
-                    Err(PreparationError::NonLiveInput(_)) => Ok(None),
-                    Err(PreparationError::InputLookup(error)) => Err(SsriError::Unusable(format!(
-                        "verify guest-added input: {error}"
-                    ))),
-                    Err(PreparationError::Rejected | PreparationError::UnsafeFunding)
-                        if mode == BatchMode::CheckAssembly =>
-                    {
-                        Ok(None)
+                Ok(assembled) => {
+                    cacheable = false;
+                    match prepare(&assembled, items) {
+                        Err(PreparationError::NonLiveInput(_)) => Ok(None),
+                        Err(PreparationError::InputLookup(error)) => Err(SsriError::Unusable(
+                            format!("verify guest-added input: {error}"),
+                        )),
+                        Err(PreparationError::Rejected | PreparationError::UnsafeFunding)
+                            if mode == BatchMode::CheckAssembly =>
+                        {
+                            Ok(None)
+                        }
+                        result => Ok(Some(result)),
                     }
-                    result => Ok(Some(result)),
-                },
+                }
                 Err(error @ SsriError::Incompatible(PROCESS_LOCK_ARGS_INVALID)) => Err(error),
                 Err(error @ SsriError::Incompatible(STATE_CAPACITY_INSUFFICIENT))
                     if can_pause_on_exit_37 =>
@@ -437,6 +529,7 @@ where
                     Err(error)
                 }
                 Err(error) => {
+                    cacheable &= cacheable_assembly_exit(&error);
                     tracing::warn!(target: LOG_TARGET, event = "assemble.probe_failed",
                         process_type_hash = %hex_pref(&hash), %error,
                         intentions = ?items.iter().map(|item| &item.out_point).collect::<Vec<_>>());
@@ -444,11 +537,21 @@ where
                 }
             }
         };
-        let result = probe.search(&candidates, &mut budget, &mut try_subset);
+        let result = probe.search(&candidates, rpc.as_ref(), &mut budget, &mut try_subset);
+        probe.cacheable = cacheable;
         let pending = probe.has_work();
+        let exhausted = if !pending && matches!(&result, Ok(None)) && cacheable {
+            match probe.exhausted_snapshot(&candidates, rpc.as_ref(), &mut budget) {
+                Ok(marker) => marker,
+                Err(error) => return lookup_failed(error),
+            }
+        } else {
+            None
+        };
         {
             let mut worker = state.lock().expect("process worker state");
             worker.probe_budget = budget;
+            worker.exhausted_assembly = exhausted;
             if pending && result.is_ok() {
                 worker.isolation_probe = Some(probe);
             }
@@ -493,7 +596,10 @@ where
                 probe.advance();
                 probe
             }
-            None => new_probe(budget.scan_number, rejected),
+            None => {
+                let candidates: Vec<_> = batch.iter().chain(rest).collect();
+                new_probe(&candidates, &budget, rejected)
+            }
         };
         if probe.has_work() {
             worker.isolation_probe = Some(probe);
@@ -706,32 +812,59 @@ fn prepare_execution(
     Ok(skeleton)
 }
 
-/// Enumerate subsets of the initial window and its remaining candidates.
+fn cacheable_assembly_exit(error: &SsriError) -> bool {
+    matches!(
+        error,
+        SsriError::Incompatible(code)
+            if !matches!(*code, HOST_QUERY_FAILED | STATE_CAPACITY_INSUFFICIENT)
+    )
+}
+
+pub(crate) struct ExhaustedAssembly {
+    skip_scan: u64,
+    chain: (u64, [u8; 32]),
+    live: Vec<bool>,
+}
+
+/// Enumerate legal subsets of the initial window and the remaining candidates.
 pub(crate) struct IsolationProbe {
     order: Vec<usize>,
     min: usize,
     max: usize,
-    indices: Option<Vec<usize>>,
+    cursors: VecDeque<(usize, Option<Vec<usize>>)>,
+    interleave: bool,
     preferred: Vec<Vec<usize>>,
     next_preferred: usize,
-    live: Option<Vec<bool>>,
+    live: HashMap<OutPoint, bool>,
+    watched_dead: VecDeque<OutPoint>,
     scan_number: u64,
+    cacheable: bool,
+    chain: Option<(u64, [u8; 32])>,
+    pub(crate) restart: bool,
 }
 
 impl IsolationProbe {
-    fn new(count: usize, min: usize, max: usize, scan_number: u64, rejected: bool) -> Self {
+    fn new(
+        candidates: &[&ScannedIntention],
+        min: usize,
+        max: usize,
+        scan_number: u64,
+        rejected: bool,
+        priority: &[usize],
+    ) -> Self {
+        let count = candidates.len();
+        let interleave = exceeds_probe_budget(count, min, max);
         let mut order: Vec<_> = (0..count).collect();
-        // Keep nearby candidates first. Vary the rest when a large search
-        // starts over so frequent arrivals cannot starve later candidates.
-        if scan_number != 0 && exceeds_probe_budget(count, min, max) {
-            order[(min + 1).min(count)..].sort_by_cached_key(|index| {
+        // Keep nearby candidates first. Rotate the remainder when the search
+        // restarts and give arrivals and observed revivals early probes.
+        if interleave && (scan_number != 0 || !priority.is_empty()) {
+            let priority_set: HashSet<_> = priority.iter().copied().collect();
+            order[(min + 1).min(count)..].sort_by_cached_key(|&index| {
                 let mut hasher = DefaultHasher::new();
                 (scan_number, index).hash(&mut hasher);
-                hasher.finish()
+                (!priority_set.contains(&index), hasher.finish())
             });
         }
-        // Rejected transactions try the smaller prefix and shifted window
-        // first, then use the same enumeration as assembly failures.
         let mut preferred = Vec::new();
         if rejected && max > 1 {
             if max > min {
@@ -741,16 +874,62 @@ impl IsolationProbe {
                 preferred.push((1..(max + 1).min(count)).collect());
             }
         }
+        // Sample combinations that include new or revived candidates, while
+        // leaving most of the budget to the normal per-size search.
+        let size_count = max - min + 1;
+        if interleave && !priority.is_empty() {
+            let sample_limit = (MAX_COMPARISON_PROBES / 4)
+                .min(MAX_COMPARISON_PROBES.saturating_sub(size_count + preferred.len()));
+            let priority_at_min = priority.iter().map(|&index| (min, index));
+            let priority_by_size = (min + 1..=max)
+                .flat_map(|size| priority.iter().take(2).map(move |&index| (size, index)));
+            for (size, index) in priority_at_min
+                .take(2)
+                .chain(priority_by_size)
+                .chain(priority.iter().skip(2).map(|&index| (min, index)))
+                .take(sample_limit)
+            {
+                let lock = candidates[index].lock_group_key();
+                let mut positions: Vec<_> = (0..max)
+                    .filter(|&i| candidates[i].lock_group_key() != lock)
+                    .take(size - 1)
+                    .collect();
+                positions.push(index);
+                positions.sort_unstable();
+                if !Self::is_initial(&positions, max) && !preferred.contains(&positions) {
+                    preferred.push(positions);
+                }
+            }
+        }
+        let mut cursors: VecDeque<_> = if count == min {
+            VecDeque::new()
+        } else {
+            (min..=max).map(|size| (size, None)).collect()
+        };
+        if cursors.len() > MAX_COMPARISON_PROBES - preferred.len() {
+            // A range wider than the budget gets a different start on restart.
+            let start = (scan_number % cursors.len() as u64) as usize;
+            cursors.rotate_left(start);
+        }
         Self {
             order,
             min,
             max,
-            indices: (count != min).then(|| (0..min).collect()),
+            cursors,
+            interleave,
             preferred,
             next_preferred: 0,
-            live: None,
+            live: HashMap::new(),
+            watched_dead: VecDeque::new(),
             scan_number,
+            cacheable: false,
+            chain: None,
+            restart: false,
         }
+    }
+
+    fn is_initial(positions: &[usize], max: usize) -> bool {
+        positions.len() == max && positions.iter().copied().eq(0..max)
     }
 
     fn matches_shape(&self, count: usize, min: usize, max: usize) -> bool {
@@ -758,36 +937,97 @@ impl IsolationProbe {
     }
 
     fn has_work(&self) -> bool {
-        self.indices.is_some()
+        !self.cursors.is_empty()
+    }
+
+    fn candidate_live(
+        &mut self,
+        op: &OutPoint,
+        rpc: &impl HostQueryRpc,
+        budget: &mut ProbeBudget,
+    ) -> Result<Option<bool>, RpcError> {
+        if let Some(&live) = self.live.get(op) {
+            return Ok(Some(live));
+        }
+        // Allow a full window and up to 64 additional reads even if every
+        // reached subset adds new candidates. Never walk the whole remainder.
+        if budget.live_reads >= self.max + MAX_COMPARISON_PROBES {
+            return Ok(None);
+        }
+        budget.live_reads += 1;
+        let live = rpc.get_live_cell(op)?.is_some();
+        self.live.insert(op.clone(), live);
+        if !live {
+            if self.watched_dead.len() == MAX_COMPARISON_PROBES {
+                self.watched_dead.pop_front();
+            }
+            self.watched_dead.push_back(op.clone());
+        }
+        Ok(Some(live))
+    }
+
+    fn exhausted_snapshot(
+        &mut self,
+        candidates: &[&ScannedIntention],
+        rpc: &impl HostQueryRpc,
+        budget: &mut ProbeBudget,
+    ) -> Result<Option<ExhaustedAssembly>, RpcError> {
+        let mut live = Vec::with_capacity(candidates.len());
+        for item in candidates {
+            let Some(is_live) = self.candidate_live(&item.out_point, rpc, budget)? else {
+                return Ok(None);
+            };
+            live.push(is_live);
+        }
+        Ok(self.chain.map(|chain| ExhaustedAssembly {
+            skip_scan: budget.scan_number.wrapping_add(1),
+            chain,
+            live,
+        }))
     }
 
     fn search<T>(
         &mut self,
         candidates: &[&ScannedIntention],
+        rpc: &impl HostQueryRpc,
         budget: &mut ProbeBudget,
         attempt: &mut impl FnMut(&[ScannedIntention]) -> Result<Option<T>, SsriError>,
     ) -> Result<Option<(Vec<ScannedIntention>, T)>, SsriError> {
-        while let Some(indices) = self.indices.as_ref().filter(|_| budget.remaining > 0) {
+        'probe: while self.has_work() && budget.remaining > 0 {
             let positions = if let Some(preferred) = self.preferred.get(self.next_preferred) {
                 preferred.clone()
             } else {
+                let (size, indices) = self.cursors.front_mut().expect("active subset search");
+                let indices = indices.get_or_insert_with(|| (0..*size).collect());
                 let mut positions: Vec<_> = indices.iter().map(|&i| self.order[i]).collect();
                 positions.sort_unstable(); // Preserve the candidate order within each batch.
-                let initial =
-                    positions.len() == self.max && positions.iter().copied().eq(0..self.max);
-                if initial || self.preferred.contains(&positions) {
+                if Self::is_initial(&positions, self.max) || self.preferred.contains(&positions) {
                     self.advance();
                     continue;
                 }
                 positions
             };
             budget.remaining -= 1;
-            let live = self.live.as_ref().expect("subset liveness checked");
             let mut locks = HashSet::new();
             if positions
                 .iter()
-                .all(|&i| live[i] && locks.insert(candidates[i].lock_group_key()))
+                .all(|&i| locks.insert(candidates[i].lock_group_key()))
             {
+                for &i in &positions {
+                    match self.candidate_live(&candidates[i].out_point, rpc, budget) {
+                        Ok(Some(true)) => {}
+                        Ok(Some(false)) => {
+                            self.advance();
+                            continue 'probe;
+                        }
+                        Ok(None) => return Ok(None),
+                        Err(error) => {
+                            return Err(SsriError::Unusable(format!(
+                                "verify isolation candidate: {error}"
+                            )));
+                        }
+                    }
+                }
                 let items: Vec<_> = positions.iter().map(|&i| candidates[i].clone()).collect();
                 if let Some(assembled) = attempt(&items)? {
                     return Ok(Some((items, assembled)));
@@ -803,7 +1043,8 @@ impl IsolationProbe {
             self.next_preferred += 1;
             return;
         }
-        let indices = self.indices.as_mut().expect("active subset search");
+        let (size, indices) = self.cursors.pop_front().expect("active subset search");
+        let mut indices = indices.expect("initialized subset cursor");
         // Exhaust nearby subsets before including a later candidate.
         for i in 0..indices.len() {
             let limit = indices.get(i + 1).copied().unwrap_or(self.order.len());
@@ -812,11 +1053,14 @@ impl IsolationProbe {
                 for (initial, index) in indices[..i].iter_mut().enumerate() {
                     *index = initial;
                 }
+                if self.interleave {
+                    self.cursors.push_back((size, Some(indices)));
+                } else {
+                    self.cursors.push_front((size, Some(indices)));
+                }
                 return;
             }
         }
-        let next_size = indices.len() + 1;
-        self.indices = (next_size <= self.max).then(|| (0..next_size).collect());
     }
 }
 
