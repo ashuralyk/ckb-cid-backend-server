@@ -36,7 +36,7 @@ Stable field `event` (target `cid_backend`):
 | `dry_run.conflict` | Digest dry-run mapped to Conflict |
 | `submit.ok` | `tx_hash` |
 | `submit.conflict` | Submit mapped as Conflict |
-| `dry_run.rejected` / `submit.rejected` | A permanent dry-run or send rejection caches the transaction combination. Its inputs can still be considered in other combinations. |
+| `dry_run.rejected` / `submit.rejected` | Permanent transaction validation rejection. The combination is cached and other eligible combinations can still run. |
 | `dry_run.pool_policy_rejected` / `submit.pool_policy_rejected` | The node rejected this transaction on a retryable rule, such as minimum fee rate, size limit, or maturity. The worker can try a different combination in the same tick and retry this combination on a later tick. |
 | `submit.rejected_combo` | Isolation skipped a combo already in `rejected_combos` (no new `send_transaction`) |
 | `pending.admission_unconfirmed` | An unanswered send still holds occupancy while the node has no current admission status for the attempt |
