@@ -301,6 +301,58 @@ mod tests {
     }
 
     #[test]
+    fn isolation_skips_a_subset_with_spent_guest_funding() {
+        let (rpc, state, ops) = chain(3);
+        let funding_op = out_point(4, 0);
+        rpc.insert_cell(live_cell(
+            funding_op.clone(),
+            lock_script([0x44; 32], ScriptHashType::Type, vec![0xAA]),
+            None,
+            100_0000_0000,
+            vec![],
+        ));
+        rpc.consume(&funding_op);
+        let ssri = ScriptedSsri::mimic((1, 3))
+            .with_intention_error(ops[0].clone(), 32)
+            .with_added_input_for(ops[1].clone(), funding_op);
+        let mut loop_ = loop_with_resolver(rpc, ssri, default_loop_config(), 1);
+
+        assert_eq!(loop_.tick().submitted, 1);
+        assert_eq!(
+            input_sets(loop_.rpc()),
+            [vec![ops[2].clone(), state.out_point]]
+        );
+        assert!(ops[..2].iter().all(|op| loop_.rpc().has_cell(op)));
+    }
+
+    #[test]
+    fn unavailable_guest_funding_lookup_preserves_the_probe_position() {
+        let (rpc, state, ops) = chain(3);
+        let funding_op = out_point(4, 0);
+        rpc.insert_cell(live_cell(
+            funding_op.clone(),
+            lock_script([0x44; 32], ScriptHashType::Type, vec![0xAA]),
+            None,
+            100_0000_0000,
+            vec![],
+        ));
+        rpc.fail_live_cell_once(funding_op.clone());
+        let ssri = ScriptedSsri::mimic((1, 3))
+            .with_intention_error(ops[0].clone(), 32)
+            .with_added_input_for(ops[1].clone(), funding_op.clone());
+        let mut loop_ = loop_with_resolver(rpc, ssri, default_loop_config(), 1);
+
+        assert_eq!(loop_.tick().submitted, 0);
+        assert_eq!(loop_.tick().submitted, 1);
+        assert_eq!(
+            input_sets(loop_.rpc()),
+            [vec![ops[1].clone(), state.out_point, funding_op]]
+        );
+        assert!(loop_.rpc().has_cell(&ops[0]));
+        assert!(loop_.rpc().has_cell(&ops[2]));
+    }
+
+    #[test]
     fn assembly_cannot_add_a_legacy_data1_cid_input() {
         let (rpc, _, ops) = chain(1);
         let hash = [0x33; 32];
@@ -470,6 +522,70 @@ mod tests {
             }
             assert_eq!(input_sets(loop_.rpc()), [expected]);
         }
+    }
+
+    #[test]
+    fn rejected_filter_refund_is_reconsidered_on_replacement_state() {
+        let (rpc, mut state, ops) = chain(1);
+        rpc.inject_dry_run_reject_once();
+        let ssri = ScriptedSsri::mimic((1, 1)).with_filter(|n| Ok(vec![5; n]));
+        let mut loop_ = loop_with_resolver(rpc, ssri, default_loop_config(), 1);
+
+        assert_eq!(loop_.tick().submitted, 0);
+        assert_eq!(loop_.tick().submitted, 0);
+        assert_eq!(loop_.rpc().dry_run_attempts(), 1);
+
+        loop_.rpc().consume(&state.out_point);
+        state.out_point = out_point(0xA1, 0);
+        loop_.rpc().insert_cell(state.clone());
+        assert_eq!(loop_.tick().submitted, 1);
+        assert_eq!(input_sets(loop_.rpc()), [vec![ops[0].clone()]]);
+        assert!(loop_.rpc().submitted()[0]
+            .cell_deps()
+            .into_iter()
+            .any(|dep| dep.out_point() == state.out_point));
+    }
+
+    #[test]
+    fn committed_refund_returning_to_pool_blocks_digest_again() {
+        let (rpc, state, ops) = chain(2);
+        rpc.defer_commit();
+        let second = rpc.get_live_cell(&ops[1]).unwrap().unwrap();
+        rpc.consume(&ops[1]);
+        let mut reason = 5;
+        let ssri = ScriptedSsri::mimic((1, 1)).with_filter(move |n| {
+            let current = reason;
+            reason = 0;
+            Ok(vec![current; n])
+        });
+        let mut config = default_loop_config();
+        config.confirmation_depth = 3;
+        let mut loop_ = loop_with_resolver(rpc, ssri, config, 1);
+
+        assert_eq!(loop_.tick().submitted, 1);
+        let refund = loop_.rpc().submitted()[0].hash();
+        loop_.rpc().commit_pending(&refund);
+        assert_eq!(loop_.tick().submitted, 0);
+        let pending = loop_.state().submit.unwrap().pending;
+        assert!(pending[refund.as_slice()].seen_committed);
+        assert!(pending[refund.as_slice()].currently_committed);
+
+        loop_.rpc().return_to_pool(&refund);
+        loop_.rpc().insert_cell(second);
+        assert_eq!(loop_.tick().submitted, 0);
+        assert_eq!(input_sets(loop_.rpc()), [vec![ops[0].clone()]]);
+        assert!(loop_.rpc().has_cell(&state.out_point));
+        assert!(loop_.rpc().has_cell(&ops[1]));
+        let pending = loop_.state().submit.unwrap().pending;
+        assert!(pending[refund.as_slice()].seen_committed);
+        assert!(!pending[refund.as_slice()].currently_committed);
+
+        loop_.rpc().commit_pending(&refund);
+        assert_eq!(loop_.tick().submitted, 1);
+        assert_eq!(
+            input_sets(loop_.rpc()),
+            [vec![ops[0].clone()], vec![ops[1].clone(), state.out_point]]
+        );
     }
 
     #[test]
@@ -739,6 +855,9 @@ mod tests {
         assert_eq!(loop_.tick().submitted, 0);
         assert_eq!(loop_.rpc().submit_attempts(), 0);
         loop_.rpc().insert_block_hash(tip, [0x92; 32]);
+        for _ in 0..3 {
+            assert_eq!(loop_.tick().submitted, 0);
+        }
         assert_eq!(loop_.tick().submitted, 1);
         assert_eq!(
             input_sets(loop_.rpc()),
@@ -1016,6 +1135,43 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_singleton_pauses_assembly_and_retries_after_backoff() {
+        let (rpc, _, ops) = chain(1);
+        let ssri = ScriptedSsri::mimic((1, 1)).with_intention_error(ops[0].clone(), 32);
+        let mut loop_ = loop_with_resolver(rpc, ssri, default_loop_config(), 1);
+
+        let first = loop_.tick();
+        assert_eq!(first.submitted, 0);
+        assert!(first.last_error.as_deref().unwrap().contains("32"));
+        loop_.ssri().seen_binaries.lock().unwrap().clear();
+        for _ in 0..3 {
+            assert_eq!(loop_.tick().submitted, 0);
+        }
+        // At most the batch bounds call per poll while the exhaustion marker holds.
+        assert!(loop_.ssri().seen_binaries.lock().unwrap().len() <= 3);
+        assert!(loop_.tick().last_error.as_deref().unwrap().contains("32"));
+        assert!(loop_.rpc().has_cell(&ops[0]));
+        assert!(input_sets(loop_.rpc()).is_empty());
+    }
+
+    #[test]
+    fn new_candidate_reopens_exhausted_isolation() {
+        let (rpc, state, ops) = chain(1);
+        let ssri = ScriptedSsri::mimic((1, 1)).with_intention_error(ops[0].clone(), 32);
+        let arrival = intention_cell(2, process_type_hash(1), 600_0000_0000);
+        let mut loop_ = loop_with_resolver(rpc, ssri, default_loop_config(), 1);
+
+        assert_eq!(loop_.tick().submitted, 0);
+        loop_.rpc().insert_cell(arrival.clone());
+        assert_eq!(loop_.tick().submitted, 1);
+        assert_eq!(
+            input_sets(loop_.rpc()),
+            [vec![arrival.out_point, state.out_point]]
+        );
+        assert!(loop_.rpc().has_cell(&ops[0]));
+    }
+
+    #[test]
     fn exhausted_isolation_resumes_at_the_next_window_after_a_cell_returns() {
         use std::sync::{Arc, Mutex};
 
@@ -1035,6 +1191,9 @@ mod tests {
         calls.lock().unwrap().clear();
         // A reorg revives C at the node without changing the indexer results.
         loop_.rpc().restore_indexer_cell_liveness(&ops[2]);
+        for _ in 0..3 {
+            assert_eq!(loop_.tick().submitted, 0);
+        }
         assert_eq!(loop_.tick().submitted, 1);
         assert_eq!(
             calls.lock().unwrap()[0][..2],

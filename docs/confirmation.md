@@ -33,8 +33,15 @@ still at sufficient depth.
 
 While confirming, occupancy covers both the spent inputs **and** the tx's
 outputs (the Process recreate). A later `digest_ok` that would spend that
-recreate is skipped until settlement (`process_occupied`). Incompatible User
-Lock refunds still submit; they do not spend Process.
+recreate is skipped until settlement (`process_occupied`).
+
+A filter-authorized User Lock refund spends the Intention and uses the live
+Process state and code as cell dependencies. The worker defers the refund while
+a pending digest consumes its authorizing state. In the other direction, a
+pending refund blocks digest submissions that would consume its state dependency.
+The worker lifts that dependency interlock when it observes the refund as
+committed. If the refund returns to the pool before settlement, or its status
+becomes unavailable, the worker holds the interlock again.
 
 ## Reorg recovery
 
@@ -42,6 +49,7 @@ Lock refunds still submit; they do not spend Process.
 |-------------|--------|
 | Tip rewinds (`tip < last_tip`) | Log `reorg.tip_rewind`. Confirmation count drops. Occupancy stays held until depth is met again. |
 | Tip rewinds while reading a Committed status (stale start-of-tick tip, or `tip < commit height`) | Re-read tip before settling. Keep occupancy this tick (`pending.tip_rewind` / confirming). Do not settle against the stale height. |
+| Confirming refund returns to `Pending` | Keep the Intention occupied and block digests that would spend the refund's Process state dependency. |
 | Confirming or committed tx becomes `Dropped` | Log `pending.reorg` (if we had seen Committed) or `pending.dropped`. Release occupancy. If cells are live, the next tick retries. |
 | Status or tip RPC unavailable | Keep occupancy. Do not settle. |
 
@@ -57,7 +65,7 @@ cells are live again.
 The adapter keeps the JSON-RPC `error.code` from `send_transaction` and
 classifies it. Transient node/pool errors are `Unavailable`. Core
 `SubmitRejected` is a **transaction-level** permanent failure of that exact
-Intention combo (plus Process outpoint when the tx spends Process). It does
+Intention combo under its Process state and execution code. It does
 **not** prove any one Intention is invalid, so consumed outpoints are not
 written to `rejected`.
 
@@ -70,12 +78,15 @@ written to `rejected`.
 | `Process.assemble` error | log and try another batch, or quarantine state on exit 41 | affected cells stay live |
 | `Process.filter` reasons 4–7 | User Lock refund after matching node snapshots | Intention input occupied on successful submit |
 
-**Combo isolation.** A `SubmitRejected` batch is recorded as a fingerprint of
-the Intention outpoints in order plus the Process outpoint if `digest_ok`
-spent it (refunds omit Process). The same combo is not submitted again until
-restart (or a new Process outpoint). Within the tick, the window is split
-into legal `[min, max]` sub-batches (shrink prefix; drop-first remainder)
-so a valid sibling can still submit when `min = 1`.
+**Combo isolation.** A rejected digest fingerprint includes the ordered
+Intention outpoints, the spent Process state outpoint, and the execution code
+identity. The worker splits the window into legal `[min, max]` sub-batches
+(shrink prefix or drop the first item) so a valid sibling can still submit.
+A rejected filter refund fingerprints the singleton Intention, the authorizing
+Process state dependency, and the execution code identity, with a tag for the
+refund path. A replacement state has a different outpoint, so the worker can
+reconsider the refund after a fresh filter verdict of 4–7 and matching node
+snapshots for the Intention, replacement state, and code.
 
 At most 64 **new** `send_transaction` or assemble-skip attempts per bucket
 per tick (cached `rejected_combos` hits do not consume that budget). A
@@ -88,13 +99,15 @@ unique windows instead of re-walking the tree from the ASC head (which
 would starve a later valid B). The set is dropped when the sweep
 completes, and on restart.
 
-Before SSRI assemble, the digest_ok fingerprint (Intention outpoints plus this
-Process outpoint) is looked up; a hit skips assemble and submit. After
-assemble, the actual fingerprint is checked (digest_ok includes Process;
-User Lock refunds omit it) so a cached refund does not skip a digest_ok
-combo and vice versa. Cache hits still walk/split so later Intentions can
-be reached on a later tick. Isolation is iterative (no recursion on long
-prefixes).
+Before SSRI assemble, the worker checks the digest fingerprint for the
+candidate window. A cache hit skips assembly and submission while the window
+can still be split to reach later Intentions. Isolation is iterative.
+
+A subset whose guest-added funding input is no longer live is skipped. A
+funding lookup error leaves that subset at the probe cursor for retry. When
+the search runs out of subsets, the worker leaves the Intentions live and
+skips the same candidate set for the next three successful scans. A change
+to the candidate set, Process state, or execution code reopens the search.
 
 Uncached no-send skips (`RefundUnbuildable`, capacity shortfall, SSRI
 assemble Unusable) still count toward the per-tick work bound — they are

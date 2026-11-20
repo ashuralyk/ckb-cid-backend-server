@@ -17,7 +17,7 @@ pub struct ScriptedSsri {
     intention_errors: Vec<(OutPoint, i8, Option<u64>)>,
     pair_error: Option<(OutPoint, i8)>,
     assembly_error: Option<AssemblyErrorScript>,
-    additional_input: Option<OutPoint>,
+    additional_input: Option<(OutPoint, Option<OutPoint>)>,
     pub bounds: (u32, u32),
     pub mode: Mode,
     /// Binaries observed by `get_batch_bounds` / `assemble` (SSRI source tests).
@@ -100,7 +100,12 @@ impl ScriptedSsri {
     }
 
     pub fn with_added_input(mut self, op: OutPoint) -> Self {
-        self.additional_input = Some(op);
+        self.additional_input = Some((op, None));
+        self
+    }
+
+    pub fn with_added_input_for(mut self, intention: OutPoint, input: OutPoint) -> Self {
+        self.additional_input = Some((input, Some(intention)));
         self
     }
 
@@ -182,11 +187,18 @@ impl SsriHost for ScriptedSsri {
             Mode::Unusable => Err(SsriError::Unusable("scripted".into())),
             Mode::MimicExample => {
                 let assembled = mimic_assemble(draft_tx, host, None)?;
-                let Some(op) = &self.additional_input else {
+                let Some((op, intention)) = &self.additional_input else {
                     return Ok(assembled);
                 };
                 let tx = Transaction::from_slice(assembled.as_molecule_bytes()).unwrap();
                 let mut inputs: Vec<_> = tx.raw().inputs().into_iter().collect();
+                if intention.as_ref().is_some_and(|intention| {
+                    !inputs
+                        .iter()
+                        .any(|input| &input.previous_output() == intention)
+                }) {
+                    return Ok(assembled);
+                }
                 inputs.push(CellInput::new_builder().previous_output(op.clone()).build());
                 let mut witnesses: Vec<_> = tx.witnesses().into_iter().collect();
                 witnesses.push(Default::default());

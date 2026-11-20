@@ -20,6 +20,7 @@ struct Inner {
     stale_indexer_cells: HashSet<OutPoint>,
     indexer_snapshots: HashMap<OutPoint, Option<LiveCell>>,
     unavailable_submit_inputs: HashSet<OutPoint>,
+    unavailable_live_cell_once: Option<OutPoint>,
     unavailable_next_dry_run: bool,
     reject_inputs: HashSet<Vec<u8>>,
     submit_attempts: usize,
@@ -171,6 +172,10 @@ impl FakeRpc {
         self.inner.lock().unwrap().stale_indexer_cells.insert(op);
     }
 
+    pub fn fail_live_cell_once(&self, op: OutPoint) {
+        self.inner.lock().unwrap().unavailable_live_cell_once = Some(op);
+    }
+
     pub fn restore_indexer_cell_liveness(&self, op: &OutPoint) {
         self.inner.lock().unwrap().stale_indexer_cells.remove(op);
     }
@@ -309,6 +314,15 @@ impl FakeRpc {
             }
         }
         inner.tx_status.insert(key, TxStatus::Dropped);
+    }
+
+    pub fn return_to_pool(&self, tx_hash: &Byte32) {
+        self.simulate_drop(tx_hash);
+        self.inner
+            .lock()
+            .unwrap()
+            .tx_status
+            .insert(tx_hash.as_slice().to_vec(), TxStatus::Pending);
     }
 
     /// Rewind the tip. Transactions committed above `new_tip` are dropped and
@@ -578,7 +592,13 @@ impl Rpc for FakeRpc {
 
 impl HostQueryRpc for FakeRpc {
     fn get_live_cell(&self, out_point: &OutPoint) -> Result<Option<LiveCell>, RpcError> {
-        let inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
+        if inner.unavailable_live_cell_once.as_ref() == Some(out_point) {
+            inner.unavailable_live_cell_once = None;
+            return Err(RpcError::Unavailable(
+                "injected live cell lookup failure".into(),
+            ));
+        }
         if inner.stale_indexer_cells.contains(out_point) {
             return Ok(None);
         }

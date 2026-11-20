@@ -5,8 +5,8 @@ use crate::host_query::HostQueryRpc;
 use crate::process::ResolvedProcess;
 use crate::process::{ProcessEntry, ProcessResolver};
 use crate::process_batch::{
-    run_process_batch, BatchMode, BatchOutcome, BatchReportDelta, IsolationProbe, ProbeBudget,
-    ProcessBatchParams,
+    run_process_batch, BatchMode, BatchOutcome, BatchReportDelta, ExhaustedIsolation,
+    IsolationProbe, ProbeBudget, ProcessBatchParams,
 };
 use crate::rpc::{LiveCell, Rpc};
 use crate::scan::ScannedIntention;
@@ -44,6 +44,7 @@ pub struct ProcessWorkerState {
     /// State dependencies of submitted filter refunds, keyed by transaction.
     pub(crate) refund_state_deps: HashMap<Vec<u8>, OutPoint>,
     pub(crate) isolation_probe: Option<IsolationProbe>,
+    pub(crate) exhausted_isolation: Option<ExhaustedIsolation>,
     pub(crate) probe_budget: ProbeBudget,
     pub generation: u64,
     /// State out point quarantined after Process.assemble exit 41.
@@ -70,6 +71,7 @@ impl ProcessWorkerState {
             filter_refund_deferred: false,
             refund_state_deps: HashMap::new(),
             isolation_probe: None,
+            exhausted_isolation: None,
             probe_budget: ProbeBudget::default(),
             generation,
             unhealthy_state: None,
@@ -97,13 +99,13 @@ impl ProcessWorkerState {
         self.isolate_resume = None;
         self.refund_cursor = None;
         self.isolation_probe = None;
+        self.exhausted_isolation = None;
     }
 
     pub(crate) fn has_pending_filter_refund(&self, state: &OutPoint) -> bool {
-        self.submit
-            .pending
-            .iter()
-            .any(|(hash, tx)| !tx.seen_committed && self.refund_state_deps.get(hash) == Some(state))
+        self.submit.pending.iter().any(|(hash, tx)| {
+            !tx.currently_committed && self.refund_state_deps.get(hash) == Some(state)
+        })
     }
 
     pub fn process_type_hash(&self) -> [u8; 32] {
@@ -756,6 +758,7 @@ mod tests {
                     consumed: vec![],
                     created: vec![],
                     seen_committed: false,
+                    currently_committed: false,
                 },
             );
         });
@@ -781,6 +784,7 @@ mod tests {
                     consumed: vec![],
                     created: vec![],
                     seen_committed: false,
+                    currently_committed: false,
                 },
             );
         });

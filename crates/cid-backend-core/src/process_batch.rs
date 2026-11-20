@@ -2,6 +2,7 @@
 
 use crate::assemble::{
     assemble_refund_with_policy, execution_from_assembled, validate_assembled_tx, AssembleError,
+    ExecutionSkeleton,
 };
 use crate::code_deps::{cell_dep_code, merge_cell_deps};
 const DEFAULT_MAX_ASSEMBLED_TX_BYTES: usize = 512 * 1024;
@@ -17,6 +18,7 @@ use crate::ssri::{
 use crate::submit::{combo_fingerprint, dry_run_gate, submit_execution, DryRunGate};
 use crate::worker_commands::{Submission, WorkerCommands};
 use crate::workers::ProcessWorkerState;
+use cid_process_executor::AssembledTx;
 use cid_protocol::CidArgs;
 use ckb_types::packed::{CellDep, OutPoint};
 use ckb_types::prelude::{Entity, Unpack};
@@ -262,13 +264,22 @@ where
         let cells = draft_cells_for_batch(items, process);
         ssri.assemble_live(rpc.clone(), &process.binary, &draft, &cells, tip)
     };
+    let prepare = |assembled: &AssembledTx, items: &[ScannedIntention]| {
+        prepare_execution(rpc.as_ref(), assembled, items, process, max_size, cid_locks)
+    };
     let (probe, mut budget) = {
         let mut worker = state.lock().expect("process worker state");
         (worker.isolation_probe.take(), worker.probe_budget)
     };
-    let assemble_outcome = if probe.is_none() {
+    let prepared = if probe.is_none() {
         match attempt(&batch) {
-            Ok(assembled) => Some(assembled),
+            Ok(assembled) => match prepare(&assembled, &batch) {
+                Err(PreparationError::NonLiveInput(op)) => {
+                    report.last_error = Some(format!("guest-added input {op:?} is not live"));
+                    None
+                }
+                result => Some(result),
+            },
             Err(SsriError::Incompatible(PROCESS_LOCK_ARGS_INVALID)) => {
                 return mark_process_unhealthy(hash, process, &state, batch.len());
             }
@@ -283,8 +294,8 @@ where
     } else {
         None
     };
-    let assembled = if let Some(assembled) = assemble_outcome {
-        assembled
+    let prepared = if let Some(prepared) = prepared {
+        prepared
     } else {
         let candidates: HashMap<_, _> = batch
             .iter()
@@ -323,7 +334,13 @@ where
                 }
             }
             match attempt(items) {
-                Ok(assembled) => Ok(Some(assembled)),
+                Ok(assembled) => match prepare(&assembled, items) {
+                    Err(PreparationError::NonLiveInput(_)) => Ok(None),
+                    Err(PreparationError::InputLookup(error)) => Err(SsriError::Unusable(format!(
+                        "verify guest-added input: {error}"
+                    ))),
+                    result => Ok(Some(result)),
+                },
                 Err(error @ SsriError::Incompatible(PROCESS_LOCK_ARGS_INVALID)) => Err(error),
                 Err(error) => {
                     tracing::debug!(target: LOG_TARGET, event = "assemble.probe_failed",
@@ -340,15 +357,21 @@ where
             worker.probe_budget = budget;
             if pending {
                 worker.isolation_probe = Some(probe);
+            } else if matches!(result, Ok(None)) {
+                worker.exhausted_isolation = Some(ExhaustedIsolation::new(
+                    process,
+                    execution_code_key,
+                    batch.iter().chain(rest),
+                ));
             }
         }
         match result {
-            Ok(Some((items, assembled))) => {
+            Ok(Some((items, prepared))) => {
                 tracing::info!(target: LOG_TARGET, event = "assemble.batch_isolated",
                     process_type_hash = %hex_pref(&hash),
                     intentions = ?items.iter().map(|item| &item.out_point).collect::<Vec<_>>());
                 batch = items;
-                assembled
+                prepared
             }
             Err(SsriError::Incompatible(PROCESS_LOCK_ARGS_INVALID)) => {
                 return mark_process_unhealthy(hash, process, &state, batch.len());
@@ -369,16 +392,14 @@ where
             }
         }
     };
-    match validate_assembled_tx(&assembled, &batch, process, max_size) {
-        Ok(()) => {}
-        Err(AssembleError::SizeLimit { size, max }) => {
-            tracing::warn!(
-                target: LOG_TARGET,
-                event = "assemble.invalid",
-                reason = "size_limit",
-                size,
-                max,
-            );
+    let skeleton = match prepared {
+        Ok(skeleton) => skeleton,
+        Err(PreparationError::Invalid(error)) => {
+            let reason = match error {
+                AssembleError::SizeLimit { .. } => "size_limit",
+                _ => "guest_tx",
+            };
+            tracing::warn!(target: LOG_TARGET, event = "assemble.invalid", reason, %error);
             let mut worker = state.lock().expect("process worker state");
             return record_invalid_assembled_reject(
                 &mut worker,
@@ -388,66 +409,7 @@ where
                 &mut report,
             );
         }
-        Err(AssembleError::InvalidAssembled(m)) => {
-            tracing::warn!(
-                target: LOG_TARGET,
-                event = "assemble.invalid",
-                reason = "guest_tx",
-                error = %m,
-            );
-            let mut worker = state.lock().expect("process worker state");
-            return record_invalid_assembled_reject(
-                &mut worker,
-                &batch,
-                process,
-                execution_code_key,
-                &mut report,
-            );
-        }
-        Err(e) => {
-            tracing::warn!(
-                target: LOG_TARGET,
-                event = "tick.skip",
-                reason = "validate_assembled",
-                error = %e,
-            );
-            report.skipped += batch.len();
-            return (BatchOutcome::Continue, report);
-        }
-    }
-    let skeleton = match execution_from_assembled(&assembled) {
-        Ok(s) => s,
-        Err(AssembleError::InvalidAssembled(m)) => {
-            tracing::warn!(
-                target: LOG_TARGET,
-                event = "assemble.invalid",
-                reason = "execution_skeleton",
-                error = %m,
-            );
-            let mut worker = state.lock().expect("process worker state");
-            return record_invalid_assembled_reject(
-                &mut worker,
-                &batch,
-                process,
-                execution_code_key,
-                &mut report,
-            );
-        }
-        Err(e) => {
-            tracing::warn!(
-                target: LOG_TARGET,
-                event = "tick.skip",
-                reason = "execution_from_assembled",
-                error = %e,
-            );
-            report.skipped += batch.len();
-            return (BatchOutcome::Continue, report);
-        }
-    };
-
-    match find_unselected_intention(rpc.as_ref(), &skeleton, &batch, process, cid_locks) {
-        Ok(None) => {}
-        Ok(Some(out_point)) => {
+        Err(PreparationError::UnselectedIntention(out_point)) => {
             tracing::warn!(target: LOG_TARGET, event = "assemble.invalid",
                 reason = "unselected_intention", ?out_point);
             let mut worker = state.lock().expect("process worker state");
@@ -459,14 +421,17 @@ where
                 &mut report,
             );
         }
-        Err(error) => {
+        Err(PreparationError::InputLookup(error)) => {
             tracing::warn!(target: LOG_TARGET, event = "tick.skip",
                 reason = "funding_input_lookup", %error);
             report.last_error = Some(format!("verify guest-added input: {error}"));
             report.skipped += batch.len();
             return (BatchOutcome::RetryLater, report);
         }
-    }
+        Err(PreparationError::NonLiveInput(_)) => {
+            unreachable!("non-live input starts or advances isolation")
+        }
+    };
 
     if mode == BatchMode::CheckAssembly {
         return (BatchOutcome::Continue, report);
@@ -582,33 +547,90 @@ where
     }
 }
 
-/// Preserve guest-added funding inputs while preventing them from bypassing
-/// routing, filtering and selection as additional CID Intention inputs.
-fn find_unselected_intention<R: HostQueryRpc>(
-    rpc: &R,
-    skeleton: &crate::assemble::ExecutionSkeleton,
+enum PreparationError {
+    Invalid(AssembleError),
+    UnselectedIntention(OutPoint),
+    NonLiveInput(OutPoint),
+    InputLookup(RpcError),
+}
+
+fn prepare_execution(
+    rpc: &impl HostQueryRpc,
+    assembled: &AssembledTx,
     batch: &[ScannedIntention],
     process: &ResolvedProcess,
+    max_size: usize,
     cid_locks: &[CidLockIdentity],
-) -> Result<Option<OutPoint>, RpcError> {
+) -> Result<ExecutionSkeleton, PreparationError> {
+    validate_assembled_tx(assembled, batch, process, max_size)
+        .map_err(PreparationError::Invalid)?;
+    let skeleton = execution_from_assembled(assembled).map_err(PreparationError::Invalid)?;
+
+    // Additional funding inputs must be live and cannot bypass Intention selection.
     for input in skeleton.tx.inputs().into_iter() {
         let op = input.previous_output();
         if op == process.live_cell.out_point || batch.iter().any(|item| item.out_point == op) {
             continue;
         }
-        let cell = rpc.get_live_cell(&op)?.ok_or_else(|| {
-            RpcError::Unavailable(format!("guest-added input {op:?} is no longer live"))
-        })?;
+        let Some(cell) = rpc
+            .get_live_cell(&op)
+            .map_err(PreparationError::InputLookup)?
+        else {
+            tracing::warn!(target: LOG_TARGET, event = "assemble.invalid",
+                reason = "funding_input_not_live", out_point = ?op,
+                process_type_hash = %hex_pref(&process.type_hash));
+            return Err(PreparationError::NonLiveInput(op));
+        };
         let lock = cell.lock();
         let code_hash: [u8; 32] = lock.code_hash().unpack();
         if cid_locks.iter().any(|identity| {
             code_hash == identity.code_hash && lock.hash_type() == identity.hash_type.into()
         }) || CidArgs::decode(&lock.args().raw_data()).is_ok()
         {
-            return Ok(Some(op));
+            return Err(PreparationError::UnselectedIntention(op));
         }
     }
-    Ok(None)
+    Ok(skeleton)
+}
+
+/// Back off after checking all subsets. The same candidate set may be rotated
+/// by the window cursor, so key it independently of that order.
+pub(crate) struct ExhaustedIsolation {
+    fingerprint: Vec<u8>,
+    pub(crate) polls_remaining: u8,
+}
+
+impl ExhaustedIsolation {
+    fn new<'a>(
+        process: &ResolvedProcess,
+        execution_code_key: &[u8],
+        items: impl Iterator<Item = &'a ScannedIntention>,
+    ) -> Self {
+        Self {
+            fingerprint: Self::fingerprint(process, execution_code_key, items),
+            // Skip the next three successful scans and retry on the fourth.
+            polls_remaining: 4,
+        }
+    }
+
+    pub(crate) fn matches(
+        &self,
+        process: &ResolvedProcess,
+        execution_code_key: &[u8],
+        items: &[ScannedIntention],
+    ) -> bool {
+        self.fingerprint == Self::fingerprint(process, execution_code_key, items.iter())
+    }
+
+    fn fingerprint<'a>(
+        process: &ResolvedProcess,
+        execution_code_key: &[u8],
+        items: impl Iterator<Item = &'a ScannedIntention>,
+    ) -> Vec<u8> {
+        let mut ops: Vec<_> = items.map(|item| item.out_point.clone()).collect();
+        ops.sort_unstable_by(|a, b| a.as_slice().cmp(b.as_slice()));
+        combo_fingerprint(&ops, Some(&process.live_cell.out_point), execution_code_key)
+    }
 }
 
 /// Keep positions stable across scans. The original search and each group of

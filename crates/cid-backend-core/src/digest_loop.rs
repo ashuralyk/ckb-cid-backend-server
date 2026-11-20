@@ -513,6 +513,12 @@ where
                     .refund_state_deps
                     .retain(|hash, _| state.submit.pending.contains_key(hash));
                 state.probe_budget = process_batch::ProbeBudget::default();
+                if let Some(exhausted) = &mut state.exhausted_isolation {
+                    exhausted.polls_remaining -= 1;
+                    if exhausted.polls_remaining == 0 {
+                        state.exhausted_isolation = None;
+                    }
+                }
             });
         });
 
@@ -822,7 +828,27 @@ where
                     }
                 };
                 let tx_hex = hex_pref(tx_hash.as_slice());
-                match self.rpc.get_transaction_status(&tx_hash) {
+                let status = self.rpc.get_transaction_status(&tx_hash);
+                if let Some(worker) = self.workers.get(&process_hash) {
+                    worker.with_state_mut(|state| {
+                        if let Some(pending) = state.submit.pending.get_mut(&hash_bytes) {
+                            pending.currently_committed =
+                                matches!(status, Ok(TxStatus::Committed { .. }));
+                            if let Ok(TxStatus::Committed { block_number }) = status {
+                                if !pending.seen_committed {
+                                    pending.seen_committed = true;
+                                    tracing::info!(
+                                        target: LOG_TARGET,
+                                        event = "pending.committed",
+                                        tx_hash = %tx_hex,
+                                        block_number,
+                                    );
+                                }
+                            }
+                        }
+                    });
+                }
+                match status {
                     Ok(TxStatus::Dropped) => {
                         let Some(worker) = self.workers.get(&process_hash) else {
                             continue;
@@ -857,21 +883,6 @@ where
                         });
                     }
                     Ok(TxStatus::Committed { block_number }) => {
-                        if let Some(worker) = self.workers.get(&process_hash) {
-                            worker.with_state_mut(|state| {
-                                if let Some(p) = state.submit.pending.get_mut(&hash_bytes) {
-                                    if !p.seen_committed {
-                                        p.seen_committed = true;
-                                        tracing::info!(
-                                            target: LOG_TARGET,
-                                            event = "pending.committed",
-                                            tx_hash = %tx_hex,
-                                            block_number,
-                                        );
-                                    }
-                                }
-                            });
-                        }
                         let start_tip = tip;
                         let Some(fresh_tip) = self.refresh_tip_only() else {
                             continue;
@@ -1108,6 +1119,21 @@ where
             .get(&hash)
             .is_some_and(|worker| worker.with_state(|state| state.probe_budget.remaining == 0))
         {
+            return;
+        }
+        if self.workers.get(&hash).is_some_and(|worker| {
+            worker.with_state_mut(|state| {
+                let Some(exhausted) = &state.exhausted_isolation else {
+                    return false;
+                };
+                if exhausted.matches(process, &self.batch_code_key(process), &bucket) {
+                    return true;
+                }
+                state.exhausted_isolation = None;
+                false
+            })
+        }) {
+            report.skipped += bucket.len();
             return;
         }
         let (min, max) = match self.ssri.get_batch_bounds(&process.binary) {
@@ -1634,6 +1660,7 @@ mod worker_cmd_tests {
                     consumed: vec![],
                     created: vec![],
                     seen_committed: false,
+                    currently_committed: false,
                 },
             );
         });

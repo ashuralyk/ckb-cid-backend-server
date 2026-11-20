@@ -33,6 +33,8 @@ pub struct PendingTx {
     pub created: Vec<Vec<u8>>,
     /// True after we have observed `TxStatus::Committed` at least once.
     pub seen_committed: bool,
+    /// True only when the latest status poll reports Committed.
+    pub currently_committed: bool,
 }
 
 impl SubmitState {
@@ -102,6 +104,7 @@ pub fn submit_execution<R: Rpc>(
                     consumed: keys,
                     created,
                     seen_committed: false,
+                    currently_committed: false,
                 },
             );
             Ok(hash)
