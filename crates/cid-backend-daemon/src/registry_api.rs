@@ -8,7 +8,7 @@ use cid_backend_core::process::{state_is_process_lock, validate_state_cid_bindin
 use cid_backend_core::rpc::{LiveCell, RpcError};
 use cid_backend_core::{
     type_id_script_hash, CidLockIdentity, ProcessBusyMap, ProcessRegistration, ProcessRegistry,
-    RegisterOutcome, RegistryError, WorkerCommand,
+    RegisterOutcome, RegistryError, WorkerCommand, WorkerCommands,
 };
 use ckb_types::packed::Script;
 use serde::{Deserialize, Serialize};
@@ -29,7 +29,7 @@ type FindProcessState = dyn Fn(&Script) -> Result<Vec<LiveCell>, RpcError> + Sen
 #[derive(Clone)]
 pub struct RegistryApiState {
     pub registry: Arc<Mutex<ProcessRegistry>>,
-    pub worker_cmds: Arc<Mutex<Vec<WorkerCommand>>>,
+    pub worker_cmds: Arc<WorkerCommands>,
     /// Shared with the digest loop for pending/idle checks (P1-6).
     pub busy: ProcessBusyMap,
     pub cid: CidLockIdentity,
@@ -297,15 +297,9 @@ fn register_process(
             }
             Err(e) => return Ok(bad_request(format!("{e}\n").as_bytes())),
         };
-        let mut q = state.worker_cmds.lock().map_err(|_| ())?;
-        // Cancel pending deletes for this identity before enqueueing Register (P0-1).
-        q.retain(|c| {
-            !matches!(
-                c,
-                WorkerCommand::Delete { hash: h, .. } if *h == hash
-            )
-        });
-        q.push(WorkerCommand::Register(entry));
+        if !state.worker_cmds.enqueue(WorkerCommand::Register(entry)) {
+            return Err(());
+        }
         outcome
     };
     let hash = reg_entry.identity_type_hash();
@@ -336,8 +330,12 @@ fn delete_process(
         if !reg.delete(&hash).map_err(|_| ())? {
             return Ok(not_found());
         }
-        let mut q = state.worker_cmds.lock().map_err(|_| ())?;
-        q.push(WorkerCommand::delete(hash));
+        if !state.worker_cmds.enqueue(WorkerCommand::delete(hash)) {
+            return Err(());
+        }
+    }
+    if !state.worker_cmds.wait_for_submission(&hash) {
+        return Err(());
     }
     tracing::info!(
         target: "cid_backend",
@@ -557,7 +555,7 @@ mod tests {
     fn api_state(registry: ProcessRegistry, lock_args: Vec<u8>) -> RegistryApiState {
         RegistryApiState {
             registry: Arc::new(Mutex::new(registry)),
-            worker_cmds: Arc::new(Mutex::new(Vec::new())),
+            worker_cmds: Arc::new(WorkerCommands::default()),
             busy: ProcessBusyMap::new(),
             cid: CID,
             find_process_state: Arc::new(move |typ| {
@@ -594,7 +592,7 @@ mod tests {
             .unwrap()
             .contains("Process state lock args (TooShort)"));
         assert!(state.registry.lock().unwrap().is_empty());
-        assert!(state.worker_cmds.lock().unwrap().is_empty());
+        assert!(state.worker_cmds.queued().is_empty());
         assert!(!path.exists());
     }
     use std::time::Duration;
@@ -661,7 +659,7 @@ mod tests {
         );
         let (status, resp) = http_exchange(handle.local_addr, &raw);
         assert_eq!(status, 201, "{resp}");
-        assert_eq!(state.worker_cmds.lock().unwrap().len(), 1);
+        assert_eq!(state.worker_cmds.queued().len(), 1);
 
         let (status, resp) = http_exchange(
             handle.local_addr,
@@ -682,7 +680,7 @@ mod tests {
             &format!("DELETE /v1/processes/{id} HTTP/1.1\r\nHost: localhost\r\n\r\n"),
         );
         assert_eq!(status, 204, "{resp}");
-        assert_eq!(state.worker_cmds.lock().unwrap().len(), 2);
+        assert_eq!(state.worker_cmds.queued().len(), 2);
 
         let (status, _) = http_exchange(
             handle.local_addr,

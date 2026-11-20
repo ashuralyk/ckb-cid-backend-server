@@ -17,7 +17,7 @@ mod tests {
         let rpc = FakeRpc::new();
         let ts = process_type_script(3);
         let hash = script_hash32(&ts);
-        let intent_cap = 100_0000_0000u64;
+        let intent_cap = 200_0000_0000u64;
         let proc = process_cell(3, 200_0000_0000, vec![0x7f, b'E', b'L', b'F', 3]);
         let proc_op = proc.out_point.clone();
         rpc.insert_cell(intention_cell(1, hash, intent_cap));
@@ -86,7 +86,7 @@ mod tests {
         for bounded in [false, true] {
             let rpc = FakeRpc::new();
             let hash = script_hash32(&process_type_script(3));
-            let capacity = 100_0000_0000;
+            let capacity = 200_0000_0000;
             let legacy = CidLockIdentity::new([0xd1; 32], ScriptHashType::Data1);
             let legacy_cell =
                 intention_cell_with_lock(2, hash, capacity, legacy.code_hash, legacy.hash_type);
@@ -129,20 +129,33 @@ mod tests {
     #[test]
     fn unaffordable_filter_refund_does_not_suppress_an_affordable_refund() {
         use cid_backend_core::DEFAULT_FEE_RATE;
+        use cid_protocol::XUDT_CODE_HASH;
+        use ckb_types::{core::ScriptHashType, packed::Script};
 
         let rpc = FakeRpc::new();
         rpc.insert_cell(code_cell(0xA0, PROC_CODE_ARGS, FIXTURE_ELF.to_vec()));
         let hash = script_hash32(&process_type_script(3));
         let mut expensive = intention_cell(1, hash, 2000_0000_0000);
         expensive.data = vec![0; 1024];
-        let affordable = intention_cell(2, hash, 100_0000_0000);
+        expensive.data[0] = 1;
+        let xudt = Script::new_builder()
+            .code_hash(XUDT_CODE_HASH.pack())
+            .hash_type(ScriptHashType::Data1.into())
+            .args([1u8; 32].as_slice().pack())
+            .build();
+        expensive.output = expensive
+            .output
+            .as_builder()
+            .type_(Some(xudt).pack())
+            .build();
+        let affordable = intention_cell(2, hash, 200_0000_0000);
         rpc.insert_cell(expensive.clone());
         rpc.insert_cell(affordable.clone());
         rpc.insert_cell(process_cell(3, 200_0000_0000, vec![]));
         let mut config = default_loop_config();
         config.refund_policy.bounded_locks = vec![config.scan_lock_identities()[0]];
         config.refund_policy.fee_rate = 1_000_000;
-        let ssri = ScriptedSsri::mimic((2, 2)).with_filter(|count| Ok(vec![4; count]));
+        let ssri = ScriptedSsri::mimic((2, 2)).with_filter(|count| Ok(vec![6; count]));
         let mut loop_ = loop_with_resolver(rpc, ssri, config, 3);
 
         let report = loop_.tick();
@@ -170,7 +183,7 @@ mod tests {
 
         let rpc = FakeRpc::new();
         let hash = script_hash32(&process_type_script(3));
-        let capacity = 100_0000_0000;
+        let capacity = 200_0000_0000;
         let bounded = intention_cell(1, hash, capacity);
         rpc.insert_cell(bounded.clone());
         rpc.insert_cell(process_cell(3, 200_0000_0000, vec![]));
@@ -208,7 +221,7 @@ mod tests {
 
         let rpc = FakeRpc::new();
         let hash = script_hash32(&process_type_script(3));
-        let capacity = 100_0000_0000;
+        let capacity = 200_0000_0000;
         let bounded = intention_cell(1, hash, capacity);
         let companion = intention_cell(2, hash, capacity);
         rpc.insert_cell(bounded.clone());
@@ -270,7 +283,7 @@ mod tests {
 
         let rpc = FakeRpc::new();
         let hash = script_hash32(&process_type_script(3));
-        let capacity = 100_0000_0000;
+        let capacity = 200_0000_0000;
         let bounded = intention_cell(1, hash, capacity);
         let companion = intention_cell(2, hash, capacity);
         let other_companion = intention_cell(3, hash, capacity);
@@ -313,7 +326,7 @@ mod tests {
 
         let rpc = FakeRpc::new();
         let hash = script_hash32(&process_type_script(3));
-        let capacity = 100_0000_0000;
+        let capacity = 200_0000_0000;
         let bounded = intention_cell(1, hash, capacity);
         let companion = intention_cell(2, hash, capacity);
         rpc.insert_cell(bounded.clone());

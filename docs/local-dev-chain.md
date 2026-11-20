@@ -26,9 +26,9 @@ Default auto-download is **Linux x86_64** (`ckb_${version}_x86_64-unknown-linux-
 ./scripts/local-dev-chain.sh
 ```
 
-The script inits `dev` with genesis miner lock, sets **`min_fee_rate = 0`** (D8: no fee input; `digest_ok` pays from Process recreate; Incompatible refunds default to exact/zero-fee under an empty bounded-refund allowlist — required here so local refunds clear against the pinned lock), enables the Indexer RPC module, builds RISC-V guests, starts `ckb run` + `ckb miner` on `127.0.0.1:8114`, exports `CID_CKB_RPC_URL`, `CID_PROCESS_EXAMPLE_PATH`, `CID_LOCK_ELF_PATH`, `CID_ALWAYS_SUCCESS_PATH`, `CID_LOCAL_CHAIN_E2E=1`, then runs the ignored E2E. Setting only `CID_LOCAL_CHAIN_E2E=1` and invoking `cargo test` on a clean machine is **not** equivalent.
+The script inits `dev` with genesis miner lock, sets **`min_fee_rate = 0`** (D8: no fee input; `digest_ok` pays from Process recreate; Incompatible refunds default to exact/zero-fee under an empty bounded-refund allowlist — required here so local refunds clear against the pinned lock), enables the Indexer RPC module, builds RISC-V guests and stages the official xUDT ELF, starts `ckb run` + `ckb miner` on `127.0.0.1:8114`, exports `CID_CKB_RPC_URL`, `CID_PROCESS_EXAMPLE_PATH`, `CID_LOCK_ELF_PATH`, `CID_ALWAYS_SUCCESS_PATH`, `CID_XUDT_ELF_PATH`, `CID_LOCAL_CHAIN_E2E=1`, then runs the ignored E2E. Setting only `CID_LOCAL_CHAIN_E2E=1` and invoking `cargo test` on a clean machine is **not** equivalent.
 
-Before signing setup, the ignored fixture requires a numeric loopback HTTP RPC URL and checks that the node reports `ckb_dev`. The fixture disables HTTP redirects and proxies. Success confirms that the committed transaction spends the original Intention and produces the expected beneficiary output.
+Before signing setup, the ignored fixture requires a numeric loopback HTTP RPC URL and checks that the node reports `ckb_dev`. The fixture disables HTTP redirects and proxies. The fixture checks the committed beneficiary output, a committed xUDT refund that preserves trailing data, and the CID lock's rejection of an untyped Intention with nonempty data.
 
 ## Daemon env (production / local)
 

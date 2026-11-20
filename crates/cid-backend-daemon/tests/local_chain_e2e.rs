@@ -5,7 +5,7 @@
 //!
 //! Flow: deploy always-success + CID lock + Process ELF → Process state cell →
 //! Intention → `DigestLoop::tick` (real JSON-RPC + EmbeddedSsri ckb-vm) →
-//! wait until the execution tx is **committed**.
+//! wait until the digest and xUDT refund are **committed**.
 
 #![allow(clippy::inconsistent_digit_grouping)]
 
@@ -19,9 +19,12 @@ use cid_backend_core::digest_loop::{DigestLoop, NopClock};
 use cid_backend_core::host_query::HostQueryRpc;
 use cid_backend_core::rpc::{script_hash32, Rpc, TxStatus};
 use cid_backend_core::ssri::EmbeddedSsri;
-use cid_backend_core::{ProcessEntry, TypeIdCodeDep, TypeIdIdentity};
+use cid_backend_core::{
+    assemble_digest_incompatible, decode_cells, AssembleError, ProcessEntry, RpcError,
+    TypeIdCodeDep, TypeIdIdentity,
+};
 use cid_backend_daemon::{CkbRpc, DaemonConfig};
-use cid_protocol::{CidArgs, Payload, Script as CidScript};
+use cid_protocol::{CidArgs, Payload, Script as CidScript, XUDT_CODE_HASH};
 use ckb_hash::{blake2b_256, new_blake2b};
 use ckb_types::bytes::Bytes;
 use ckb_types::core::{Capacity, DepType, ScriptHashType, TransactionBuilder, TransactionView};
@@ -443,6 +446,8 @@ fn scan_resolve_ssri_submit_confirms_on_local_dev_chain() {
     assert_eq!(&cid_elf[..4], b"\x7fELF");
     assert_eq!(&always_elf[..4], b"\x7fELF");
 
+    let xudt_elf = std::fs::read(read_env_path("CID_XUDT_ELF_PATH")).expect("xUDT elf");
+    assert_eq!(blake2b_256(&xudt_elf), XUDT_CODE_HASH);
     let always_code_hash = blake2b_256(&always_elf);
 
     let secp_lock = secp_lock();
@@ -457,7 +462,8 @@ fn scan_resolve_ssri_submit_confirms_on_local_dev_chain() {
     let (cid_out, cid_cap) = code_output(&secp_lock, Some(cid_code.type_script()), &cid_elf);
     let (proc_code_out, proc_code_cap) =
         code_output(&secp_lock, Some(process_code.type_script()), &process_elf);
-    let spent = as_cap + cid_cap + proc_code_cap;
+    let (xudt_out, xudt_cap) = code_output(&secp_lock, None, &xudt_elf);
+    let spent = as_cap + cid_cap + proc_code_cap + xudt_cap;
     assert!(issued_cap > spent + 1_000_0000_0000, "genesis capacity");
     let change_cap = issued_cap - spent - 1_0000_0000; // 1 CKB fee buffer even with min_fee_rate=0
 
@@ -466,10 +472,12 @@ fn scan_resolve_ssri_submit_confirms_on_local_dev_chain() {
         .output(as_out)
         .output(cid_out)
         .output(proc_code_out)
+        .output(xudt_out)
         .output(change_output(&secp_lock, change_cap))
         .output_data(always_elf.pack())
         .output_data(cid_elf.pack())
         .output_data(process_elf.pack())
+        .output_data(xudt_elf.pack())
         .output_data(Vec::<u8>::new().pack())
         .cell_dep(secp_code_dep.clone())
         .cell_dep(secp_data_dep.clone())
@@ -488,9 +496,15 @@ fn scan_resolve_ssri_submit_confirms_on_local_dev_chain() {
         .tx_hash(tx1_hash.clone())
         .index(2u32.pack())
         .build();
+    let xudt_dep = cell_dep(
+        OutPoint::new_builder()
+            .tx_hash(tx1_hash.clone())
+            .index(3u32.pack())
+            .build(),
+    );
     let change_op = OutPoint::new_builder()
-        .tx_hash(tx1_hash.clone())
-        .index(3u32.pack())
+        .tx_hash(tx1_hash)
+        .index(4u32.pack())
         .build();
 
     let first_in = input(change_op);
@@ -515,7 +529,7 @@ fn scan_resolve_ssri_submit_confirms_on_local_dev_chain() {
         hash_type: 2,
         args: vec![],
     };
-    let intent_args = CidArgs::new(process_type_hash, user, payload)
+    let intent_args = CidArgs::new(process_type_hash, user.clone(), payload)
         .encode()
         .unwrap();
     let cid_lock = Script::new_builder()
@@ -528,7 +542,30 @@ fn scan_resolve_ssri_submit_confirms_on_local_dev_chain() {
         .capacity(intent_cap.pack())
         .lock(cid_lock)
         .build();
-    let spent2 = proc_data_cap + intent_cap;
+    let malformed_args = CidArgs::new(process_type_hash, user, Payload { data: vec![0xFF] })
+        .encode()
+        .unwrap();
+    let malformed_lock = intent_out
+        .lock()
+        .as_builder()
+        .args(malformed_args.pack())
+        .build();
+    // The secp funding input authorizes minting this xUDT.
+    let xudt_type = Script::new_builder()
+        .code_hash(XUDT_CODE_HASH.pack())
+        .hash_type(ScriptHashType::Data1.into())
+        .args(script_hash32(&secp_lock).as_slice().pack())
+        .build();
+    let xudt_intention = intent_out
+        .clone()
+        .as_builder()
+        .lock(malformed_lock.clone())
+        .type_(Some(xudt_type.clone()).pack())
+        .build();
+    let xudt_data = [100u128.to_le_bytes().as_slice(), &[0xAA, 0xBB]].concat();
+    let untyped_data = [0xCCu8];
+    let untyped_intention = intent_out.clone().as_builder().lock(malformed_lock).build();
+    let spent2 = proc_data_cap + 3 * intent_cap;
     assert!(change_cap > spent2 + 1_000_0000_0000);
     let change2 = change_cap - spent2 - 1_0000_0000;
 
@@ -536,15 +573,20 @@ fn scan_resolve_ssri_submit_confirms_on_local_dev_chain() {
         .input(first_in)
         .output(proc_out)
         .output(intent_out)
+        .output(xudt_intention)
+        .output(untyped_intention)
         .output(change_output(&secp_lock, change2))
         .output_data(Vec::<u8>::new().pack())
         .output_data(Vec::<u8>::new().pack())
+        .output_data(xudt_data.pack())
+        .output_data(untyped_data.as_slice().pack())
         .output_data(Vec::<u8>::new().pack())
         .cell_dep(secp_code_dep)
         .cell_dep(secp_data_dep)
         .cell_dep(cell_dep(as_op.clone()))
         .cell_dep(cell_dep(cid_op.clone()))
         .cell_dep(cell_dep(proc_code_op.clone()))
+        .cell_dep(xudt_dep.clone())
         .build();
     let tx2 = sign_secp(tx2);
     let tx2_hash = submit_wait(&rpc, tx2);
@@ -556,6 +598,34 @@ fn scan_resolve_ssri_submit_confirms_on_local_dev_chain() {
         .tx_hash(tx2_hash.clone())
         .index(1u32.pack())
         .build();
+    let xudt_op = intent_op.clone().as_builder().index(2u32.pack()).build();
+    let untyped_op = intent_op.clone().as_builder().index(3u32.pack()).build();
+    let untyped = rpc
+        .get_live_cell(&untyped_op)
+        .unwrap()
+        .expect("untyped fixture input");
+    let deps = [cell_dep(cid_op), cell_dep(as_op.clone())];
+    assert!(matches!(
+        assemble_digest_incompatible(&decode_cells(vec![untyped.clone()]), &deps),
+        Err(AssembleError::RefundUnbuildable(_))
+    ));
+    let user_lock = Script::new_builder()
+        .code_hash(always_code_hash.pack())
+        .hash_type(ScriptHashType::Data1.into())
+        .build();
+    // Handcraft the refund the old builder would have emitted and verify CID
+    // rejects it at input asset validation (UnsupportedType, exit 29).
+    let invalid = TransactionBuilder::default()
+        .input(input(untyped_op.clone()))
+        .output(untyped.output.as_builder().lock(user_lock.clone()).build())
+        .output_data(untyped_data.as_slice().pack())
+        .cell_deps(deps)
+        .witness(Default::default())
+        .build();
+    assert!(matches!(
+        rpc.dry_run_transaction(&invalid),
+        Err(RpcError::SubmitRejected(ref message)) if message.contains("error code 29")
+    ));
     eprintln!(
         "local-chain deployed process={} intention={} type_hash={}",
         hex_bytes(process_op.tx_hash().as_slice()),
@@ -570,7 +640,7 @@ fn scan_resolve_ssri_submit_confirms_on_local_dev_chain() {
         cid_lock_code_hash: cid_code_hash,
         hash_type: ScriptHashType::Type,
         poll_interval: Duration::from_secs(1),
-        extra_cell_deps: vec![cell_dep(as_op)],
+        extra_cell_deps: vec![cell_dep(as_op), xudt_dep],
         type_id_code_deps: vec![TypeIdCodeDep {
             label: "cid_lock".into(),
             identity: cid_code,
@@ -600,25 +670,57 @@ fn scan_resolve_ssri_submit_confirms_on_local_dev_chain() {
         ssri_elf_path: None,
     }));
 
-    let mut submitted_hash: Option<Byte32> = None;
+    let mut digest_hash = None;
+    let mut refund_hash = None;
     for i in 0..20 {
         let report = loop_.tick();
         eprintln!(
             "tick {i}: scanned={} submitted={} skipped={}",
             report.scanned, report.submitted, report.skipped
         );
-        if report.submitted > 0 {
-            let pending = loop_
-                .state()
-                .submit
-                .as_ref()
-                .and_then(|s| s.pending.keys().next().cloned());
-            submitted_hash = pending.map(|b| Byte32::from_slice(&b).unwrap());
+        assert_eq!(report.last_error, None);
+        if let Some(state) = loop_.state().submit {
+            for (hash, pending) in state.pending {
+                if pending
+                    .consumed
+                    .iter()
+                    .any(|op| op.as_slice() == intent_op.as_slice())
+                {
+                    digest_hash = Some(Byte32::from_slice(&hash).unwrap());
+                }
+                if pending
+                    .consumed
+                    .iter()
+                    .any(|op| op.as_slice() == xudt_op.as_slice())
+                {
+                    refund_hash = Some(Byte32::from_slice(&hash).unwrap());
+                }
+            }
+        }
+        if digest_hash.is_some() && refund_hash.is_some() {
             break;
         }
         thread::sleep(Duration::from_millis(500));
     }
-    let hash = submitted_hash.expect("daemon did not submit an execution tx");
+    let hash = digest_hash.expect("daemon did not submit an execution tx");
+    let refund_hash = refund_hash.expect("daemon did not submit an xUDT refund");
+    assert!(matches!(
+        wait_committed(loop_.rpc(), &refund_hash, Duration::from_secs(60)),
+        TxStatus::Committed { .. }
+    ));
+    let refund_op = OutPoint::new_builder().tx_hash(refund_hash).build();
+    let refund = loop_
+        .rpc()
+        .get_live_cell(&refund_op)
+        .unwrap()
+        .expect("xUDT payout");
+    assert_eq!(refund.lock(), user_lock);
+    assert_eq!(refund.capacity(), intent_cap);
+    assert_eq!(refund.type_script(), Some(xudt_type));
+    assert_eq!(refund.data, xudt_data);
+    assert!(loop_.rpc().get_live_cell(&xudt_op).unwrap().is_none());
+    assert!(loop_.rpc().get_live_cell(&untyped_op).unwrap().is_some());
+
     let st = wait_committed(loop_.rpc(), &hash, Duration::from_secs(60));
     assert!(matches!(st, TxStatus::Committed { .. }));
     eprintln!(

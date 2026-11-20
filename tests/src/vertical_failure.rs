@@ -613,7 +613,7 @@ mod tests {
             rpc.insert_cell(cell.clone());
             poison.push(cell);
         }
-        let good = intention_cell(POISON + 1, hash, 110_0000_0000);
+        let good = intention_cell(POISON + 1, hash, 200_0000_0000);
         let proc = process_cell(34, 200_0000_0000, vec![0x7f, b'E', b'L', b'F', 34]);
         rpc.insert_cell(good.clone());
         rpc.insert_cell(proc.clone());

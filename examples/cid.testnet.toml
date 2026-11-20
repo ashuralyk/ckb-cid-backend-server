@@ -9,6 +9,12 @@ validate_genesis = true
 [rpc]
 url = "https://testnet.ckb.dev/"
 
+# Official Pudge xUDT (data1), Nervos RFC 0052.
+[[cell_deps]]
+tx_hash = "0xbf6fb538763efec2a70a6a3dcb7242787087e1030c4e7d86585bc63a9d337f5f"
+index = 0
+dep_type = "code"
+
 [cid_lock]
 type_id_args = "0xdfe0a1416c7373e8aaae5257445e940b6ff08e9cbc62ebca8541d28997370f25"
 type_id = "0xf3f8a56c2594030f99f05b09ff1b6a1b07e6e07ed04309c1c4e246561faad326"

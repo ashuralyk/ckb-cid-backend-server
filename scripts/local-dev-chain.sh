@@ -67,6 +67,16 @@ export CLANG
 bash "$ROOT/scripts/build-cid-process-example.sh"
 bash "$ROOT/scripts/build-cid-lock.sh"
 
+export CID_XUDT_ELF_PATH="${CID_XUDT_ELF_PATH:-$ROOT/tests/fixtures/xudt}"
+if [ ! -s "$CID_XUDT_ELF_PATH" ]; then
+  if [ -n "$CID_DISPATCHER_SRC" ]; then
+    cp "$CID_DISPATCHER_SRC/tests/binaries/xudt" "$CID_XUDT_ELF_PATH"
+  else
+    curl -fsSL -o "$CID_XUDT_ELF_PATH" \
+      "https://raw.githubusercontent.com/ashuralyk/ckb-common-intention-dispatcher/$PIN/tests/binaries/xudt"
+  fi
+fi
+
 if ! curl -fsS -m 1 -H 'content-type: application/json' \
     --data '{"id":1,"jsonrpc":"2.0","method":"get_tip_block_number","params":[]}' \
     "$RPC_URL" >/dev/null 2>&1; then

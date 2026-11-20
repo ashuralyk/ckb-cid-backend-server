@@ -94,8 +94,8 @@ covers `fee_rate`, fail-closed otherwise.
 
 Against the intended CKB node with the node's real `min_fee_rate`, confirm
 both DigestOk and allowlisted bounded-refund txs are accepted by the tx-pool
-after contract PR #12 is deployed and pinned. Mixed old/new Intention sets
-must drain without haircutting legacy locks.
+after contract PR #12 is deployed and pinned. With a mixed scan, verify that
+primary-CID Intentions drain and legacy CID Intentions remain untouched.
 
 ## Local / CI
 

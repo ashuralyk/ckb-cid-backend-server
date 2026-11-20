@@ -173,13 +173,13 @@ mod tests {
     #[test]
     fn delete_drains_pending_without_starting_another_batch() {
         use crate::helpers::{fixture_process_entry, register_fixture};
-        use cid_backend_core::digest_loop::{DigestLoop, NopClock, WorkerCommand};
+        use cid_backend_core::digest_loop::{DigestLoop, NopClock, WorkerCommand, WorkerCommands};
         use cid_backend_core::workers::WorkerPool;
-        use std::sync::{Arc, Mutex};
+        use std::sync::Arc;
 
         let rpc = Arc::new(FakeRpc::new());
         let ssri = Arc::new(ScriptedSsri::mimic((1, 1)));
-        let cmds = Arc::new(Mutex::new(Vec::new()));
+        let cmds = Arc::new(WorkerCommands::default());
         let workers = WorkerPool::new(rpc.clone(), ssri.clone());
         let hash = fixture_process_entry(21).identity_type_hash;
         rpc.insert_cell(process_cell(21, 400_0000_0000, vec![]));
@@ -189,7 +189,7 @@ mod tests {
             DigestLoop::with_workers(rpc, NopClock, ssri, cfg(1), workers, Some(cmds.clone()));
         register_fixture(&mut loop_, 21);
         assert_eq!(loop_.tick().submitted, 1);
-        cmds.lock().unwrap().push(WorkerCommand::delete(hash));
+        cmds.enqueue(WorkerCommand::delete(hash));
         assert_eq!(
             loop_.tick().submitted,
             0,

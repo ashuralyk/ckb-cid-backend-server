@@ -138,7 +138,7 @@ impl SsriHost for EmbeddedSsri {
     }
 }
 
-fn intention_draft_cell(intent: &ScannedIntention) -> DraftCell {
+pub(crate) fn intention_draft_cell(intent: &ScannedIntention) -> DraftCell {
     let lock = Script::new_builder()
         .code_hash(intent.lock_code_hash.pack())
         .hash_type(intent.lock_hash_type.into())

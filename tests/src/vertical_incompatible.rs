@@ -17,7 +17,7 @@ mod tests {
         let rpc = FakeRpc::new();
         let ts = process_type_script(3);
         let hash = script_hash32(&ts);
-        let intent = intention_cell(1, hash, 100_0000_0000);
+        let intent = intention_cell(1, hash, 200_0000_0000);
         let proc = process_cell(3, 200_0000_0000, vec![0x7f, b'E', b'L', b'F', 3]);
         rpc.insert_cell(intent.clone());
         rpc.insert_cell(proc.clone());
@@ -50,7 +50,7 @@ mod tests {
         assert_eq!(tx.outputs().len(), 1);
         let out = tx.outputs().get(0).unwrap();
         let cap: u64 = out.capacity().unpack();
-        assert_eq!(cap, 100_0000_0000);
+        assert_eq!(cap, 200_0000_0000);
         let code: [u8; 32] = out.lock().code_hash().unpack();
         assert_eq!(code, user_lock().code_hash);
         assert!(out.type_().to_opt().is_none());
@@ -64,7 +64,7 @@ mod tests {
         assert!(live.iter().all(|c| c.out_point != intent.out_point));
         assert!(live.iter().any(|c| {
             let code: [u8; 32] = c.lock().code_hash().unpack();
-            code == user_lock().code_hash && c.capacity() == 100_0000_0000
+            code == user_lock().code_hash && c.capacity() == 200_0000_0000
         }));
     }
 

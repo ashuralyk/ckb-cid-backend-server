@@ -2014,6 +2014,15 @@ poll_interval_secs = 1
     fn testnet_v014_example_loads_with_current_cid_type_id() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/cid.testnet.toml");
         let cfg = DaemonConfig::from_file_and_vars(Some(&path), |_| None).unwrap();
+        assert_eq!(cfg.extra_cell_deps.len(), 1);
+        let xudt = &cfg.extra_cell_deps[0];
+        assert_eq!(xudt.dep_type(), DepType::Code.into());
+        assert_eq!(
+            hex::encode(xudt.out_point().tx_hash().as_slice()),
+            "bf6fb538763efec2a70a6a3dcb7242787087e1030c4e7d86585bc63a9d337f5f"
+        );
+        let index: u32 = xudt.out_point().index().unpack();
+        assert_eq!(index, 0);
         assert!(cfg.validate_genesis);
         assert!(!cfg.allow_missing_filter);
         assert_eq!(

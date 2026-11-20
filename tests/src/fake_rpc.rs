@@ -16,6 +16,7 @@ struct Inner {
     reject_next_submit: bool,
     reject_next_dry_run: bool,
     spent_deps: HashSet<OutPoint>,
+    stale_indexer_cells: HashSet<OutPoint>,
     unavailable_submit_inputs: HashSet<OutPoint>,
     unavailable_next_dry_run: bool,
     reject_inputs: HashSet<Vec<u8>>,
@@ -40,13 +41,19 @@ struct Inner {
 
 pub struct FakeRpc {
     inner: Mutex<Inner>,
+    after_submit: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl FakeRpc {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(Inner::default()),
+            after_submit: Mutex::new(None),
         }
+    }
+
+    pub fn after_next_submit(&self, callback: impl FnOnce() + Send + 'static) {
+        *self.after_submit.lock().unwrap() = Some(Box::new(callback));
     }
 
     pub fn insert_cell(&self, cell: LiveCell) {
@@ -149,6 +156,10 @@ impl FakeRpc {
     }
 
     /// The node rejects this dependency while the indexer still lists it.
+    pub fn mark_indexer_cell_stale(&self, op: OutPoint) {
+        self.inner.lock().unwrap().stale_indexer_cells.insert(op);
+    }
+
     pub fn mark_dep_spent(&self, op: OutPoint) {
         self.inner.lock().unwrap().spent_deps.insert(op);
     }
@@ -491,6 +502,10 @@ impl Rpc for FakeRpc {
                 .tx_status
                 .insert(hash_key, TxStatus::Committed { block_number });
         }
+        drop(inner);
+        if let Some(callback) = self.after_submit.lock().unwrap().take() {
+            callback();
+        }
         Ok(tx_hash)
     }
 
@@ -521,6 +536,9 @@ impl Rpc for FakeRpc {
 impl HostQueryRpc for FakeRpc {
     fn get_live_cell(&self, out_point: &OutPoint) -> Result<Option<LiveCell>, RpcError> {
         let inner = self.inner.lock().unwrap();
+        if inner.stale_indexer_cells.contains(out_point) {
+            return Ok(None);
+        }
         Ok(inner.cells.get(&out_point_key(out_point)).cloned())
     }
 

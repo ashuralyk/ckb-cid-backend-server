@@ -13,7 +13,7 @@ type FilterScript = Box<dyn FnMut(usize) -> Result<Vec<i8>, SsriError> + Send>;
 pub struct ScriptedSsri {
     filter_script: Mutex<Option<FilterScript>>,
     pub filter_requests: Mutex<Vec<Vec<u8>>>,
-    intention_errors: Vec<(OutPoint, i8)>,
+    intention_errors: Vec<(OutPoint, i8, Option<u64>)>,
     additional_input: Option<OutPoint>,
     pub bounds: (u32, u32),
     pub mode: Mode,
@@ -81,7 +81,17 @@ impl ScriptedSsri {
     }
 
     pub fn with_intention_error(mut self, op: OutPoint, code: i8) -> Self {
-        self.intention_errors.push((op, code));
+        self.intention_errors.push((op, code, None));
+        self
+    }
+
+    pub fn with_intention_error_at_state_capacity(
+        mut self,
+        op: OutPoint,
+        code: i8,
+        cap: u64,
+    ) -> Self {
+        self.intention_errors.push((op, code, Some(cap)));
         self
     }
 
@@ -124,11 +134,28 @@ impl SsriHost for ScriptedSsri {
     ) -> Result<AssembledTx, SsriError> {
         self.note_binary(binary);
         if !self.intention_errors.is_empty() {
-            let draft = Transaction::from_slice(draft_tx).unwrap();
-            for input in draft.raw().inputs() {
+            let inputs: Vec<_> = Transaction::from_slice(draft_tx)
+                .unwrap()
+                .raw()
+                .inputs()
+                .into_iter()
+                .collect();
+            for input in &inputs {
                 let op = input.previous_output();
-                if let Some((_, code)) = self.intention_errors.iter().find(|(bad, _)| *bad == op) {
-                    return Err(SsriError::Incompatible(*code));
+                for (bad, code, state_cap) in &self.intention_errors {
+                    if *bad == op
+                        && state_cap.is_none_or(|cap| {
+                            inputs.iter().any(|input| {
+                                host.get_cell(input.previous_output().as_slice())
+                                    .is_some_and(|cell| {
+                                        let capacity: u64 = cell.output.capacity().unpack();
+                                        is_process_state(&cell) && capacity == cap
+                                    })
+                            })
+                        })
+                    {
+                        return Err(SsriError::Incompatible(*code));
+                    }
                 }
             }
         }

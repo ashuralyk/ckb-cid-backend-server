@@ -9,6 +9,8 @@ use crate::scan::{bucket_by_process_type_hash, scan_intentions_multi, ScannedInt
 use crate::ssri::{filter_intentions, SsriError, SsriHost};
 use crate::submit::{combo_fingerprint, execution_code_key, SubmitState};
 use crate::type_id::TypeIdCodeDep;
+pub use crate::worker_commands::{WorkerCommand, WorkerCommands};
+use crate::workers::IsolatedRefundScope;
 use crate::workers::{WorkerPool, WorkerRemoveError};
 use cid_intention_filter::{
     FILTER_ACCEPTED, FILTER_MALFORMED_DIGEST, FILTER_RESERVED_2, FILTER_RESERVED_3,
@@ -19,7 +21,7 @@ use ckb_types::packed::{Byte32, CellDep, CellOutput};
 use ckb_types::prelude::*;
 use std::collections::HashSet;
 use std::fmt::Write as _;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -127,35 +129,6 @@ impl Clock for RealClock {
     }
 }
 
-/// Deferred register/delete from the HTTP registry API (applied at tick start).
-#[derive(Clone, Debug)]
-pub enum WorkerCommand {
-    Register(ProcessEntry),
-    /// Disable Process. `generation` stamps the worker epoch when delete was
-    /// first deferred (`None` = fresh API delete). Re-register bumps generation
-    /// so a stale deferred delete is a no-op (P0-1).
-    Delete {
-        hash: [u8; 32],
-        generation: Option<u64>,
-    },
-}
-
-impl WorkerCommand {
-    fn identity(&self) -> [u8; 32] {
-        match self {
-            Self::Register(entry) => entry.identity_type_hash,
-            Self::Delete { hash, .. } => *hash,
-        }
-    }
-
-    pub fn delete(hash: [u8; 32]) -> Self {
-        Self::Delete {
-            hash,
-            generation: None,
-        }
-    }
-}
-
 pub struct DigestLoop<R, C, S>
 where
     R: Rpc + HostQueryRpc + Send + Sync + 'static,
@@ -170,7 +143,7 @@ where
     example_policy_data_hashes: Vec<[u8; 32]>,
     workers: WorkerPool<R, S>,
     /// Optional shared command queue for live registry API updates.
-    worker_cmds: Option<Arc<Mutex<Vec<WorkerCommand>>>>,
+    worker_cmds: Option<Arc<WorkerCommands>>,
     /// Optional shared pending map for registry API code-rebind checks (P1-6).
     busy: Option<ProcessBusyMap>,
     last_tip: Option<u64>,
@@ -198,7 +171,7 @@ where
         ssri: Arc<S>,
         config: LoopConfig,
         workers: WorkerPool<R, S>,
-        worker_cmds: Option<Arc<Mutex<Vec<WorkerCommand>>>>,
+        worker_cmds: Option<Arc<WorkerCommands>>,
     ) -> Self {
         Self {
             rpc,
@@ -223,7 +196,7 @@ where
         ssri: S,
         config: LoopConfig,
         workers: WorkerPool<R, S>,
-        worker_cmds: Option<Arc<Mutex<Vec<WorkerCommand>>>>,
+        worker_cmds: Option<Arc<WorkerCommands>>,
     ) -> Self {
         let rpc = Arc::new(rpc);
         let ssri = Arc::new(ssri);
@@ -282,7 +255,7 @@ where
         &mut self.workers
     }
 
-    pub fn worker_cmds(&self) -> Option<Arc<Mutex<Vec<WorkerCommand>>>> {
+    pub fn worker_cmds(&self) -> Option<Arc<WorkerCommands>> {
         self.worker_cmds.clone()
     }
 
@@ -329,12 +302,9 @@ where
             return;
         };
         // Fail closed on poisoned queue (P2-10).
-        let mut batch = match cmds.lock() {
-            Ok(mut g) => std::mem::take(&mut *g),
-            Err(_) => {
-                tracing::error!(target: LOG_TARGET, event = "worker_cmds.poisoned");
-                return;
-            }
+        let Some(mut batch) = cmds.drain() else {
+            tracing::error!(target: LOG_TARGET, event = "worker_cmds.poisoned");
+            return;
         };
         // Only the latest registry request for an identity represents desired state.
         let mut seen = HashSet::new();
@@ -402,12 +372,7 @@ where
             }
         }
         if !requeue.is_empty() {
-            if let Some(q) = &self.worker_cmds {
-                // Recover deferred Deletes even if the mutex was poisoned (P2-8).
-                let mut g = q.lock().unwrap_or_else(|e| e.into_inner());
-                requeue.retain(|old| !g.iter().any(|new| new.identity() == old.identity()));
-                g.extend(requeue);
-            }
+            cmds.requeue(requeue);
         }
     }
 
@@ -569,12 +534,6 @@ where
             });
         });
 
-        let queued_updates: HashSet<_> = self
-            .worker_cmds
-            .as_ref()
-            .and_then(|cmds| cmds.lock().ok())
-            .map(|cmds| cmds.iter().map(WorkerCommand::identity).collect())
-            .unwrap_or_default();
         let buckets = bucket_by_process_type_hash(scanned, &self.config.cid_code_hash);
         report.skipped +=
             report.scanned - buckets.iter().map(|(_, cells)| cells.len()).sum::<usize>();
@@ -587,7 +546,11 @@ where
                     report.skipped += bucket.len();
                     return None;
                 };
-                if queued_updates.contains(&hash) {
+                if self
+                    .worker_cmds
+                    .as_ref()
+                    .is_some_and(|cmds| cmds.has_update(hash))
+                {
                     report.skipped += bucket.len();
                     return None;
                 }
@@ -785,11 +748,6 @@ where
                         .window
                         .first()
                         .map(|item| out_point_key(&item.out_point));
-                    if !state.isolate_pending.is_empty() {
-                        let mut items = polled.window;
-                        items.extend_from_slice(&polled.rest);
-                        state.isolate_pending.push(items);
-                    }
                 });
             }
             BatchOutcome::Continue | BatchOutcome::RpcUnavailable => {
@@ -1108,14 +1066,19 @@ where
             return None;
         }
         let process_lock = process.live_cell.lock();
+        let example_policy = process.verdict_code_cell().is_some_and(|cell| {
+            let hash = CellOutput::calc_data_hash(&cell.data).unpack();
+            hash == PINNED_EXAMPLE_DATA_HASH || self.example_policy_data_hashes.contains(&hash)
+        });
+        let scope = if example_policy {
+            IsolatedRefundScope::Example(process_lock.clone())
+        } else {
+            IsolatedRefundScope::State(process.live_cell.out_point.clone())
+        };
         worker.with_state_mut(|state| {
-            let policy = (
-                process_lock.clone(),
-                CellOutput::calc_data_hash(&process.live_cell.data),
-            );
-            if state.isolated_refund_policy.as_ref() != Some(&policy) {
+            if state.isolated_refund_scope.as_ref() != Some(&scope) {
                 state.isolated_refunds.clear();
-                state.isolated_refund_policy = Some(policy);
+                state.isolated_refund_scope = Some(scope);
             }
         });
         bucket.retain(
@@ -1132,10 +1095,6 @@ where
 
         let mut accepted = Vec::new();
         let mut refunds = Vec::new();
-        let example_policy = process.verdict_code_cell().is_some_and(|cell| {
-            let hash = CellOutput::calc_data_hash(&cell.data).unpack();
-            hash == PINNED_EXAMPLE_DATA_HASH || self.example_policy_data_hashes.contains(&hash)
-        });
         let process_lock_code_hash = process_lock.code_hash().unpack();
         match filter_intentions(self.ssri.as_ref(), &process.binary, &bucket) {
             Ok(reasons) => {
@@ -1223,7 +1182,7 @@ where
     fn process_bucket(
         &mut self,
         process: &ResolvedProcess,
-        bucket: Vec<ScannedIntention>,
+        mut bucket: Vec<ScannedIntention>,
         report: &mut TickReport,
     ) {
         if bucket.is_empty() || !self.process_is_healthy(process) {
@@ -1275,7 +1234,23 @@ where
             .workers
             .get(&hash)
             .and_then(|w| w.with_state(|s| s.isolate_resume.clone()));
-        let bucket = Self::rotate_bucket(bucket, resume_key.as_ref());
+        let resuming_probe = self.workers.get(&hash).is_some_and(|worker| {
+            worker.with_state_mut(|state| {
+                let Some(probe) = &state.isolation_probe else {
+                    return false;
+                };
+                if probe.resume_bucket(&process.live_cell.out_point, min as usize, &mut bucket) {
+                    return true;
+                }
+                state.isolation_probe = None;
+                false
+            })
+        });
+        let bucket = if resuming_probe {
+            bucket
+        } else {
+            Self::rotate_bucket(bucket, resume_key.as_ref())
+        };
         let resume = self.isolate_window(
             hash,
             process,
@@ -1285,6 +1260,7 @@ where
             report,
             &mut attempts,
             MAX_ATTEMPTS,
+            resuming_probe,
         );
         if let Some(worker) = self.workers.get(&hash) {
             worker.with_state_mut(|state| {
@@ -1309,14 +1285,15 @@ where
         report: &mut TickReport,
         attempts: &mut u32,
         max_attempts: u32,
+        resuming_probe: bool,
     ) -> Option<Vec<u8>> {
         const MAX_CACHED_SPLITS: u32 = 256;
         let mut cached_splits = 0u32;
         // Prefer async Rejected frames (drop_first + shrink) over re-walking the
         // bucket via `already` (P0).
-        let mut stack = self
-            .workers
-            .get(&hash)
+        let mut stack = (!resuming_probe)
+            .then(|| self.workers.get(&hash))
+            .flatten()
             .map(|w| {
                 w.with_state_mut(|s| {
                     if s.isolate_pending.is_empty() {
@@ -1610,16 +1587,13 @@ where
             Some(w) => w,
             None => return BatchOutcome::Continue,
         };
-        // Serialize dispatch with registry enqueue. A deferred delete or rebind
-        // may remain queued while the previous transactions are reconciled.
-        let _commands = if let Some(queue) = &self.worker_cmds {
-            match queue.lock() {
-                Ok(commands) if commands.iter().all(|cmd| cmd.identity() != hash) => Some(commands),
-                _ => return BatchOutcome::Continue,
-            }
-        } else {
-            None
-        };
+        if self
+            .worker_cmds
+            .as_ref()
+            .is_some_and(|cmds| cmds.has_update(hash))
+        {
+            return BatchOutcome::Continue;
+        }
         let max_size = if self.config.max_assembled_tx_bytes == 0 {
             DEFAULT_MAX_ASSEMBLED_TX_BYTES
         } else {
@@ -1639,6 +1613,7 @@ where
             rest,
             min,
             mode,
+            self.worker_cmds.clone(),
         ) {
             Ok(()) => BatchOutcome::ProcessOccupied,
             Err(crate::workers::StartBatchError::AlreadyOutstanding) => {
@@ -1764,7 +1739,7 @@ mod worker_cmd_tests {
 
     #[test]
     fn worker_command_register_and_delete_take_effect_on_tick() {
-        let cmds = Arc::new(Mutex::new(Vec::new()));
+        let cmds = Arc::new(WorkerCommands::default());
         let rpc = Arc::new(EmptyRpc);
         let ssri = Arc::new(NopSsri);
         let mut loop_ = DigestLoop::with_workers(
@@ -1779,14 +1754,14 @@ mod worker_cmd_tests {
 
         let e = entry([0x11; 32], [0x22; 32]);
         let hash = e.identity_type_hash;
-        cmds.lock().unwrap().push(WorkerCommand::Register(e));
+        cmds.enqueue(WorkerCommand::Register(e));
         let _ = loop_.tick();
         assert!(
             loop_.workers().contains(&hash),
             "register must spawn worker"
         );
 
-        cmds.lock().unwrap().push(WorkerCommand::delete(hash));
+        cmds.enqueue(WorkerCommand::delete(hash));
         let _ = loop_.tick();
         assert!(
             !loop_.workers().contains(&hash),
@@ -1796,7 +1771,7 @@ mod worker_cmd_tests {
 
     #[test]
     fn worker_command_delete_deferred_while_in_flight() {
-        let cmds = Arc::new(Mutex::new(Vec::new()));
+        let cmds = Arc::new(WorkerCommands::default());
         let e = entry([0x33; 32], [0x44; 32]);
         let hash = e.identity_type_hash;
         let rpc = Arc::new(EmptyRpc);
@@ -1814,29 +1789,25 @@ mod worker_cmd_tests {
         });
         let mut loop_ =
             DigestLoop::with_workers(rpc, NopClock, ssri, cfg(), pool, Some(cmds.clone()));
-        cmds.lock().unwrap().push(WorkerCommand::delete(hash));
+        cmds.enqueue(WorkerCommand::delete(hash));
         let _ = loop_.tick();
         assert!(
             loop_.workers().contains(&hash),
             "in-flight delete must stay deferred"
         );
-        assert_eq!(cmds.lock().unwrap().len(), 1);
-        assert!(matches!(
-            cmds.lock().unwrap()[0],
-            WorkerCommand::Delete { .. }
-        ));
+        assert_eq!(cmds.queued().len(), 1);
+        assert!(matches!(cmds.queued()[0], WorkerCommand::Delete { .. }));
 
         // P0-1: re-register must invalidate the deferred delete.
         let e2 = entry([0x33; 32], [0x44; 32]);
-        cmds.lock().unwrap().push(WorkerCommand::Register(e2));
+        cmds.enqueue(WorkerCommand::Register(e2));
         let _ = loop_.tick();
         assert!(
             loop_.workers().contains(&hash),
             "re-register must keep worker; stale delete must not apply"
         );
         assert!(
-            cmds.lock()
-                .unwrap()
+            cmds.queued()
                 .iter()
                 .all(|c| { !matches!(c, WorkerCommand::Delete { hash: h, .. } if *h == hash) }),
             "no stale Delete may remain after re-register"

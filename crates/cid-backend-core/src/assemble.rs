@@ -305,14 +305,35 @@ fn refund_output(intent: &ScannedIntention) -> Result<(CellOutput, Vec<u8>), Ass
                 "non-standard type script; cannot exact-refund".into(),
             ));
         }
-        if intent.data.len() != cid_protocol::XUDT_AMOUNT_LEN {
+        let amount = intent.data.get(..cid_protocol::XUDT_AMOUNT_LEN);
+        if !amount.is_some_and(|bytes| bytes.iter().any(|&byte| byte != 0)) {
             return Err(AssembleError::RefundUnbuildable(
-                "xUDT amount is not 16 bytes".into(),
+                "xUDT refund requires a nonzero 16-byte amount".into(),
             ));
         }
         builder = builder.type_(Some(ts.clone()).pack());
+    } else {
+        if !intent.data.is_empty() {
+            return Err(AssembleError::RefundUnbuildable(
+                "untyped Intention must have empty data".into(),
+            ));
+        }
+        let input = crate::ssri::intention_draft_cell(intent).output;
+        if !cell_occupied_capacity(&input, &[]).is_some_and(|occupied| intent.capacity > occupied) {
+            return Err(AssembleError::RefundUnbuildable(
+                "CKB Intention capacity must exceed occupied capacity".into(),
+            ));
+        }
     }
-    Ok((builder.build(), intent.data.clone()))
+    let output = builder.build();
+    if !cell_occupied_capacity(&output, &intent.data)
+        .is_some_and(|occupied| intent.capacity >= occupied)
+    {
+        return Err(AssembleError::RefundUnbuildable(
+            "output below occupied capacity".into(),
+        ));
+    }
+    Ok((output, intent.data.clone()))
 }
 
 #[cfg(test)]
@@ -371,6 +392,34 @@ mod tests {
             lock_code_hash: [0xC1; 32],
             lock_hash_type: ScriptHashType::Type,
         }
+    }
+
+    #[test]
+    fn refund_preserves_xudt_trailing_data() {
+        let mut intent = intention(1, [2; 32], 600_0000_0000);
+        intent.type_script = Some(
+            Script::new_builder()
+                .code_hash(cid_protocol::XUDT_CODE_HASH.pack())
+                .hash_type(ScriptHashType::Data1.into())
+                .args([1u8; 32].to_vec().pack())
+                .build(),
+        );
+        intent.data = [1u128.to_le_bytes().as_slice(), &[0xaa, 0xbb]].concat();
+        let skeleton = assemble_digest_incompatible(std::slice::from_ref(&intent), &[]).unwrap();
+        assert_eq!(
+            skeleton.tx.outputs_data().get(0).unwrap().raw_data(),
+            intent.data
+        );
+    }
+
+    #[test]
+    fn refund_rejects_untyped_data() {
+        let mut intent = intention(1, [2; 32], 600_0000_0000);
+        intent.data = vec![1];
+        assert!(matches!(
+            assemble_digest_incompatible(&[intent], &[]),
+            Err(AssembleError::RefundUnbuildable(_))
+        ));
     }
 
     fn process(hash: [u8; 32], cap: u64) -> ResolvedProcess {

@@ -12,7 +12,8 @@ use crate::rpc::{LiveCell, Rpc};
 use crate::scan::ScannedIntention;
 use crate::ssri::SsriHost;
 use crate::submit::SubmitState;
-use ckb_types::packed::{Byte32, CellDep, OutPoint, Script};
+use crate::worker_commands::WorkerCommands;
+use ckb_types::packed::{CellDep, OutPoint, Script};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
@@ -25,6 +26,13 @@ fn process_thread_name(hash: &[u8; 32]) -> String {
         "cid-proc-{:02x}{:02x}{:02x}{:02x}",
         hash[0], hash[1], hash[2], hash[3]
     )
+}
+
+#[derive(PartialEq, Eq)]
+pub(crate) enum IsolatedRefundScope {
+    State(OutPoint),
+    // The audited example classifies exit 39/40 from the Intention and state lock.
+    Example(Script),
 }
 
 /// Per-Process mutable state (digest thread and worker thread via lock).
@@ -42,9 +50,9 @@ pub struct ProcessWorkerState {
     /// (e.g. fee unaffordable). Below-min leftovers retry refund without a
     /// legal `[min,max]` assemble window.
     pub pending_incompatible_refund: HashSet<Vec<u8>>,
-    /// Individually isolated exit-39/40 verdicts for the current code and state lock.
+    /// Individually isolated exit-39/40 verdicts for the current code and scope.
     pub(crate) isolated_refunds: HashMap<OutPoint, i8>,
-    pub(crate) isolated_refund_policy: Option<(Script, Byte32)>,
+    pub(crate) isolated_refund_scope: Option<IsolatedRefundScope>,
     pub(crate) refund_cursor: Option<OutPoint>,
     pub(crate) isolation_probe: Option<IsolationProbe>,
     pub(crate) isolation_probe_paused: bool,
@@ -71,7 +79,7 @@ impl ProcessWorkerState {
             isolate_pending: Vec::new(),
             pending_incompatible_refund: HashSet::new(),
             isolated_refunds: HashMap::new(),
-            isolated_refund_policy: None,
+            isolated_refund_scope: None,
             refund_cursor: None,
             isolation_probe: None,
             isolation_probe_paused: false,
@@ -101,7 +109,7 @@ impl ProcessWorkerState {
         self.isolate_resume = None;
         self.pending_incompatible_refund.clear();
         self.isolated_refunds.clear();
-        self.isolated_refund_policy = None;
+        self.isolated_refund_scope = None;
         self.refund_cursor = None;
         self.isolation_probe = None;
     }
@@ -128,6 +136,7 @@ enum ProcessWorkerJob {
         max_assembled_tx_bytes: usize,
         min: u32,
         mode: BatchMode,
+        commands: Option<Arc<WorkerCommands>>,
         reply: SyncSender<(BatchOutcome, BatchReportDelta)>,
     },
 }
@@ -263,6 +272,7 @@ impl ProcessWorker {
         rest: Vec<ScannedIntention>,
         min: u32,
         mode: BatchMode,
+        commands: Option<Arc<WorkerCommands>>,
     ) -> Result<(), StartBatchError> {
         if self
             .batch_outstanding
@@ -288,6 +298,7 @@ impl ProcessWorker {
                 max_assembled_tx_bytes,
                 min,
                 mode,
+                commands,
                 reply: reply_tx,
             })
             .is_err()
@@ -364,6 +375,7 @@ fn worker_thread_main<R, S>(
                 max_assembled_tx_bytes,
                 min,
                 mode,
+                commands,
                 reply,
             } => {
                 if epoch.load(Ordering::SeqCst) != job_epoch {
@@ -401,6 +413,7 @@ fn worker_thread_main<R, S>(
                         epoch: epoch.clone(),
                         min,
                         mode,
+                        commands,
                     },
                 );
                 // Always forward the real outcome — especially Submitted* after

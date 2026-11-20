@@ -1,4 +1,4 @@
-use cid_backend_core::digest_loop::{DigestLoop, NopClock, WorkerCommand};
+use cid_backend_core::digest_loop::{DigestLoop, NopClock, WorkerCommands};
 use cid_backend_core::ssri::EmbeddedSsri;
 use cid_backend_core::{ProcessBusyMap, ProcessRegistry, WorkerPool};
 use cid_backend_daemon::observe::{spawn_health, DaemonStats};
@@ -99,7 +99,7 @@ fn main() {
         entries = registry.len(),
     );
 
-    let worker_cmds: Arc<Mutex<Vec<WorkerCommand>>> = Arc::new(Mutex::new(Vec::new()));
+    let worker_cmds = Arc::new(WorkerCommands::default());
     let busy = ProcessBusyMap::new();
 
     let rpc = Arc::new(CkbRpc::from_config(&config));
