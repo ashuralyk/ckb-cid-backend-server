@@ -7,7 +7,8 @@ mod tests {
 
     use crate::fake_rpc::FakeRpc;
     use crate::helpers::{
-        intention_cell, loop_with_resolver, process_cell, process_type_script, CID_CODE,
+        distinct_intention_cell, intention_cell, loop_with_resolver, process_cell,
+        process_type_script, CID_CODE,
     };
     use crate::scripted_ssri::ScriptedSsri;
 
@@ -20,7 +21,7 @@ mod tests {
         let proc = process_cell(2, 400_0000_0000, vec![0x7f, b'E', b'L', b'F', 2]);
         rpc.insert_cell(proc.clone());
         for i in 1..=4 {
-            rpc.insert_cell(intention_cell(i, hash, 100_0000_0000));
+            rpc.insert_cell(distinct_intention_cell(i, hash, 100_0000_0000));
         }
 
         let mut loop_ = loop_with_resolver(
@@ -126,7 +127,7 @@ mod tests {
         let proc = process_cell(6, 400_0000_0000, vec![0x7f, b'E', b'L', b'F', 6]);
         rpc.insert_cell(proc.clone());
         for i in 1..=4 {
-            rpc.insert_cell(intention_cell(i, hash, 100_0000_0000));
+            rpc.insert_cell(distinct_intention_cell(i, hash, 100_0000_0000));
         }
         let mut loop_ = loop_with_resolver(rpc, ScriptedSsri::mimic((2, 2)), cfg(), 6);
 
@@ -169,7 +170,7 @@ mod tests {
         let proc = process_cell(7, 400_0000_0000, vec![0x7f, b'E', b'L', b'F', 7]);
         rpc.insert_cell(proc.clone());
         for i in 1..=4 {
-            rpc.insert_cell(intention_cell(i, hash, 100_0000_0000));
+            rpc.insert_cell(distinct_intention_cell(i, hash, 100_0000_0000));
         }
         let mut loop_ = loop_with_resolver(rpc, ScriptedSsri::mimic((2, 2)), cfg(), 7);
 
@@ -245,27 +246,32 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Process pending occupancy stops same-bucket digest/refund interleaving this tick"]
-    fn pending_digest_ok_still_allows_incompatible_refund() {
+    fn pending_digest_defers_the_filter_refund_until_the_state_is_recreated() {
         let rpc = FakeRpc::new();
         rpc.defer_commit();
+        rpc.insert_cell(crate::helpers::code_cell(
+            0xA0,
+            crate::helpers::PROC_CODE_ARGS,
+            crate::helpers::FIXTURE_ELF.to_vec(),
+        ));
         let ts = process_type_script(9);
         let hash = script_hash32(&ts);
         let digest_intent = intention_cell(1, hash, 100_0000_0000);
-        let refund_intent = intention_cell(2, hash, 110_0000_0000);
+        let refund_intent = intention_cell(2, hash, 200_0000_0000);
         let proc = process_cell(9, 200_0000_0000, vec![0x7f, b'E', b'L', b'F', 9]);
         rpc.insert_cell(digest_intent.clone());
         rpc.insert_cell(refund_intent.clone());
         rpc.insert_cell(proc.clone());
         let mut loop_ = loop_with_resolver(
             rpc,
-            ScriptedSsri::ok_then_incompatible((1, 1), 1, 21),
+            ScriptedSsri::mimic((1, 1))
+                .with_filter(|n| Ok(if n == 2 { vec![0, 5] } else { vec![5; n] })),
             cfg(),
             9,
         );
 
         let first = loop_.tick();
-        assert_eq!(first.submitted, 1);
+        assert_eq!(first.submitted, 1, "{first:?}");
         assert_eq!(first.conflicts, 0);
         let digest_tx = &loop_.rpc().submitted()[0];
         assert!(digest_tx
@@ -280,15 +286,14 @@ mod tests {
             .pending_occupies(&proc.out_point));
 
         let second = loop_.tick();
-        assert_eq!(second.submitted, 1, "refund must still submit");
-        assert_eq!(second.conflicts, 0);
-        assert_eq!(loop_.rpc().submitted().len(), 2);
-        let refund_tx = &loop_.rpc().submitted()[1];
-        assert_eq!(refund_tx.inputs().len(), 1, "refund does not spend Process");
         assert_eq!(
-            refund_tx.inputs().get(0).unwrap().previous_output(),
-            refund_intent.out_point
+            second.submitted, 0,
+            "pending transactions must retain occupancy"
         );
+        assert_eq!(second.conflicts, 0);
+        assert_eq!(loop_.rpc().submit_attempts(), 1);
+        assert_eq!(loop_.rpc().dry_run_attempts(), 1);
+        assert!(loop_.rpc().has_cell(&refund_intent.out_point));
         assert_eq!(
             loop_
                 .rpc()
@@ -299,11 +304,18 @@ mod tests {
             proc.out_point,
             "Process stays live under pending digest_ok"
         );
-        assert!(loop_
-            .state()
-            .submit
-            .as_ref()
-            .unwrap()
-            .pending_occupies(&proc.out_point));
+        loop_.rpc().commit_pending(&digest_tx.hash());
+        assert_eq!(loop_.tick().submitted, 1);
+        let refund_tx = &loop_.rpc().submitted()[1];
+        assert_eq!(refund_tx.inputs().len(), 1, "refund does not spend Process");
+        assert_eq!(
+            refund_tx.inputs().get(0).unwrap().previous_output(),
+            refund_intent.out_point
+        );
+        assert!(refund_tx
+            .cell_deps()
+            .into_iter()
+            .any(|dep| dep.out_point().tx_hash() == digest_tx.hash()));
+        assert_eq!(loop_.ssri().filter_requests.lock().unwrap().len(), 3);
     }
 }

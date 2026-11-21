@@ -18,7 +18,7 @@ env:
   CARGO_INCREMENTAL: "0"
   RUST_BACKTRACE: "1"
   # Must match workspace.dependencies cid-process-executor / cid-protocol rev.
-  CID_DISPATCHER_REV: 5ea581fad5922ad0e4104d99757be143ee6706f8
+  CID_DISPATCHER_REV: b2d01e0a5a9760c8ee627633365aa98dd7a99859
 
 jobs:
   test:
@@ -68,7 +68,7 @@ jobs:
           set -euo pipefail
           cargo test --locked -p cid-backend-core -- --include-ignored --nocapture 2>&1 | tee core-test.log
           if grep -E 'skip: cid_process_example missing|ignoring: cid_process_example' core-test.log; then
-            echo '::error::real SSRI guest test skipped; CI must execute ckb-vm Process.batch/assemble'
+            echo '::error::real SSRI guest test skipped; CI must execute ckb-vm Process.filter/batch/assemble'
             exit 1
           fi
           grep -F 'real SSRI guest executed:' core-test.log
@@ -108,7 +108,7 @@ jobs:
             done
             if [ -f core-test.log ] && grep -F 'real SSRI guest executed:' core-test.log >/dev/null; then
               echo
-              echo '**Real SSRI guest:** executed (ckb-vm `Process.batch` / `Process.assemble`).'
+              echo '**Real SSRI guest:** executed (ckb-vm `Process.filter`, `Process.batch`, and `Process.assemble`).'
               grep -F 'real SSRI guest executed:' core-test.log | sed 's/^/- /'
             elif [ -f core-test.log ]; then
               echo

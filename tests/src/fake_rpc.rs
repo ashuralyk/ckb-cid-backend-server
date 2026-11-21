@@ -15,15 +15,29 @@ struct Inner {
     fail_next_submit: bool,
     reject_next_submit: bool,
     reject_next_dry_run: bool,
+    reject_dry_run_input: Option<OutPoint>,
+    spent_deps: HashSet<OutPoint>,
+    replace_cell_on_submit: Option<(OutPoint, Option<LiveCell>)>,
+    stale_indexer_cells: HashSet<OutPoint>,
+    indexer_snapshots: HashMap<OutPoint, Option<LiveCell>>,
+    unavailable_submit_inputs: HashSet<OutPoint>,
+    unavailable_live_cell_once: Option<OutPoint>,
+    live_cell_reads: HashMap<OutPoint, usize>,
+    unavailable_next_dry_run: bool,
     reject_inputs: HashSet<Vec<u8>>,
+    conflict_input: Option<(OutPoint, bool)>,
+    reject_fee_rate_once: Option<(usize, bool)>,
+    cid_lock_groups: Option<([u8; 32], ScriptHashType)>,
     submit_attempts: usize,
     dry_run_attempts: usize,
     unavailable_next_submit: bool,
+    lose_next_submit_response: bool,
     defer_commit: bool,
     fail_status_queries: bool,
     fail_tip_queries: bool,
     fail_type_script_queries: bool,
     rewind_tip_on_status: Option<u64>,
+    replace_commit_block_on_status: bool,
     submitted: Vec<TransactionView>,
     consumed_by_tx: HashMap<Vec<u8>, Vec<LiveCell>>,
     tx_status: HashMap<Vec<u8>, TxStatus>,
@@ -35,15 +49,78 @@ struct Inner {
     cell_index_meta: HashMap<Vec<u8>, (u64, u32)>,
 }
 
+impl Inner {
+    fn block_hash(&self, number: u64) -> [u8; 32] {
+        self.block_hashes.get(&number).copied().unwrap_or_else(|| {
+            let mut hash = [0; 32];
+            hash[..8].copy_from_slice(&number.to_le_bytes());
+            hash
+        })
+    }
+
+    fn committed_status(&self) -> TxStatus {
+        TxStatus::Committed {
+            block_number: self.tip,
+            block_hash: self.block_hash(self.tip),
+        }
+    }
+
+    fn indexed_cell(&self, op: &OutPoint) -> Option<&LiveCell> {
+        match self.indexer_snapshots.get(op) {
+            Some(snapshot) => snapshot.as_ref(),
+            None => self.cells.get(&out_point_key(op)),
+        }
+    }
+}
+
 pub struct FakeRpc {
     inner: Mutex<Inner>,
+    after_submit: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+fn check_injected_conflict(
+    inner: &Inner,
+    tx: &TransactionView,
+    dry_run: bool,
+) -> Result<(), RpcError> {
+    if inner.conflict_input.as_ref().is_some_and(|(op, stage)| {
+        *stage == dry_run
+            && tx
+                .inputs()
+                .into_iter()
+                .any(|input| input.previous_output() == *op)
+    }) {
+        return Err(RpcError::Conflict("injected unresolved dependency".into()));
+    }
+    Ok(())
 }
 
 impl FakeRpc {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(Inner::default()),
+            after_submit: Mutex::new(None),
         }
+    }
+
+    pub fn after_next_submit(&self, callback: impl FnOnce() + Send + 'static) {
+        *self.after_submit.lock().unwrap() = Some(Box::new(callback));
+    }
+
+    pub fn conflict_on_input(&self, op: Option<OutPoint>, dry_run: bool) {
+        self.inner.lock().unwrap().conflict_input = op.map(|op| (op, dry_run));
+    }
+
+    pub fn reject_fee_rate_once_at_input_count(&self, count: usize, dry_run: bool) {
+        self.inner.lock().unwrap().reject_fee_rate_once = Some((count, dry_run));
+    }
+
+    pub fn enforce_single_input_cid_lock_groups(
+        &self,
+        code_hash: [u8; 32],
+        hash_type: ScriptHashType,
+    ) {
+        self.inner.lock().unwrap().cid_lock_groups = Some((code_hash, hash_type));
     }
 
     pub fn insert_cell(&self, cell: LiveCell) {
@@ -126,6 +203,11 @@ impl FakeRpc {
         self.inner.lock().unwrap().defer_commit = true;
     }
 
+    /// Accept the next transaction but lose the RPC response.
+    pub fn lose_next_submit_response(&self) {
+        self.inner.lock().unwrap().lose_next_submit_response = true;
+    }
+
     /// `get_transaction_status` returns Unavailable until restored (occupancy must be held).
     pub fn fail_status_queries(&self) {
         self.inner.lock().unwrap().fail_status_queries = true;
@@ -143,6 +225,63 @@ impl FakeRpc {
     /// Next `dry_run_transaction` returns `SubmitRejected` (combo blacklist path).
     pub fn inject_dry_run_reject_once(&self) {
         self.inner.lock().unwrap().reject_next_dry_run = true;
+    }
+
+    pub fn reject_dry_run_when_consuming(&self, op: OutPoint) {
+        self.inner.lock().unwrap().reject_dry_run_input = Some(op);
+    }
+
+    /// The node rejects this dependency while the indexer still lists it.
+    pub fn mark_indexer_cell_stale(&self, op: OutPoint) {
+        self.inner.lock().unwrap().stale_indexer_cells.insert(op);
+    }
+
+    pub fn take_live_cell_reads(&self) -> HashMap<OutPoint, usize> {
+        std::mem::take(&mut self.inner.lock().unwrap().live_cell_reads)
+    }
+
+    pub fn fail_live_cell_once(&self, op: OutPoint) {
+        self.inner.lock().unwrap().unavailable_live_cell_once = Some(op);
+    }
+
+    pub fn restore_indexer_cell_liveness(&self, op: &OutPoint) {
+        self.inner.lock().unwrap().stale_indexer_cells.remove(op);
+    }
+
+    pub fn set_indexer_snapshot(&self, op: OutPoint, cell: Option<LiveCell>) {
+        self.inner
+            .lock()
+            .unwrap()
+            .indexer_snapshots
+            .insert(op, cell);
+    }
+
+    pub fn clear_indexer_snapshot(&self, op: &OutPoint) {
+        self.inner.lock().unwrap().indexer_snapshots.remove(op);
+    }
+
+    pub fn mark_dep_spent(&self, op: OutPoint) {
+        self.inner.lock().unwrap().spent_deps.insert(op);
+    }
+
+    pub fn spend_dep_on_next_submit(&self, op: OutPoint) {
+        self.inner.lock().unwrap().replace_cell_on_submit = Some((op, None));
+    }
+
+    pub fn replace_cell_on_next_submit(&self, op: OutPoint, replacement: LiveCell) {
+        self.inner.lock().unwrap().replace_cell_on_submit = Some((op, Some(replacement)));
+    }
+
+    pub fn inject_unavailable_refund_once(&self, op: OutPoint) {
+        self.inner
+            .lock()
+            .unwrap()
+            .unavailable_submit_inputs
+            .insert(op);
+    }
+
+    pub fn inject_unavailable_dry_run_once(&self) {
+        self.inner.lock().unwrap().unavailable_next_dry_run = true;
     }
 
     /// Every submit that spends `op` returns `SubmitRejected` (A-fails / B-succeeds).
@@ -203,6 +342,10 @@ impl FakeRpc {
         self.inner.lock().unwrap().rewind_tip_on_status = Some(new_tip);
     }
 
+    pub fn replace_commit_block_on_next_status(&self) {
+        self.inner.lock().unwrap().replace_commit_block_on_status = true;
+    }
+
     pub fn live_cells(&self) -> Vec<LiveCell> {
         let inner = self.inner.lock().unwrap();
         inner
@@ -245,6 +388,15 @@ impl FakeRpc {
         inner.tx_status.insert(key, TxStatus::Dropped);
     }
 
+    pub fn return_to_pool(&self, tx_hash: &Byte32) {
+        self.simulate_drop(tx_hash);
+        self.inner
+            .lock()
+            .unwrap()
+            .tx_status
+            .insert(tx_hash.as_slice().to_vec(), TxStatus::Pending);
+    }
+
     /// Rewind the tip. Transactions committed above `new_tip` are dropped and
     /// their inputs restored (reorg of confirming/committed txs).
     pub fn simulate_reorg(&self, new_tip: u64) {
@@ -254,7 +406,7 @@ impl FakeRpc {
                 .tx_status
                 .iter()
                 .filter_map(|(k, st)| match st {
-                    TxStatus::Committed { block_number } if *block_number > new_tip => {
+                    TxStatus::Committed { block_number, .. } if *block_number > new_tip => {
                         Byte32::from_slice(k).ok()
                     }
                     _ => None,
@@ -275,10 +427,8 @@ impl FakeRpc {
             return;
         }
         apply_commit(&mut inner, tx_hash);
-        let block_number = inner.tip;
-        inner
-            .tx_status
-            .insert(key, TxStatus::Committed { block_number });
+        let status = inner.committed_status();
+        inner.tx_status.insert(key, status);
     }
 }
 
@@ -332,7 +482,7 @@ impl Rpc for FakeRpc {
         let inner = self.inner.lock().unwrap();
         let mut out = Vec::new();
         for op in &inner.order {
-            let Some(cell) = inner.cells.get(&out_point_key(op)) else {
+            let Some(cell) = inner.indexed_cell(op) else {
                 continue;
             };
             let lock = cell.lock();
@@ -379,7 +529,7 @@ impl Rpc for FakeRpc {
             if out.len() >= max_results {
                 break;
             }
-            let Some(cell) = inner.cells.get(&out_point_key(op)) else {
+            let Some(cell) = inner.indexed_cell(op) else {
                 continue;
             };
             if let Some(ts) = cell.type_script() {
@@ -391,9 +541,40 @@ impl Rpc for FakeRpc {
         Ok(out)
     }
 
-    fn dry_run_transaction(&self, _tx: &TransactionView) -> Result<(), RpcError> {
+    fn dry_run_transaction(&self, tx: &TransactionView) -> Result<(), RpcError> {
         let mut inner = self.inner.lock().unwrap();
         inner.dry_run_attempts += 1;
+        check_injected_conflict(&inner, tx, true)?;
+        if inner.reject_fee_rate_once == Some((tx.inputs().len(), true)) {
+            inner.reject_fee_rate_once = None;
+            return Err(RpcError::PoolPolicyRejected(
+                "injected minimum fee rate".into(),
+            ));
+        }
+        if let Some((code_hash, hash_type)) = inner.cid_lock_groups {
+            let mut groups = HashSet::new();
+            for input in tx.inputs() {
+                if let Some(cell) = inner.cells.get(input.previous_output().as_slice()) {
+                    let lock = cell.lock();
+                    if lock.code_hash().as_slice() == code_hash
+                        && lock.hash_type() == hash_type.into()
+                        && !groups.insert(lock)
+                    {
+                        return Err(RpcError::SubmitRejected("CID PartialDigest".into()));
+                    }
+                }
+            }
+        }
+        if std::mem::take(&mut inner.unavailable_next_dry_run) {
+            return Err(RpcError::Unavailable("injected dry-run unavailable".into()));
+        }
+        if inner.reject_dry_run_input.as_ref().is_some_and(|op| {
+            tx.inputs()
+                .into_iter()
+                .any(|input| input.previous_output() == *op)
+        }) {
+            return Err(RpcError::SubmitRejected("injected input reject".into()));
+        }
         if inner.reject_next_dry_run {
             inner.reject_next_dry_run = false;
             return Err(RpcError::SubmitRejected("injected dry-run reject".into()));
@@ -404,6 +585,35 @@ impl Rpc for FakeRpc {
     fn submit_transaction(&self, tx: &TransactionView) -> Result<Byte32, RpcError> {
         let mut inner = self.inner.lock().unwrap();
         inner.submit_attempts += 1;
+        check_injected_conflict(&inner, tx, false)?;
+        if inner.reject_fee_rate_once == Some((tx.inputs().len(), false)) {
+            inner.reject_fee_rate_once = None;
+            return Err(RpcError::PoolPolicyRejected(
+                "injected minimum fee rate".into(),
+            ));
+        }
+        if let Some((op, replacement)) = inner.replace_cell_on_submit.take() {
+            inner.cells.remove(&out_point_key(&op));
+            inner.spent_deps.insert(op);
+            if let Some(cell) = replacement {
+                inner.order.push(cell.out_point.clone());
+                inner.cells.insert(out_point_key(&cell.out_point), cell);
+            }
+        }
+        if tx
+            .cell_deps()
+            .into_iter()
+            .any(|dep| inner.spent_deps.contains(&dep.out_point()))
+        {
+            return Err(RpcError::Conflict("dependency is spent".into()));
+        }
+        if tx.inputs().len() == 1
+            && inner
+                .unavailable_submit_inputs
+                .remove(&tx.inputs().get(0).unwrap().previous_output())
+        {
+            return Err(RpcError::Unavailable("injected refund unavailable".into()));
+        }
         if inner.unavailable_next_submit {
             inner.unavailable_next_submit = false;
             return Err(RpcError::Unavailable("injected submit unavailable".into()));
@@ -449,12 +659,21 @@ impl Rpc for FakeRpc {
             inner.tx_status.insert(hash_key, TxStatus::Pending);
         } else {
             apply_commit(&mut inner, &tx_hash);
-            let block_number = inner.tip;
-            inner
-                .tx_status
-                .insert(hash_key, TxStatus::Committed { block_number });
+            let status = inner.committed_status();
+            inner.tx_status.insert(hash_key, status);
         }
-        Ok(tx_hash)
+        let lost_response = std::mem::take(&mut inner.lose_next_submit_response);
+        drop(inner);
+        if let Some(callback) = self.after_submit.lock().unwrap().take() {
+            callback();
+        }
+        if lost_response {
+            Err(RpcError::Unavailable(
+                "injected submit response timeout".into(),
+            ))
+        } else {
+            Ok(tx_hash)
+        }
     }
 
     fn get_transaction_status(&self, tx_hash: &Byte32) -> Result<TxStatus, RpcError> {
@@ -465,11 +684,19 @@ impl Rpc for FakeRpc {
         if inner.fail_status_queries {
             return Err(RpcError::Unavailable("injected status unavailable".into()));
         }
-        Ok(inner
+        let status = inner
             .tx_status
             .get(tx_hash.as_slice())
             .copied()
-            .unwrap_or(TxStatus::Dropped))
+            .unwrap_or(TxStatus::Dropped);
+        if let TxStatus::Committed { block_number, .. } = status {
+            if std::mem::take(&mut inner.replace_commit_block_on_status) {
+                inner.block_hashes.insert(block_number, [0xbb; 32]);
+                drop(inner);
+                self.return_to_pool(tx_hash);
+            }
+        }
+        Ok(status)
     }
 
     fn tip_block_number(&self) -> Result<u64, RpcError> {
@@ -483,7 +710,17 @@ impl Rpc for FakeRpc {
 
 impl HostQueryRpc for FakeRpc {
     fn get_live_cell(&self, out_point: &OutPoint) -> Result<Option<LiveCell>, RpcError> {
-        let inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
+        *inner.live_cell_reads.entry(out_point.clone()).or_default() += 1;
+        if inner.unavailable_live_cell_once.as_ref() == Some(out_point) {
+            inner.unavailable_live_cell_once = None;
+            return Err(RpcError::Unavailable(
+                "injected live cell lookup failure".into(),
+            ));
+        }
+        if inner.stale_indexer_cells.contains(out_point) {
+            return Ok(None);
+        }
         Ok(inner.cells.get(&out_point_key(out_point)).cloned())
     }
 
@@ -492,13 +729,7 @@ impl HostQueryRpc for FakeRpc {
         if inner.fail_tip_queries {
             return Err(RpcError::Unavailable("injected tip unavailable".into()));
         }
-        if let Some(h) = inner.block_hashes.get(&number) {
-            return Ok(Some(*h));
-        }
-        // Deterministic synthetic tip hash when callers only set_tip.
-        let mut h = [0u8; 32];
-        h[..8].copy_from_slice(&number.to_le_bytes());
-        Ok(Some(h))
+        Ok(Some(inner.block_hash(number)))
     }
 
     fn get_header_by_number(&self, number: u64) -> Result<Option<Vec<u8>>, RpcError> {

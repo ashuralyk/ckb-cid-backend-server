@@ -224,7 +224,7 @@ indexer_url = "http://user:{SECRET}@127.0.0.1:{port}/v1?api_key=prefix@{TOKEN}"
 
 [cid_lock]
 code_hash = "0x{lock}"
-hash_type = "data1"
+hash_type = "type"
 
 [loop]
 poll_interval_secs = 1

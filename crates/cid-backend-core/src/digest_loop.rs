@@ -2,25 +2,29 @@ use crate::code_deps::{resolve_execution_cell_deps, resolve_type_id_code_cell, C
 use crate::fee::{CidLockIdentity, RefundPolicy};
 use crate::host_query::HostQueryRpc;
 use crate::process::{ProcessEntry, ProcessResolver, ResolvedProcess};
-use crate::process_batch::{self, BatchOutcome, BatchReportDelta};
+use crate::process_batch::{self, BatchMode, BatchOutcome, BatchReportDelta};
 use crate::process_busy::ProcessBusyMap;
 use crate::rpc::{out_point_key, Rpc, RpcError, TxStatus};
 use crate::scan::{bucket_by_process_type_hash, scan_intentions_multi, ScannedIntention};
-use crate::ssri::SsriHost;
-use crate::submit::{combo_fingerprint, execution_code_key, SubmitState};
+use crate::ssri::{filter_intentions, SsriError, SsriHost};
+use crate::submit::{execution_code_key, SubmitState};
 use crate::type_id::TypeIdCodeDep;
-use crate::workers::{WorkerPool, WorkerRemoveError};
+pub use crate::worker_commands::{WorkerCommand, WorkerCommands};
+use crate::workers::{RefundPriority, WorkerPool, WorkerRemoveError};
+use cid_intention_filter::{
+    FILTER_ACCEPTED, FILTER_DEPOSIT_BELOW_MINIMUM, FILTER_MALFORMED_DIGEST,
+    FILTER_UNSUPPORTED_ACTION, FILTER_UNSUPPORTED_ASSET,
+};
 use ckb_types::core::ScriptHashType;
 use ckb_types::packed::{Byte32, CellDep};
 use ckb_types::prelude::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const LOG_TARGET: &str = "cid_backend";
-
 /// Default max molecule size for guest-assembled execution txs (512 KiB).
 pub const DEFAULT_MAX_ASSEMBLED_TX_BYTES: usize = 512 * 1024;
 
@@ -92,8 +96,14 @@ pub struct TickReport {
     pub scan_ok: bool,
     /// Last scan/submit error on this tick, if any.
     pub last_error: Option<String>,
-    /// Isolate windows considered this tick (including cached splits).
+    /// Assembly windows dispatched this tick.
     pub isolate_windows: usize,
+}
+
+struct FilteredBucket {
+    process: ResolvedProcess,
+    accepted: Vec<ScannedIntention>,
+    refunds: Vec<ScannedIntention>,
 }
 
 pub trait Clock {
@@ -114,35 +124,6 @@ impl Clock for RealClock {
     }
 }
 
-/// Deferred register/delete from the HTTP registry API (applied at tick start).
-#[derive(Clone, Debug)]
-pub enum WorkerCommand {
-    Register(ProcessEntry),
-    /// Disable Process. `generation` stamps the worker epoch when delete was
-    /// first deferred (`None` = fresh API delete). Re-register bumps generation
-    /// so a stale deferred delete is a no-op (P0-1).
-    Delete {
-        hash: [u8; 32],
-        generation: Option<u64>,
-    },
-}
-
-impl WorkerCommand {
-    fn identity(&self) -> [u8; 32] {
-        match self {
-            Self::Register(entry) => entry.identity_type_hash,
-            Self::Delete { hash, .. } => *hash,
-        }
-    }
-
-    pub fn delete(hash: [u8; 32]) -> Self {
-        Self::Delete {
-            hash,
-            generation: None,
-        }
-    }
-}
-
 pub struct DigestLoop<R, C, S>
 where
     R: Rpc + HostQueryRpc + Send + Sync + 'static,
@@ -155,11 +136,16 @@ where
     config: LoopConfig,
     workers: WorkerPool<R, S>,
     /// Optional shared command queue for live registry API updates.
-    worker_cmds: Option<Arc<Mutex<Vec<WorkerCommand>>>>,
+    worker_cmds: Option<Arc<WorkerCommands>>,
     /// Optional shared pending map for registry API code-rebind checks (P1-6).
     busy: Option<ProcessBusyMap>,
     last_tip: Option<u64>,
+    /// Varies probe order for large candidate sets independently of search results.
+    scan_number: u64,
+    /// Indexer membership from the previous scan, used only to spot arrivals.
+    previous_live_keys: HashSet<Vec<u8>>,
     tick_cell_deps: Vec<CellDep>,
+    tick_cid_locks: Arc<[CidLockIdentity]>,
     execution_code_key: Vec<u8>,
 }
 
@@ -182,7 +168,7 @@ where
         ssri: Arc<S>,
         config: LoopConfig,
         workers: WorkerPool<R, S>,
-        worker_cmds: Option<Arc<Mutex<Vec<WorkerCommand>>>>,
+        worker_cmds: Option<Arc<WorkerCommands>>,
     ) -> Self {
         Self {
             rpc,
@@ -193,7 +179,10 @@ where
             worker_cmds,
             busy: None,
             last_tip: None,
+            scan_number: 0,
+            previous_live_keys: HashSet::new(),
             tick_cell_deps: Vec::new(),
+            tick_cid_locks: Arc::from([]),
             execution_code_key: Vec::new(),
         }
     }
@@ -204,7 +193,7 @@ where
         ssri: S,
         config: LoopConfig,
         workers: WorkerPool<R, S>,
-        worker_cmds: Option<Arc<Mutex<Vec<WorkerCommand>>>>,
+        worker_cmds: Option<Arc<WorkerCommands>>,
     ) -> Self {
         let rpc = Arc::new(rpc);
         let ssri = Arc::new(ssri);
@@ -251,7 +240,7 @@ where
         &mut self.workers
     }
 
-    pub fn worker_cmds(&self) -> Option<Arc<Mutex<Vec<WorkerCommand>>>> {
+    pub fn worker_cmds(&self) -> Option<Arc<WorkerCommands>> {
         self.worker_cmds.clone()
     }
 
@@ -298,12 +287,9 @@ where
             return;
         };
         // Fail closed on poisoned queue (P2-10).
-        let mut batch = match cmds.lock() {
-            Ok(mut g) => std::mem::take(&mut *g),
-            Err(_) => {
-                tracing::error!(target: LOG_TARGET, event = "worker_cmds.poisoned");
-                return;
-            }
+        let Some(mut batch) = cmds.drain() else {
+            tracing::error!(target: LOG_TARGET, event = "worker_cmds.poisoned");
+            return;
         };
         // Only the latest registry request for an identity represents desired state.
         let mut seen = HashSet::new();
@@ -371,18 +357,20 @@ where
             }
         }
         if !requeue.is_empty() {
-            if let Some(q) = &self.worker_cmds {
-                // Recover deferred Deletes even if the mutex was poisoned (P2-8).
-                let mut g = q.lock().unwrap_or_else(|e| e.into_inner());
-                requeue.retain(|old| !g.iter().any(|new| new.identity() == old.identity()));
-                g.extend(requeue);
-            }
+            cmds.requeue(requeue);
         }
     }
 
-    fn sync_busy_map(&self) {
+    fn sync_pending_processes(&self) {
+        if self.busy.is_none() && self.worker_cmds.is_none() {
+            return;
+        }
+        let pending = self.workers.pending_hashes();
+        if let Some(commands) = &self.worker_cmds {
+            commands.set_pending(&pending);
+        }
         if let Some(busy) = &self.busy {
-            busy.set_pending(self.workers.pending_hashes());
+            busy.set_pending(pending);
         }
     }
 
@@ -439,6 +427,7 @@ where
         let mut report = TickReport::default();
         let tip = self.refresh_tip();
         self.reconcile_pending(tip);
+        self.sync_pending_processes();
 
         let resolved = match self.refresh_cell_deps() {
             Ok(deps) => deps,
@@ -451,7 +440,6 @@ where
                 report.last_error = Some(format!("code deps: {e}"));
                 self.clear_worker_tick_code();
                 self.tick_cell_deps.clear();
-                self.sync_busy_map();
                 return report;
             }
         };
@@ -468,12 +456,22 @@ where
 
         self.refresh_worker_process_code();
 
-        let scan_ids: Vec<([u8; 32], ScriptHashType)> = self
-            .config
-            .scan_lock_identities()
-            .into_iter()
+        let mut cid_locks = self.config.scan_lock_identities();
+        let scan_ids: Vec<([u8; 32], ScriptHashType)> = cid_locks
+            .iter()
             .map(|id| (id.code_hash, id.hash_type))
             .collect();
+        if let Some(hash) = resolved.cid_lock_data_hash {
+            cid_locks.extend(
+                [
+                    ScriptHashType::Data,
+                    ScriptHashType::Data1,
+                    ScriptHashType::Data2,
+                ]
+                .map(|hash_type| CidLockIdentity::new(hash, hash_type)),
+            );
+        }
+        self.tick_cid_locks = cid_locks.into();
         let scanned = match scan_intentions_multi(self.rpc.as_ref(), &scan_ids) {
             Ok(v) => v,
             Err(RpcError::Unavailable(m)) => {
@@ -485,7 +483,6 @@ where
                 report.last_error = Some(format!("scan unavailable: {m}"));
                 self.tick_cell_deps.clear();
                 self.clear_worker_tick_code();
-                self.sync_busy_map();
                 return report;
             }
             Err(e) => {
@@ -497,7 +494,6 @@ where
                 report.last_error = Some(format!("scan error: {e}"));
                 self.tick_cell_deps.clear();
                 self.clear_worker_tick_code();
-                self.sync_busy_map();
                 return report;
             }
         };
@@ -509,6 +505,16 @@ where
             .map(|i| out_point_key(&i.out_point))
             .collect();
 
+        let scan_number = self.scan_number;
+        self.scan_number = self.scan_number.wrapping_add(1);
+        let arrivals = Arc::new(if scan_number == 0 {
+            HashSet::new()
+        } else {
+            live_keys
+                .difference(&self.previous_live_keys)
+                .cloned()
+                .collect()
+        });
         self.workers.for_each_mut(|w| {
             w.with_state_mut(|state| {
                 let pending_occupied = state.submit.pending_occupied_keys();
@@ -516,218 +522,133 @@ where
                     (live_keys.contains(k) || pending_occupied.contains(k))
                         && !state.submit.rejected.contains(k)
                 });
-                // Keep marks while a refund is in-flight (pending occupied) so a
-                // Drop/reorg can still take the below-min refund_only path.
                 state
-                    .pending_incompatible_refund
-                    .retain(|k| live_keys.contains(k) || pending_occupied.contains(k));
+                    .refund_state_deps
+                    .retain(|hash, _| state.submit.pending.contains_key(hash));
+                state.probe_budget = Some(process_batch::ProbeBudget::for_scan(
+                    scan_number,
+                    arrivals.clone(),
+                ));
             });
         });
 
-        let queued_updates: HashSet<_> = self
-            .worker_cmds
-            .as_ref()
-            .and_then(|cmds| cmds.lock().ok())
-            .map(|cmds| cmds.iter().map(WorkerCommand::identity).collect())
-            .unwrap_or_default();
-        let mut eligible = Vec::new();
-        for i in scanned {
-            if queued_updates.contains(&i.args.process_type_hash) {
-                report.skipped += 1;
-                continue;
-            }
-            if self.workers.get(&i.args.process_type_hash).is_none() {
-                report.skipped += 1;
-                tracing::debug!(
-                    target: LOG_TARGET,
-                    event = "process.unregistered",
-                    process_type_hash = %hex_pref(&i.args.process_type_hash),
-                );
-                continue;
-            }
-            let k = out_point_key(&i.out_point);
-            let blocked = self
-                .workers
-                .get(&i.args.process_type_hash)
-                .expect("checked")
-                .with_state(|w| w.submit.in_flight.contains(&k) || w.submit.rejected.contains(&k));
-            if blocked {
-                continue;
-            }
-            eligible.push(i);
-        }
-
-        let buckets = bucket_by_process_type_hash(&eligible);
-        // Multi-round only for reject-isolate expansions. Transient Continue /
-        // Conflict wait for the next tick (same as pre-async semantics).
-        for _round in 0..64 {
-            let mut started = false;
-            for (hash, bucket) in &buckets {
-                let was_out = self
-                    .workers
-                    .get(hash)
-                    .is_some_and(|w| w.batch_outstanding());
-                if was_out {
-                    continue;
-                }
-                self.process_bucket(*hash, bucket.clone(), &mut report);
+        self.previous_live_keys = live_keys;
+        let buckets = bucket_by_process_type_hash(scanned, &self.config.cid_code_hash);
+        report.skipped +=
+            report.scanned - buckets.iter().map(|(_, cells)| cells.len()).sum::<usize>();
+        let mut buckets: Vec<_> = buckets
+            .into_iter()
+            .filter_map(|(hash, mut bucket)| {
+                let Some(worker) = self.workers.get(&hash) else {
+                    tracing::warn!(target: LOG_TARGET, event = "process.unregistered",
+                        process_type_hash = %hex_pref(&hash), count = bucket.len());
+                    report.skipped += bucket.len();
+                    return None;
+                };
                 if self
-                    .workers
-                    .get(hash)
-                    .is_some_and(|w| w.batch_outstanding())
+                    .worker_cmds
+                    .as_ref()
+                    .is_some_and(|cmds| cmds.has_update(hash))
                 {
-                    started = true;
+                    report.skipped += bucket.len();
+                    return None;
+                }
+                worker.with_state(|state| {
+                    let pending = state.submit.pending_occupied_keys();
+                    bucket.retain(|item| {
+                        let key = out_point_key(&item.out_point);
+                        !pending.contains(&key)
+                            && !state.submit.in_flight.contains(&key)
+                            && !state.submit.rejected.contains(&key)
+                    });
+                });
+                if bucket.is_empty() {
+                    return None;
+                }
+                self.prepare_bucket(hash, bucket, &mut report)
+            })
+            .collect();
+        let mut searches: HashMap<_, _> = buckets
+            .iter_mut()
+            .filter(|bucket| !bucket.accepted.is_empty())
+            .map(|bucket| {
+                (
+                    bucket.process.type_hash,
+                    std::mem::take(&mut bucket.accepted),
+                )
+            })
+            .collect();
+
+        // The priority survives ticks where the indexer cannot locate the
+        // released Process state or a fresh filter pass cannot finish.
+        for bucket in &mut buckets {
+            let Some(worker) = self.workers.get(&bucket.process.type_hash) else {
+                continue;
+            };
+            if !worker.with_state(|state| state.refund_priority == RefundPriority::Ready) {
+                continue;
+            }
+            if bucket.refunds.is_empty() {
+                worker.with_state_mut(|state| state.refund_priority = RefundPriority::None);
+            } else {
+                self.dispatch_filter_refunds(bucket, &mut report);
+            }
+        }
+        self.wait_all_batches(&mut report, &mut searches);
+
+        // Give each Process one worker job per round, then handle its result.
+        for _ in 0..64 {
+            let mut started = false;
+            for bucket in &buckets {
+                let hash = &bucket.process.type_hash;
+                let Some(worker) = self.workers.get(hash) else {
+                    continue;
+                };
+                if let Some(items) = searches.remove(hash) {
+                    self.process_bucket(&bucket.process, items, &mut report);
+                    started |= worker.batch_outstanding();
                 }
             }
-            let more = self.wait_all_batches(&mut report);
-            if !started || !more {
+            if !started {
                 break;
             }
+            self.wait_all_batches(&mut report, &mut searches);
         }
 
+        for bucket in &mut buckets {
+            self.dispatch_filter_refunds(bucket, &mut report);
+        }
+        self.wait_all_batches(&mut report, &mut searches);
+
+        self.workers.for_each_mut(|worker| {
+            worker.with_state_mut(|state| state.probe_budget = None);
+        });
         self.tick_cell_deps.clear();
         self.clear_worker_tick_code();
-        self.sync_busy_map();
+        self.sync_pending_processes();
         report
     }
 
-    /// Sync Rejected/CachedRejected stack frames: drop_first(+rest) then shrink.
-    /// Returns frames in push order (shrink is last / popped first) and skipped.
-    fn reject_isolate_frames(
-        window: &[ScannedIntention],
-        rest: &[ScannedIntention],
-        min: u32,
-    ) -> (Vec<Vec<ScannedIntention>>, usize) {
-        let mut drop_first = window[1..].to_vec();
-        drop_first.extend_from_slice(rest);
-        let mut frames = Vec::new();
-        let mut skipped = 0usize;
-        if window.len() > min as usize {
-            if !drop_first.is_empty() {
-                frames.push(drop_first);
-            }
-            frames.push(window[..window.len() - 1].to_vec());
-        } else {
-            skipped = 1;
-            if !drop_first.is_empty() {
-                frames.push(drop_first);
-            }
+    fn dispatch_filter_refunds(&self, bucket: &mut FilteredBucket, report: &mut TickReport) {
+        if !bucket.refunds.is_empty() {
+            self.dispatch_process_batch(
+                bucket.process.type_hash,
+                &bucket.process,
+                std::mem::take(&mut bucket.refunds),
+                Vec::new(),
+                1,
+                report,
+                BatchMode::FilterRefund,
+            );
         }
-        (frames, skipped)
     }
 
-    /// Remove fee-unaffordable / pending-incompatible cells from isolate frames
-    /// so a sibling Rejected identity cannot shrink them away (P3).
-    fn strip_pending_incompatible_refund(
-        worker: &crate::workers::ProcessWorker,
-        window: &[ScannedIntention],
-        rest: &[ScannedIntention],
-    ) -> (Vec<ScannedIntention>, Vec<ScannedIntention>) {
-        worker.with_state(|s| {
-            let keep = |i: &ScannedIntention| {
-                !s.pending_incompatible_refund
-                    .contains(&out_point_key(&i.out_point))
-            };
-            (
-                window.iter().filter(|i| keep(i)).cloned().collect(),
-                rest.iter().filter(|i| keep(i)).cloned().collect(),
-            )
-        })
-    }
-
-    fn apply_polled_batch(
-        worker: &crate::workers::ProcessWorker,
+    /// Block until every outstanding RunBatch has an ack.
+    fn wait_all_batches(
+        &mut self,
         report: &mut TickReport,
-        polled: crate::workers::PolledBatch,
-    ) -> bool {
-        Self::apply_batch_report(report, &polled.delta);
-        let mut continue_round = false;
-        match polled.outcome {
-            BatchOutcome::Submitted | BatchOutcome::SubmittedProcess => {
-                // Keep leftover isolate_pending frames saved on ProcessOccupied.
-                let has_pending = worker.with_state(|s| !s.isolate_pending.is_empty());
-                continue_round = has_pending;
-                worker.with_state_mut(|state| {
-                    if let Some(r) = polled.resume_on_continue {
-                        state.isolate_resume = Some(r);
-                    } else if !has_pending {
-                        state.isolate_resume = None;
-                        state.isolate_expanded.clear();
-                    }
-                });
-            }
-            BatchOutcome::Rejected | BatchOutcome::CachedRejected => {
-                if polled.refund_only {
-                    // Permanent refund_only failure is combo-cached in process_batch;
-                    // never isolate-split below-min leftovers (P3).
-                    continue_round = worker.with_state(|s| !s.isolate_pending.is_empty());
-                } else {
-                    // P0: apply sync drop_first + shrink — strip fee-unaffordable
-                    // pending cells so they are not shrunk away (P3).
-                    let (iso_window, iso_rest) = Self::strip_pending_incompatible_refund(
-                        worker,
-                        &polled.window,
-                        &polled.rest,
-                    );
-                    if iso_window.is_empty() {
-                        continue_round = worker.with_state(|s| !s.isolate_pending.is_empty());
-                        if let Some(r) = polled.resume_on_continue {
-                            worker.with_state_mut(|state| {
-                                state.isolate_resume = Some(r);
-                            });
-                        }
-                    } else {
-                        let (frames, skipped) =
-                            Self::reject_isolate_frames(&iso_window, &iso_rest, polled.min);
-                        report.skipped += skipped;
-                        continue_round = true;
-                        worker.with_state_mut(|state| {
-                            state.isolate_expanded.insert(polled.window_fp);
-                            state.isolate_pending.extend(frames);
-                        });
-                    }
-                }
-            }
-            BatchOutcome::RetryLater => {
-                // Fee-unaffordable (etc.): no isolate split; keep draining any
-                // leftover isolate_pending frames this tick (P3).
-                continue_round = worker.with_state(|s| !s.isolate_pending.is_empty());
-                if let Some(r) = polled.resume_on_continue {
-                    worker.with_state_mut(|state| {
-                        state.isolate_resume = Some(r);
-                    });
-                }
-            }
-            BatchOutcome::Continue => {
-                if polled.refund_only {
-                    // Cached / permanent refund_only soft-skip must not re-enter
-                    // isolate rounds (would burn up to 64 RunBatch/tick).
-                } else if polled.delta.conflicts == 0
-                    && polled.delta.last_error.is_none()
-                    && polled.delta.skipped > 0
-                {
-                    // Unbuildable / soft skip: advance past window and keep isolating.
-                    // Conflict / submit failure set last_error or conflicts — next tick.
-                    continue_round = true;
-                    worker.with_state_mut(|state| {
-                        if let Some(r) = polled.resume_on_continue {
-                            state.isolate_resume = Some(r);
-                        } else {
-                            state.isolate_resume = None;
-                            state.isolate_expanded.clear();
-                        }
-                    });
-                }
-            }
-            BatchOutcome::ProcessOccupied => {}
-        }
-        continue_round
-    }
-
-    /// Block until every outstanding RunBatch has an ack — never invent outcomes.
-    /// Returns true when isolate should run another round this tick.
-    fn wait_all_batches(&mut self, report: &mut TickReport) -> bool {
-        let mut more = false;
+        searches: &mut HashMap<[u8; 32], Vec<ScannedIntention>>,
+    ) {
         loop {
             let mut any_outstanding = false;
             for hash in self.workers.hashes() {
@@ -735,21 +656,29 @@ where
                     continue;
                 };
                 if let Some(polled) = worker.try_poll_batch() {
-                    if matches!(
-                        polled.outcome,
-                        BatchOutcome::Submitted | BatchOutcome::SubmittedProcess
-                    ) {
-                        self.sync_busy_map();
+                    if let Some(busy) = &self.busy {
+                        busy.update_process(
+                            hash,
+                            worker.with_state(|state| !state.submit.pending.is_empty()),
+                        );
                     }
-                    if Self::apply_polled_batch(worker, report, polled) {
-                        more = true;
+                    Self::apply_batch_report(report, &polled.delta);
+                    if polled.mode == BatchMode::Assemble
+                        && !polled.rest.is_empty()
+                        && (polled.outcome == BatchOutcome::Submitted
+                            || (polled.outcome == BatchOutcome::Continue
+                                && polled.delta.conflicts == 0
+                                && polled.delta.last_error.is_none()
+                                && polled.delta.skipped > 0))
+                    {
+                        searches.insert(hash, polled.rest.to_vec());
                     }
                 } else if worker.batch_outstanding() {
                     any_outstanding = true;
                 }
             }
             if !any_outstanding {
-                return more;
+                return;
             }
             thread::sleep(Duration::from_micros(100));
         }
@@ -800,6 +729,7 @@ where
             return Ok(crate::code_deps::ResolvedExecutionDeps {
                 cell_deps: self.config.extra_cell_deps.clone(),
                 process_code: None,
+                cid_lock_data_hash: None,
                 type_id_outpoints: Vec::new(),
             });
         }
@@ -836,8 +766,42 @@ where
                     }
                 };
                 let tx_hex = hex_pref(tx_hash.as_slice());
-                match self.rpc.get_transaction_status(&tx_hash) {
-                    Ok(TxStatus::Dropped) => {
+                let status = self.rpc.get_transaction_status(&tx_hash);
+                if let Some(worker) = self.workers.get(&process_hash) {
+                    worker.with_state_mut(|state| {
+                        if let Some(pending) = state.submit.pending.get_mut(&hash_bytes) {
+                            pending.currently_committed = false;
+                            if let Ok(TxStatus::Committed { block_number, .. }) = status {
+                                if !pending.seen_committed {
+                                    pending.seen_committed = true;
+                                    tracing::info!(
+                                        target: LOG_TARGET,
+                                        event = "pending.committed",
+                                        tx_hash = %tx_hex,
+                                        block_number,
+                                    );
+                                }
+                            }
+                        }
+                    });
+                }
+                match status {
+                    Ok(TxStatus::Unknown | TxStatus::Rejected)
+                        if self.workers.get(&process_hash).is_some_and(|worker| {
+                            worker.with_state(|state| {
+                                state
+                                    .submit
+                                    .pending
+                                    .get(&hash_bytes)
+                                    .and_then(|tx| tx.admission_deadline)
+                                    .is_some_and(|deadline| Instant::now() < deadline)
+                            })
+                        }) =>
+                    {
+                        tracing::debug!(target: LOG_TARGET, event = "pending.admission_unconfirmed",
+                            tx_hash = %tx_hex);
+                    }
+                    Ok(TxStatus::Unknown | TxStatus::Rejected | TxStatus::Dropped) => {
                         let Some(worker) = self.workers.get(&process_hash) else {
                             continue;
                         };
@@ -864,28 +828,21 @@ where
                         }
                         worker.with_state_mut(|state| {
                             if let Some(p) = state.submit.pending.remove(&hash_bytes) {
+                                if state.refund_priority.is_awaiting(&tx_hash) {
+                                    state.refund_priority = RefundPriority::Ready;
+                                } else if !state.refund_state_deps.contains_key(&hash_bytes) {
+                                    state.refund_priority.grant();
+                                }
                                 for k in p.consumed {
                                     state.submit.in_flight.remove(&k);
                                 }
                             }
                         });
                     }
-                    Ok(TxStatus::Committed { block_number }) => {
-                        if let Some(worker) = self.workers.get(&process_hash) {
-                            worker.with_state_mut(|state| {
-                                if let Some(p) = state.submit.pending.get_mut(&hash_bytes) {
-                                    if !p.seen_committed {
-                                        p.seen_committed = true;
-                                        tracing::info!(
-                                            target: LOG_TARGET,
-                                            event = "pending.committed",
-                                            tx_hash = %tx_hex,
-                                            block_number,
-                                        );
-                                    }
-                                }
-                            });
-                        }
+                    Ok(TxStatus::Committed {
+                        block_number,
+                        block_hash,
+                    }) => {
                         let start_tip = tip;
                         let Some(fresh_tip) = self.refresh_tip_only() else {
                             continue;
@@ -916,7 +873,33 @@ where
                             );
                             continue;
                         }
+                        match self.rpc.get_block_hash(block_number) {
+                            Ok(Some(canonical_hash)) if canonical_hash == block_hash => {}
+                            Ok(_) => {
+                                tracing::warn!(target: LOG_TARGET, event = "pending.noncanonical",
+                                    tx_hash = %tx_hex, block_number);
+                                continue;
+                            }
+                            Err(error) => {
+                                tracing::warn!(target: LOG_TARGET, event = "pending.block_lookup",
+                                    tx_hash = %tx_hex, block_number, %error);
+                                continue;
+                            }
+                        }
                         let confirmations = confirmation_count(fresh_tip, block_number);
+                        worker.with_state_mut(|state| {
+                            state.refund_priority.confirm_admission(&tx_hash);
+                            if confirmations >= depth {
+                                state.submit.pending.remove(&hash_bytes);
+                                if !state.refund_state_deps.contains_key(&hash_bytes) {
+                                    state.refund_priority.grant();
+                                }
+                            } else if let Some(pending) = state.submit.pending.get_mut(&hash_bytes)
+                            {
+                                pending.currently_committed = true;
+                                pending.admission_deadline = None;
+                            }
+                        });
                         if confirmations >= depth {
                             tracing::info!(
                                 target: LOG_TARGET,
@@ -925,9 +908,6 @@ where
                                 confirmations,
                                 depth,
                             );
-                            worker.with_state_mut(|state| {
-                                state.submit.pending.remove(&hash_bytes);
-                            });
                         } else {
                             tracing::debug!(
                                 target: LOG_TARGET,
@@ -940,7 +920,16 @@ where
                             );
                         }
                     }
-                    Ok(TxStatus::Pending) => {}
+                    Ok(TxStatus::Pending) => {
+                        if let Some(worker) = self.workers.get(&process_hash) {
+                            worker.with_state_mut(|state| {
+                                state.refund_priority.confirm_admission(&tx_hash);
+                                if let Some(pending) = state.submit.pending.get_mut(&hash_bytes) {
+                                    pending.admission_deadline = None;
+                                }
+                            });
+                        }
+                    }
                     Err(e) => {
                         tracing::warn!(
                             target: LOG_TARGET,
@@ -981,66 +970,137 @@ where
         }
     }
 
-    fn process_bucket(
-        &mut self,
+    fn process_is_healthy(&self, process: &ResolvedProcess) -> bool {
+        self.workers
+            .get(&process.type_hash)
+            .is_some_and(|worker| worker.with_state(|state| !state.is_process_quarantined(process)))
+    }
+
+    fn prepare_bucket(
+        &self,
         hash: [u8; 32],
-        bucket: Vec<ScannedIntention>,
+        mut bucket: Vec<ScannedIntention>,
         report: &mut TickReport,
-    ) {
-        if bucket.is_empty() {
-            return;
-        }
-        if self.workers.get(&hash).is_none() {
-            report.skipped += bucket.len();
-            return;
-        }
-
-        // Collect async RunBatch outcomes without blocking other Processes (P1).
-        if let Some(worker) = self.workers.get(&hash) {
-            if let Some(polled) = worker.try_poll_batch() {
-                if matches!(
-                    polled.outcome,
-                    BatchOutcome::Submitted | BatchOutcome::SubmittedProcess
-                ) {
-                    self.sync_busy_map();
-                }
-                let outcome = polled.outcome;
-                Self::apply_polled_batch(worker, report, polled);
-                if matches!(outcome, BatchOutcome::SubmittedProcess) {
-                    return;
-                }
-            }
-            if worker.batch_outstanding() {
-                return;
-            }
-        }
-
-        let process = {
-            let worker = self.workers.get(&hash).expect("exists");
-            match worker.with_state_mut(|state| state.resolver.resolve(self.rpc.as_ref(), &hash)) {
-                Ok(Some(p)) => p,
-                Ok(None) => {
-                    tracing::warn!(
-                        target: LOG_TARGET,
-                        event = "process.resolve_miss",
-                        process_type_hash = %hex_pref(&hash),
-                    );
-                    report.skipped += bucket.len();
-                    return;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        target: LOG_TARGET,
-                        event = "process.resolve_miss",
-                        process_type_hash = %hex_pref(&hash),
-                        error = %e,
-                    );
-                    report.skipped += bucket.len();
-                    return;
-                }
+    ) -> Option<FilteredBucket> {
+        let worker = self.workers.get(&hash)?;
+        let cid = CidLockIdentity::new(self.config.cid_code_hash, self.config.hash_type);
+        let process = match worker
+            .with_state_mut(|state| state.resolver.resolve(self.rpc.as_ref(), &hash, cid))
+        {
+            Ok(Some(process)) => process,
+            result => {
+                tracing::warn!(target: LOG_TARGET, event = "process.resolve_miss",
+                    process_type_hash = %hex_pref(&hash), error = ?result.err());
+                report.skipped += bucket.len();
+                return None;
             }
         };
+        if !self.process_is_healthy(&process) {
+            report.skipped += bucket.len();
+            return None;
+        }
+        bucket.retain(|item| {
+            if !item.has_supported_user_lock() {
+                tracing::warn!(target: LOG_TARGET, event = "scan.unsupported_user_lock",
+                    out_point = ?item.out_point, hash_type = item.args.entry.user_lock.hash_type);
+                report.skipped += 1;
+                return false;
+            }
+            match item.belongs_to_process(&cid.code_hash, &process.type_hash) {
+                Ok(()) => true,
+                Err(reason) => {
+                    tracing::warn!(target: LOG_TARGET, event = "scan.unroutable",
+                    out_point = ?item.out_point, ?reason);
+                    report.skipped += 1;
+                    false
+                }
+            }
+        });
 
+        let mut accepted = Vec::new();
+        let mut refunds = Vec::new();
+        match filter_intentions(self.ssri.as_ref(), &process.binary, &bucket) {
+            Ok(reasons) => {
+                for (item, reason) in bucket.into_iter().zip(reasons) {
+                    match reason {
+                        Some(FILTER_ACCEPTED) => accepted.push(item),
+                        Some(
+                            reason @ (FILTER_UNSUPPORTED_ASSET
+                            | FILTER_DEPOSIT_BELOW_MINIMUM
+                            | FILTER_MALFORMED_DIGEST
+                            | FILTER_UNSUPPORTED_ACTION),
+                        ) => {
+                            tracing::info!(target: LOG_TARGET, event = "ssri.filter_refund",
+                                process_type_hash = %hex_pref(&hash), out_point = ?item.out_point, reason);
+                            refunds.push(item);
+                        }
+                        Some(reason) => {
+                            // Reason 1 reports a failure to decode the packed cell output.
+                            tracing::warn!(target: LOG_TARGET, event = "ssri.filter_protocol_error",
+                                process_type_hash = %hex_pref(&hash), out_point = ?item.out_point,
+                                reason);
+                            report.skipped += 1;
+                        }
+                        None => {
+                            tracing::warn!(target: LOG_TARGET, event = "ssri.filter_cell_too_large",
+                                process_type_hash = %hex_pref(&hash), out_point = ?item.out_point);
+                            report.skipped += 1;
+                        }
+                    }
+                }
+            }
+            Err(SsriError::MethodNotFound) => {
+                worker.with_state_mut(|state| {
+                    if !state.filter_missing_logged {
+                        tracing::warn!(target: LOG_TARGET, event = "ssri.filter_missing",
+                            process_type_hash = %hex_pref(&hash));
+                        state.filter_missing_logged = true;
+                    }
+                });
+                report.skipped += bucket.len();
+                report.last_error = Some("Process.filter is missing".into());
+                return None;
+            }
+            Err(error) => {
+                tracing::warn!(target: LOG_TARGET, event = "ssri.filter_failed",
+                    process_type_hash = %hex_pref(&hash), %error);
+                report.skipped += bucket.len();
+                report.last_error = Some(format!("Process.filter: {error}"));
+                return None;
+            }
+        }
+
+        Some(FilteredBucket {
+            process,
+            accepted,
+            refunds,
+        })
+    }
+
+    fn process_bucket(
+        &self,
+        process: &ResolvedProcess,
+        mut items: Vec<ScannedIntention>,
+        report: &mut TickReport,
+    ) {
+        let hash = process.type_hash;
+        let Some(worker) = self.workers.get(&hash) else {
+            return;
+        };
+        let paused = worker.with_state(|state| {
+            state.is_process_unfunded(process)
+                || state.is_process_quarantined(process)
+                || state
+                    .probe_budget
+                    .as_ref()
+                    .expect("tick probe budget")
+                    .remaining
+                    == 0
+        });
+        if paused {
+            report.skipped += items.len();
+            return;
+        }
         let (min, max) = match self.ssri.get_batch_bounds(&process.binary) {
             Ok(b) => b,
             Err(e) => {
@@ -1050,7 +1110,7 @@ where
                     reason = "batch_bounds",
                     error = %e,
                 );
-                report.skipped += bucket.len();
+                report.skipped += items.len();
                 return;
             }
         };
@@ -1062,254 +1122,43 @@ where
                 min,
                 max,
             );
-            report.skipped += bucket.len();
+            report.skipped += items.len();
             return;
         }
 
-        const MAX_ATTEMPTS: u32 = 64;
-        let mut attempts = 0u32;
-        if let Some(worker) = self.workers.get(&hash) {
-            worker.with_state_mut(|state| {
-                if state.isolate_resume.is_none() {
-                    state.isolate_expanded.clear();
-                }
+        worker.with_state(|state| {
+            items.retain(|item| {
+                !state
+                    .submit
+                    .in_flight
+                    .contains(&out_point_key(&item.out_point))
             });
+        });
+        let mut locks = HashSet::new();
+        let mut window = Vec::new();
+        let mut rest = Vec::new();
+        for item in &items {
+            if window.len() < max as usize && locks.insert(item.lock_group_key()) {
+                window.push(item.clone());
+            } else {
+                rest.push(item.clone());
+            }
         }
-        let resume_key = self
-            .workers
-            .get(&hash)
-            .and_then(|w| w.with_state(|s| s.isolate_resume.clone()));
-        let bucket = Self::rotate_bucket(bucket, resume_key.as_ref());
-        let resume = self.isolate_window(
-            hash,
-            &process,
-            bucket,
-            min,
-            max,
-            report,
-            &mut attempts,
-            MAX_ATTEMPTS,
-        );
-        if let Some(worker) = self.workers.get(&hash) {
-            worker.with_state_mut(|state| {
-                if let Some(k) = resume {
-                    state.isolate_resume = Some(k);
-                } else {
-                    state.isolate_resume = None;
-                    state.isolate_expanded.clear();
-                }
-            });
+        if window.len() < min as usize {
+            report.skipped += window.len() + rest.len();
+            return;
         }
-    }
 
-    #[allow(clippy::too_many_arguments)]
-    fn isolate_window(
-        &mut self,
-        hash: [u8; 32],
-        process: &ResolvedProcess,
-        items: Vec<ScannedIntention>,
-        min: u32,
-        max: u32,
-        report: &mut TickReport,
-        attempts: &mut u32,
-        max_attempts: u32,
-    ) -> Option<Vec<u8>> {
-        const MAX_CACHED_SPLITS: u32 = 256;
-        let mut cached_splits = 0u32;
-        // Prefer async Rejected frames (drop_first + shrink) over re-walking the
-        // bucket via `already` (P0).
-        let mut stack = self
-            .workers
-            .get(&hash)
-            .map(|w| {
-                w.with_state_mut(|s| {
-                    if s.isolate_pending.is_empty() {
-                        Vec::new()
-                    } else {
-                        std::mem::take(&mut s.isolate_pending)
-                    }
-                })
-            })
-            .unwrap_or_default();
-        if stack.is_empty() {
-            stack.push(items);
-        }
-        while let Some(items) = stack.pop() {
-            let items: Vec<ScannedIntention> = items
-                .into_iter()
-                .filter(|i| {
-                    self.workers
-                        .get(&hash)
-                        .map(|w| {
-                            w.with_state(|s| {
-                                !s.submit.in_flight.contains(&out_point_key(&i.out_point))
-                            })
-                        })
-                        .unwrap_or(true)
-                })
-                .collect();
-            let (items, refund_only) = if items.len() < min as usize {
-                let (pending_items, non_pending): (Vec<_>, Vec<_>) = self
-                    .workers
-                    .get(&hash)
-                    .map(|w| {
-                        w.with_state(|s| {
-                            items.iter().cloned().partition(|i| {
-                                s.pending_incompatible_refund
-                                    .contains(&out_point_key(&i.out_point))
-                            })
-                        })
-                    })
-                    .unwrap_or_else(|| (Vec::new(), items));
-                report.skipped += non_pending.len();
-                if pending_items.is_empty() {
-                    continue;
-                }
-                (pending_items, true)
-            } else {
-                (items, false)
-            };
-            let n = items.len().min(max as usize);
-            let window = items[..n].to_vec();
-            let rest = items[n..].to_vec();
-            // refund_only rejects cache with process=None; probe that fingerprint
-            // before dispatch so we soft-skip without RunBatch / isolate_windows.
-            if refund_only && self.refund_combo_cached(&hash, &window, process) {
-                tracing::debug!(
-                    target: LOG_TARGET,
-                    event = "submit.rejected_combo",
-                    path = "refund_only",
-                    n = window.len(),
-                );
-                report.skipped += window.len();
-                if !rest.is_empty() {
-                    stack.push(rest);
-                }
-                continue;
-            }
-            report.isolate_windows += 1;
-            let fp = self.window_fingerprint(&window, process);
-            let already = !refund_only
-                && self
-                    .workers
-                    .get(&hash)
-                    .map(|w| w.with_state(|s| s.isolate_expanded.contains(&fp)))
-                    .unwrap_or(false);
-            if already {
-                // Already expanded once this sweep — do not re-push drop_first/
-                // shrink (diamond explosion). Async Rejected queues frames via
-                // isolate_pending at poll time instead of relying on this arm.
-                continue;
-            }
-            let cached = !refund_only && self.window_combo_cached(&hash, &window, process);
-            let outcome = if cached {
-                tracing::debug!(
-                    target: LOG_TARGET,
-                    event = "submit.rejected_combo",
-                    n = window.len(),
-                );
-                BatchOutcome::CachedRejected
-            } else {
-                if *attempts >= max_attempts {
-                    tracing::warn!(
-                        target: LOG_TARGET,
-                        event = "tick.skip",
-                        reason = "reject_isolate_budget",
-                        attempts,
-                    );
-                    report.skipped += items.len();
-                    for leftover in stack.drain(..) {
-                        report.skipped += leftover.len();
-                    }
-                    return items.first().map(|i| out_point_key(&i.out_point));
-                }
-                let resume_on_continue = rest.first().map(|i| out_point_key(&i.out_point));
-                let outcome = self.dispatch_process_batch(
-                    hash,
-                    process,
-                    window.clone(),
-                    rest.clone(),
-                    min,
-                    resume_on_continue,
-                    report,
-                    refund_only,
-                );
-                if !matches!(outcome, BatchOutcome::CachedRejected) {
-                    *attempts += 1;
-                }
-                outcome
-            };
-            if matches!(outcome, BatchOutcome::CachedRejected) {
-                if cached_splits >= MAX_CACHED_SPLITS {
-                    tracing::warn!(
-                        target: LOG_TARGET,
-                        event = "tick.skip",
-                        reason = "cached_split_budget",
-                        cached_splits,
-                    );
-                    report.skipped += items.len();
-                    for leftover in stack.drain(..) {
-                        report.skipped += leftover.len();
-                    }
-                    return items.first().map(|i| out_point_key(&i.out_point));
-                }
-                cached_splits += 1;
-            }
-            match outcome {
-                BatchOutcome::SubmittedProcess => {
-                    let resume = rest
-                        .first()
-                        .or_else(|| stack.iter().find_map(|s| s.first()))
-                        .map(|i| out_point_key(&i.out_point));
-                    report.skipped += rest.len();
-                    for leftover in stack.drain(..) {
-                        report.skipped += leftover.len();
-                    }
-                    return resume;
-                }
-                BatchOutcome::ProcessOccupied => {
-                    // Preserve unprocessed frames for the next round after poll.
-                    if let Some(w) = self.workers.get(&hash) {
-                        if !stack.is_empty() {
-                            w.with_state_mut(|state| {
-                                state.isolate_pending.append(&mut stack);
-                            });
-                        }
-                    }
-                    // Resume at this window after poll (do not skip to `rest`).
-                    return items.first().map(|i| out_point_key(&i.out_point));
-                }
-                BatchOutcome::Submitted | BatchOutcome::Continue | BatchOutcome::RetryLater => {
-                    if !rest.is_empty() {
-                        stack.push(rest);
-                    }
-                }
-                BatchOutcome::Rejected | BatchOutcome::CachedRejected => {
-                    if refund_only {
-                        // Should be rare (process_batch maps these to Continue);
-                        // never isolate-split below-min refund leftovers.
-                        if !rest.is_empty() {
-                            stack.push(rest);
-                        }
-                    } else if let Some(w) = self.workers.get(&hash) {
-                        let (iso_window, iso_rest) =
-                            Self::strip_pending_incompatible_refund(w, &window, &rest);
-                        if iso_window.is_empty() {
-                            if !rest.is_empty() {
-                                // rest may still hold pending cells — keep for scan.
-                            }
-                        } else {
-                            w.with_state_mut(|state| state.isolate_expanded.insert(fp));
-                            let (frames, skipped) =
-                                Self::reject_isolate_frames(&iso_window, &iso_rest, min);
-                            report.skipped += skipped;
-                            stack.extend(frames);
-                        }
-                    }
-                }
-            }
-        }
-        None
+        report.isolate_windows += 1;
+        self.dispatch_process_batch(
+            hash,
+            process,
+            window,
+            rest,
+            min,
+            report,
+            BatchMode::Assemble,
+        );
     }
 
     fn batch_code_key(&self, process: &ResolvedProcess) -> Vec<u8> {
@@ -1318,66 +1167,6 @@ where
             key.extend_from_slice(cell.out_point.as_slice());
         }
         key
-    }
-
-    fn window_fingerprint(&self, batch: &[ScannedIntention], process: &ResolvedProcess) -> Vec<u8> {
-        let ops: Vec<_> = batch.iter().map(|i| i.out_point.clone()).collect();
-        combo_fingerprint(
-            &ops,
-            Some(&process.live_cell.out_point),
-            &self.batch_code_key(process),
-        )
-    }
-
-    fn rotate_bucket(
-        bucket: Vec<ScannedIntention>,
-        resume: Option<&Vec<u8>>,
-    ) -> Vec<ScannedIntention> {
-        let Some(key) = resume else {
-            return bucket;
-        };
-        match bucket
-            .iter()
-            .position(|i| out_point_key(&i.out_point) == *key)
-        {
-            Some(i) if i > 0 => {
-                let mut rotated = bucket[i..].to_vec();
-                rotated.extend_from_slice(&bucket[..i]);
-                rotated
-            }
-            _ => bucket,
-        }
-    }
-
-    fn refund_combo_cached(
-        &self,
-        hash: &[u8; 32],
-        batch: &[ScannedIntention],
-        process: &ResolvedProcess,
-    ) -> bool {
-        self.workers.get(hash).is_some_and(|w| {
-            w.with_state(|state| {
-                process_batch::refund_combo_cached(state, batch, &self.batch_code_key(process))
-            })
-        })
-    }
-
-    fn window_combo_cached(
-        &self,
-        hash: &[u8; 32],
-        batch: &[ScannedIntention],
-        process: &ResolvedProcess,
-    ) -> bool {
-        self.workers.get(hash).is_some_and(|w| {
-            w.with_state(|state| {
-                process_batch::window_combo_cached(
-                    state,
-                    batch,
-                    process,
-                    &self.batch_code_key(process),
-                )
-            })
-        })
     }
 
     fn apply_batch_report(report: &mut TickReport, delta: &BatchReportDelta) {
@@ -1397,42 +1186,37 @@ where
         batch: Vec<ScannedIntention>,
         rest: Vec<ScannedIntention>,
         min: u32,
-        resume_on_continue: Option<Vec<u8>>,
         report: &mut TickReport,
-        refund_only: bool,
+        mode: BatchMode,
     ) -> BatchOutcome {
         let worker = match self.workers.get(&hash) {
             Some(w) => w,
             None => return BatchOutcome::Continue,
         };
-        // Serialize dispatch with registry enqueue. A deferred delete or rebind
-        // may remain queued while the previous transactions are reconciled.
-        let _commands = if let Some(queue) = &self.worker_cmds {
-            match queue.lock() {
-                Ok(commands) if commands.iter().all(|cmd| cmd.identity() != hash) => Some(commands),
-                _ => return BatchOutcome::Continue,
-            }
-        } else {
-            None
-        };
+        if self
+            .worker_cmds
+            .as_ref()
+            .is_some_and(|cmds| cmds.has_update(hash))
+        {
+            return BatchOutcome::Continue;
+        }
         let max_size = if self.config.max_assembled_tx_bytes == 0 {
             DEFAULT_MAX_ASSEMBLED_TX_BYTES
         } else {
             self.config.max_assembled_tx_bytes
         };
-        let window_fp = self.window_fingerprint(&batch, process);
         match worker.start_batch(
             process.clone(),
             batch,
             self.batch_code_key(process),
             self.tick_cell_deps.clone(),
+            self.tick_cid_locks.clone(),
             self.config.refund_policy.clone(),
             max_size,
-            window_fp,
-            resume_on_continue,
             rest,
             min,
-            refund_only,
+            mode,
+            self.worker_cmds.clone(),
         ) {
             Ok(()) => BatchOutcome::ProcessOccupied,
             Err(crate::workers::StartBatchError::AlreadyOutstanding) => {
@@ -1558,7 +1342,7 @@ mod worker_cmd_tests {
 
     #[test]
     fn worker_command_register_and_delete_take_effect_on_tick() {
-        let cmds = Arc::new(Mutex::new(Vec::new()));
+        let cmds = Arc::new(WorkerCommands::default());
         let rpc = Arc::new(EmptyRpc);
         let ssri = Arc::new(NopSsri);
         let mut loop_ = DigestLoop::with_workers(
@@ -1573,14 +1357,14 @@ mod worker_cmd_tests {
 
         let e = entry([0x11; 32], [0x22; 32]);
         let hash = e.identity_type_hash;
-        cmds.lock().unwrap().push(WorkerCommand::Register(e));
+        cmds.enqueue(WorkerCommand::Register(e));
         let _ = loop_.tick();
         assert!(
             loop_.workers().contains(&hash),
             "register must spawn worker"
         );
 
-        cmds.lock().unwrap().push(WorkerCommand::delete(hash));
+        cmds.enqueue(WorkerCommand::delete(hash));
         let _ = loop_.tick();
         assert!(
             !loop_.workers().contains(&hash),
@@ -1590,7 +1374,7 @@ mod worker_cmd_tests {
 
     #[test]
     fn worker_command_delete_deferred_while_in_flight() {
-        let cmds = Arc::new(Mutex::new(Vec::new()));
+        let cmds = Arc::new(WorkerCommands::default());
         let e = entry([0x33; 32], [0x44; 32]);
         let hash = e.identity_type_hash;
         let rpc = Arc::new(EmptyRpc);
@@ -1603,34 +1387,32 @@ mod worker_cmd_tests {
                     consumed: vec![],
                     created: vec![],
                     seen_committed: false,
+                    currently_committed: false,
+                    admission_deadline: None,
                 },
             );
         });
         let mut loop_ =
             DigestLoop::with_workers(rpc, NopClock, ssri, cfg(), pool, Some(cmds.clone()));
-        cmds.lock().unwrap().push(WorkerCommand::delete(hash));
+        cmds.enqueue(WorkerCommand::delete(hash));
         let _ = loop_.tick();
         assert!(
             loop_.workers().contains(&hash),
             "in-flight delete must stay deferred"
         );
-        assert_eq!(cmds.lock().unwrap().len(), 1);
-        assert!(matches!(
-            cmds.lock().unwrap()[0],
-            WorkerCommand::Delete { .. }
-        ));
+        assert_eq!(cmds.queued().len(), 1);
+        assert!(matches!(cmds.queued()[0], WorkerCommand::Delete { .. }));
 
         // P0-1: re-register must invalidate the deferred delete.
         let e2 = entry([0x33; 32], [0x44; 32]);
-        cmds.lock().unwrap().push(WorkerCommand::Register(e2));
+        cmds.enqueue(WorkerCommand::Register(e2));
         let _ = loop_.tick();
         assert!(
             loop_.workers().contains(&hash),
             "re-register must keep worker; stale delete must not apply"
         );
         assert!(
-            cmds.lock()
-                .unwrap()
+            cmds.queued()
                 .iter()
                 .all(|c| { !matches!(c, WorkerCommand::Delete { hash: h, .. } if *h == hash) }),
             "no stale Delete may remain after re-register"

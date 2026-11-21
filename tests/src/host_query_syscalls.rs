@@ -348,7 +348,7 @@ mod tests {
         let lock = Script::new_builder()
             .code_hash(code_hash.pack())
             .hash_type(ScriptHashType::Type.into())
-            .args(Vec::<u8>::new().pack())
+            .args([[0xC1; 32].as_slice(), &[1]].concat().pack())
             .build();
         let state_type = type_id_script(&state_args);
         let state_op = OutPoint::new_builder()
@@ -367,7 +367,8 @@ mod tests {
             hash_type: 1,
             args: vec![0xEE],
         };
-        let args = CidArgs::new(type_hash, user, Payload { data: vec![0xAA] });
+        let payload = Payload::from_script(&user).unwrap();
+        let args = CidArgs::new(type_hash, user, payload);
         let lock_args = args.encode().unwrap();
         let intent_op = OutPoint::new_builder()
             .tx_hash(Byte32::from_slice(&[0x10; 32]).unwrap())
@@ -381,8 +382,8 @@ mod tests {
                 .args(lock_args.pack())
                 .build(),
             None,
-            100_0000_0000,
-            vec![0xAA],
+            600_0000_0000,
+            vec![],
         );
         rpc.insert_cell(intent.clone());
         rpc.insert_cell(state.clone());

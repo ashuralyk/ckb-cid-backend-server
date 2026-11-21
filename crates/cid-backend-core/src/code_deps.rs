@@ -12,7 +12,7 @@
 use crate::rpc::{LiveCell, Rpc, RpcError};
 use crate::type_id::{TypeIdCodeDep, TypeIdIdentity};
 use ckb_types::core::DepType;
-use ckb_types::packed::{CellDep, OutPoint};
+use ckb_types::packed::{CellDep, CellOutput, OutPoint};
 use ckb_types::prelude::*;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -75,6 +75,8 @@ pub struct ResolvedExecutionDeps {
     /// Present when a `process_code` Type-ID spec resolved. SSRI must use these
     /// bytes (same outpoint as the Process code CellDep) for this tick.
     pub process_code: Option<ResolvedTypeIdCode>,
+    /// Binary data hash of the resolved primary CID lock, when configured by Type ID.
+    pub cid_lock_data_hash: Option<[u8; 32]>,
     /// Type-ID–resolved code outpoints in config order. Scopes reject/isolate
     /// caches to the live code snapshot (upgrades must not inherit old rejects).
     pub type_id_outpoints: Vec<OutPoint>,
@@ -158,12 +160,16 @@ pub fn resolve_execution_cell_deps<R: Rpc>(
 ) -> Result<ResolvedExecutionDeps, CodeDepError> {
     let mut resolved_cells = Vec::with_capacity(specs.len());
     let mut process_code = None;
+    let mut cid_lock_data_hash = None;
     let mut type_id_outpoints = Vec::with_capacity(specs.len());
     for spec in specs {
         let cell = resolve_type_id_code_cell(rpc, spec)?;
         type_id_outpoints.push(cell.cell.out_point.clone());
         if spec.label == PROCESS_CODE_LABEL {
             process_code = Some(cell.clone());
+        }
+        if spec.label == "cid_lock" {
+            cid_lock_data_hash = Some(CellOutput::calc_data_hash(&cell.cell.data).unpack());
         }
         resolved_cells.push(cell);
     }
@@ -172,11 +178,12 @@ pub fn resolve_execution_cell_deps<R: Rpc>(
     Ok(ResolvedExecutionDeps {
         cell_deps,
         process_code,
+        cid_lock_data_hash,
         type_id_outpoints,
     })
 }
 
-fn cell_dep_code(op: &OutPoint) -> CellDep {
+pub(crate) fn cell_dep_code(op: &OutPoint) -> CellDep {
     CellDep::new_builder()
         .out_point(op.clone())
         .dep_type(DepType::Code.into())

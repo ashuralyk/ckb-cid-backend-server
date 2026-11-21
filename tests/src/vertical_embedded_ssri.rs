@@ -11,12 +11,13 @@ mod tests {
     use cid_backend_core::rpc::script_hash32;
     use cid_backend_core::ssri::{EmbeddedSsri, SsriError, SsriHost};
     use cid_process_executor::{AssembledTx, MockHost};
+    use cid_protocol::{CidArgs, Payload};
     use ckb_types::prelude::*;
 
     use crate::fake_rpc::FakeRpc;
     use crate::helpers::{
         default_loop_config, fixture_process_entry, intention_cell, process_cell,
-        process_type_script,
+        process_type_script, user_lock,
     };
 
     fn load_example_binary() -> Option<Vec<u8>> {
@@ -56,6 +57,10 @@ mod tests {
     }
 
     impl SsriHost for RecordingSsri {
+        fn filter(&self, binary: &[u8], request: &[u8]) -> Result<Vec<i8>, SsriError> {
+            self.inner.filter(binary, request)
+        }
+
         fn get_batch_bounds(&self, binary: &[u8]) -> Result<(u32, u32), SsriError> {
             self.inner.get_batch_bounds(binary)
         }
@@ -84,7 +89,12 @@ mod tests {
         rpc.insert_block_hash(0, [0xAB; 32]);
         let ts = process_type_script(1);
         let hash = script_hash32(&ts);
-        let intent = intention_cell(1, hash, 100_0000_0000);
+        let mut intent = intention_cell(1, hash, 600_0000_0000);
+        let user = user_lock();
+        let payload = Payload::from_script(&user).unwrap();
+        let args = CidArgs::new(hash, user, payload).encode().unwrap();
+        let lock = intent.lock().as_builder().args(args.pack()).build();
+        intent.output = intent.output.as_builder().lock(lock).build();
         // Capacity must leave room for Process fee = floor((len+4)*1000/1000).
         let proc = process_cell(1, 500_0000_0000, vec![]);
         rpc.insert_cell(intent);

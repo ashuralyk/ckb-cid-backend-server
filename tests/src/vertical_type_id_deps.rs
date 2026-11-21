@@ -9,38 +9,16 @@ mod tests {
     use cid_backend_core::rpc::out_point_key;
     use cid_backend_core::type_id::{TypeIdCodeDep, TypeIdIdentity};
     use ckb_types::core::ScriptHashType;
-    use ckb_types::packed::{Byte32, CellDep, CellOutput, OutPoint, Script};
+    use ckb_types::packed::{CellDep, CellOutput, Script};
     use ckb_types::prelude::*;
 
     use crate::fake_rpc::FakeRpc;
     use crate::helpers::{
-        default_loop_config, fixture_process_entry_with_code, intention_cell, loop_with_resolver,
-        loop_with_resolver_and_code, process_cell, process_cell_for_code, process_type_hash,
-        FIXTURE_ELF, PROC_CODE_ARGS,
+        code_cell, default_loop_config, fixture_process_entry_with_code, intention_cell,
+        loop_with_resolver, loop_with_resolver_and_code, process_cell, process_cell_for_code,
+        process_type_hash, FIXTURE_ELF, PROC_CODE_ARGS,
     };
     use crate::scripted_ssri::ScriptedSsri;
-
-    fn code_cell(tx_byte: u8, args: [u8; 32], data: Vec<u8>) -> cid_backend_core::rpc::LiveCell {
-        let type_script = cid_backend_core::type_id::type_id_script(&args);
-        let lock = Script::new_builder()
-            .code_hash(Byte32::from_slice(&[0x99; 32]).unwrap())
-            .hash_type(ScriptHashType::Data1.into())
-            .args(Vec::<u8>::new().pack())
-            .build();
-        let output = CellOutput::new_builder()
-            .capacity(1_000_0000_0000u64.pack())
-            .lock(lock)
-            .type_(Some(type_script).pack())
-            .build();
-        cid_backend_core::rpc::LiveCell {
-            out_point: OutPoint::new_builder()
-                .tx_hash(Byte32::from_slice(&[tx_byte; 32]).unwrap())
-                .index(0u32.pack())
-                .build(),
-            output,
-            data,
-        }
-    }
 
     fn cfg(type_id_code_deps: Vec<TypeIdCodeDep>, extra: Vec<CellDep>) -> LoopConfig {
         LoopConfig {
@@ -192,10 +170,8 @@ mod tests {
         assert!(seen.iter().all(|b| b != &state_elf));
     }
 
-    /// Type-ID execution_code_key rotation must clear isolate_pending and
-    /// isolate_resume (same as rejected_combos / isolate_expanded).
     #[test]
-    fn type_id_execution_code_key_rotation_clears_isolate_pending_and_resume() {
+    fn type_id_execution_code_key_rotation_clears_rejected_combos() {
         let cid_args = [0xa9; 32];
         let code_args = worker_code_args();
         let rpc = FakeRpc::new();
@@ -222,9 +198,6 @@ mod tests {
 
         loop_.workers().get(&hash).unwrap().with_state_mut(|s| {
             s.submit.rejected_combos.insert(vec![0xAA]);
-            s.isolate_expanded.insert(vec![0xBB]);
-            s.isolate_pending.push(Vec::new());
-            s.isolate_resume = Some(vec![0xCC]);
         });
 
         loop_.rpc().consume(&cid_v1.out_point);
@@ -237,18 +210,6 @@ mod tests {
             assert!(
                 s.submit.rejected_combos.is_empty(),
                 "rejected_combos must clear on Type-ID code rotation"
-            );
-            assert!(
-                s.isolate_expanded.is_empty(),
-                "isolate_expanded must clear on Type-ID code rotation"
-            );
-            assert!(
-                s.isolate_pending.is_empty(),
-                "isolate_pending must clear on Type-ID code rotation"
-            );
-            assert!(
-                s.isolate_resume.is_none(),
-                "isolate_resume must clear on Type-ID code rotation"
             );
         });
     }

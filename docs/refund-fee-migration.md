@@ -15,9 +15,8 @@ at head **`9bc8193`** (or newer): per-Intention ceiling via
 `code_hash` + `hash_type` (not across deployments). DigestIncompatible
 now rejects **mixed CID identities** (`MixedCidLock`) even at zero
 shortfall — that on-chain rule is the real protocol defense against
-cross-version fee reuse. The daemon's per-`(code_hash, hash_type)`
-partition is defense-in-depth so an honest assembler never submits a
-mixed-identity tx. TimeoutBurn stays exact.
+cross-version fee reuse. The daemon builds one transaction per authorized
+Intention. TimeoutBurn stays exact.
 
 Do **not** treat undeployed candidate hashes as production defaults; do **not**
 replace current testnet `code_hash` with an undeployed binary. Operators
@@ -58,21 +57,10 @@ allowlist entry is not a scanned identity.
 3. Add that **already-scanned** identity to `[[cid_lock.bounded_refund_locks]]`
    (or `CID_BOUNDED_REFUND_LOCKS=0x…:hash_type`). Never list undeployed
    candidates. Never use the allowlist as a scan source.
-4. List old data-hash locks under `[[cid_lock.legacy_scan_locks]]` so the
-   daemon continues draining those Intentions after redeploy; add them to
-   `bounded_refund_locks` only if that legacy lock also accepts bounded fees.
-5. **Legacy Data1/Data/Data2 code CellDep (required for drain):**
-   `legacy_scan_locks` only adds an indexer query. Assembly still attaches
-   the current Type-ID code cell (new binary) plus configured static deps.
-   After an upgrade that changes the ELF, that Type-ID cell cannot locate a
-   legacy Data1 lock (`code_hash` = old `data_hash`; see
-   [RFC 0022 code locating](https://github.com/nervosnetwork/rfcs/blob/master/rfcs/0022-transaction-structure/0022-transaction-structure.md#code-locating)).
-   Keep a **live** cell whose **exact** old bytes hash to that `data_hash`,
-   and attach it as an unlabeled `[[cell_deps]]` / `CID_EXTRA_CELL_DEPS`
-   entry (do **not** label it `cid_lock` — that conflicts with Type-ID
-   discovery for the current role). Without that dep, FakeRpc may still
-   “accept” the tx, but a real node rejects it.
-6. The Process guest controls the fee for `digest_ok`.
+4. Keep any old data-hash scan entries under `[[cid_lock.legacy_scan_locks]]` for visibility. Workers route and refund only Intentions whose CID Type ID matches the configured primary and the Process state binding.
+5. The Process guest controls the fee for `digest_ok`.
+
+The v0.1.4 testnet example already includes the deployed CID Type ID in its bounded-refund allowlist. See the [runbook](runbook.md).
 
 ## Assembly rules (bounded mode)
 
@@ -81,16 +69,12 @@ allowlist entry is not a scanned identity.
   `min(MAX_REFUND_FEE, capacity - occupied)`.
 - `sum(cuts) == fee` exactly — **no siphon outputs** (implies contract
   `F >= S` when there are no extra outputs).
-- Fail closed with soft `RetryLater` (`FeeUnaffordable`) if the budget is
-  insufficient (non-permanent, no `rejected_combos`, no isolate-shrink;
-  below-min leftovers retry refund once marked pending).
+- Leave the Intention live when `FeeUnaffordable` occurs and retry only after
+  a current per-cell refund verdict.
 - Intentions whose lock is **not** on the allowlist always use exact refunds.
 - **Never** mix allowlisted and legacy locks in one bounded refund tx.
 - **Never** co-bundle two different bounded-capable lock identities in one
-  Execution tx — the loop partitions DigestIncompatible assembly by
-  `(code_hash, hash_type)` (defense-in-depth; on-chain `MixedCidLock` is
-  the real defense). The allowlist may list multiple verified deployed
-  identities after migration, but they must not share a refund tx.
+  Execution tx. On-chain `MixedCidLock` enforces this restriction.
 - **Never** co-bundle fee-shaved Incompatible refunds with Process /
   DigestOk.
 - **TimeoutBurn** stays exact; this daemon does not assemble it.
@@ -105,10 +89,12 @@ covers `fee_rate`, fail-closed otherwise.
 
 Against the intended CKB node with the node's real `min_fee_rate`, confirm
 both DigestOk and allowlisted bounded-refund txs are accepted by the tx-pool
-after contract PR #12 is deployed and pinned. Mixed old/new Intention sets
-must drain without haircutting legacy locks.
+after contract PR #12 is deployed and pinned. With a mixed scan, verify that
+primary-CID Intentions drain and legacy CID Intentions remain untouched.
 
 ## Local / CI
 
-Local-dev chain keeps `min_fee_rate = 0` and an **empty** allowlist so the
-pinned lock fixture continues to clear exact refunds.
+The local dev fixture uses zero minimum fee and an empty allowlist by default.
+With `CID_LOCAL_CHAIN_BOUNDED_REFUNDS=1`, a fresh dev node uses a minimum fee
+of 1,000 shannons/KB and the fixture verifies an allowlisted xUDT refund on
+chain. See [local dev-chain setup](local-dev-chain.md).

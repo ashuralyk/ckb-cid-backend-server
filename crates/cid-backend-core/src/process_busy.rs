@@ -19,6 +19,15 @@ impl ProcessBusyMap {
         *g = pending.into_iter().collect();
     }
 
+    pub(crate) fn update_process(&self, hash: [u8; 32], pending: bool) {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if pending {
+            guard.insert(hash);
+        } else {
+            guard.remove(&hash);
+        }
+    }
+
     pub fn is_pending(&self, hash: &[u8; 32]) -> bool {
         self.inner
             .lock()

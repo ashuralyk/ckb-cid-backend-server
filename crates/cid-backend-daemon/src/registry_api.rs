@@ -4,10 +4,13 @@
 //! / `CID_API_BIND`. Updates the on-disk registry and enqueues live worker
 //! spawn/stop commands for the digest loop.
 
+use cid_backend_core::process::{state_is_process_lock, validate_state_cid_binding};
+use cid_backend_core::rpc::{LiveCell, RpcError};
 use cid_backend_core::{
-    type_id_script_hash, ProcessBusyMap, ProcessRegistration, ProcessRegistry, RegisterOutcome,
-    RegistryError, WorkerCommand,
+    type_id_script_hash, CidLockIdentity, ProcessRegistration, ProcessRegistry, RegisterOutcome,
+    RegistrationQueueError, RegistryError, WorkerCommand, WorkerCommands,
 };
+use ckb_types::packed::{OutPoint, Script};
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
@@ -21,12 +24,16 @@ const MAX_HEADER_BYTES: usize = 8 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_API_WORKERS: usize = 32;
 
+type GetLiveCell = dyn Fn(&OutPoint) -> Result<Option<LiveCell>, RpcError> + Send + Sync;
+type FindProcessState = dyn Fn(&Script) -> Result<Vec<LiveCell>, RpcError> + Send + Sync;
+
 #[derive(Clone)]
 pub struct RegistryApiState {
     pub registry: Arc<Mutex<ProcessRegistry>>,
-    pub worker_cmds: Arc<Mutex<Vec<WorkerCommand>>>,
-    /// Shared with the digest loop for pending/idle checks (P1-6).
-    pub busy: ProcessBusyMap,
+    pub worker_cmds: Arc<WorkerCommands>,
+    pub cid: CidLockIdentity,
+    pub find_process_state: Arc<FindProcessState>,
+    pub get_live_cell: Arc<GetLiveCell>,
 }
 
 pub struct RegistryApiHandle {
@@ -217,6 +224,16 @@ fn get_process(
     }
 }
 
+fn state_lookup_unavailable(error: &RpcError) -> (u16, &'static str, &'static str, Vec<u8>) {
+    tracing::warn!(target: "cid_backend", event = "registry.state_lookup_failed", %error);
+    (
+        503,
+        "Service Unavailable",
+        "text/plain; charset=utf-8",
+        b"could not look up live Process state; retry later\n".to_vec(),
+    )
+}
+
 fn register_process(
     body: &[u8],
     state: &RegistryApiState,
@@ -235,15 +252,57 @@ fn register_process(
             return Ok(bad_request(format!("{e}\n").as_bytes()));
         }
     };
-    // Single critical section: registry persist + worker-cmd enqueue (P0-2).
-    // Lock order: registry → workers → worker_cmds.
+    let hash = reg_entry.identity_type_hash();
+    let previous = state.registry.lock().map_err(|_| ())?.get(&hash).cloned();
+    let cells = match (state.find_process_state)(&entry.identity.type_script()) {
+        Ok(cells) => cells,
+        Err(error) => return Ok(state_lookup_unavailable(&error)),
+    };
+    let [cell] = cells.as_slice() else {
+        return Ok(bad_request(
+            b"expected one live Process state cell for identity_type_id_args\n",
+        ));
+    };
+    match (state.get_live_cell)(&cell.out_point) {
+        Ok(Some(node_cell)) if node_cell == *cell => {}
+        Ok(_) => {
+            return Ok(bad_request(
+                b"node could not confirm indexed Process state\n",
+            ))
+        }
+        Err(error) => return Ok(state_lookup_unavailable(&error)),
+    }
+    if !state_is_process_lock(&entry, cell) {
+        return Ok(bad_request(
+            b"live Process state must use the registered Process code Type-ID lock\n",
+        ));
+    }
+    if let Err(reason) = validate_state_cid_binding(cell, state.cid) {
+        return Ok(bad_request(format!("{reason}\n").as_bytes()));
+    }
+
+    // Keep the idle check, registry write, and worker update atomic against
+    // submission admission. This also covers sends whose receipt is uncertain.
     let outcome = {
         let mut reg = state.registry.lock().map_err(|_| ())?;
-        let hash = reg_entry.identity_type_hash();
-        if let Some(existing) = reg.get(&hash) {
-            let code_changing = existing.code_type_id_args != reg_entry.code_type_id_args
-                || existing.code_type_id != reg_entry.code_type_id;
-            if code_changing && state.busy.is_pending(&hash) {
+        if reg.get(&hash) != previous.as_ref() {
+            return Ok((
+                409,
+                "Conflict",
+                "text/plain; charset=utf-8",
+                b"process registration changed during validation; retry\n".to_vec(),
+            ));
+        }
+        let require_idle = previous.as_ref().is_none_or(|existing| {
+            existing.code_type_id_args != reg_entry.code_type_id_args
+                || existing.code_type_id != reg_entry.code_type_id
+        });
+        match state
+            .worker_cmds
+            .enqueue_registration(entry, require_idle, || reg.register(reg_entry.clone()))
+        {
+            Ok(outcome) => outcome,
+            Err(RegistrationQueueError::Busy) => {
                 return Ok((
                     409,
                     "Conflict",
@@ -251,10 +310,7 @@ fn register_process(
                     b"process has in-flight submits; defer code re-bind until idle\n".to_vec(),
                 ));
             }
-        }
-        let outcome = match reg.register(reg_entry.clone()) {
-            Ok(o) => o,
-            Err(RegistryError::Full) => {
+            Err(RegistrationQueueError::Persist(RegistryError::Full)) => {
                 return Ok((
                     409,
                     "Conflict",
@@ -262,20 +318,12 @@ fn register_process(
                     b"registry full\n".to_vec(),
                 ));
             }
-            Err(e) => return Ok(bad_request(format!("{e}\n").as_bytes())),
-        };
-        let mut q = state.worker_cmds.lock().map_err(|_| ())?;
-        // Cancel pending deletes for this identity before enqueueing Register (P0-1).
-        q.retain(|c| {
-            !matches!(
-                c,
-                WorkerCommand::Delete { hash: h, .. } if *h == hash
-            )
-        });
-        q.push(WorkerCommand::Register(entry));
-        outcome
+            Err(RegistrationQueueError::Persist(e)) => {
+                return Ok(bad_request(format!("{e}\n").as_bytes()));
+            }
+            Err(RegistrationQueueError::Unavailable) => return Err(()),
+        }
     };
-    let hash = reg_entry.identity_type_hash();
     tracing::info!(
         target: "cid_backend",
         event = "registry.api.register",
@@ -303,8 +351,12 @@ fn delete_process(
         if !reg.delete(&hash).map_err(|_| ())? {
             return Ok(not_found());
         }
-        let mut q = state.worker_cmds.lock().map_err(|_| ())?;
-        q.push(WorkerCommand::delete(hash));
+        if !state.worker_cmds.enqueue(WorkerCommand::delete(hash)) {
+            return Err(());
+        }
+    }
+    if !state.worker_cmds.wait_for_submission(&hash) {
+        return Err(());
     }
     tracing::info!(
         target: "cid_backend",
@@ -511,7 +563,140 @@ fn close_stream(stream: TcpStream) {
 mod tests {
     use super::*;
     use cid_backend_core::{type_id_script_hash, DEFAULT_MAX_REGISTRY_ENTRIES};
+    use ckb_types::core::ScriptHashType;
+    use ckb_types::packed::CellOutput;
+    use ckb_types::prelude::*;
     use std::net::TcpStream;
+
+    const CID: CidLockIdentity = CidLockIdentity {
+        code_hash: [0xC1; 32],
+        hash_type: ScriptHashType::Type,
+    };
+
+    fn api_state(registry: ProcessRegistry, lock_args: Vec<u8>) -> RegistryApiState {
+        let cell = LiveCell {
+            out_point: OutPoint::default(),
+            output: CellOutput::new_builder()
+                .lock(
+                    Script::new_builder()
+                        .code_hash(type_id_script_hash(&[0x22; 32]).pack())
+                        .hash_type(ScriptHashType::Type.into())
+                        .args(lock_args.pack())
+                        .build(),
+                )
+                .type_(Some(cid_backend_core::type_id_script(&[0x11; 32])).pack())
+                .build(),
+            data: vec![],
+        };
+        let indexed = cell.clone();
+        RegistryApiState {
+            registry: Arc::new(Mutex::new(registry)),
+            worker_cmds: Arc::new(WorkerCommands::default()),
+            cid: CID,
+            find_process_state: Arc::new(move |typ| {
+                assert_eq!(indexed.type_script().as_ref(), Some(typ));
+                Ok(vec![indexed.clone()])
+            }),
+            get_live_cell: Arc::new(move |op| {
+                assert_eq!(op, &cell.out_point);
+                Ok(Some(cell.clone()))
+            }),
+        }
+    }
+
+    #[test]
+    fn registry_node_check_rejects_stale_or_mismatched_state_before_upsert() {
+        let (reg, path) = temp_registry();
+        let mut state = api_state(reg, [CID.code_hash.as_slice(), &[1]].concat());
+        let body = serde_json::json!({
+            "identity_type_id_args": hex_pref(&[0x11; 32]),
+            "code_type_id_args": hex_pref(&[0x22; 32]),
+        })
+        .to_string();
+        let matching = state.get_live_cell.clone();
+        state.get_live_cell = Arc::new(|_| Ok(None));
+        let post = |state: &RegistryApiState| {
+            route("POST", "/v1/processes", body.as_bytes(), state)
+                .unwrap()
+                .0
+        };
+        assert_eq!(post(&state), 400);
+        assert!(state.registry.lock().unwrap().is_empty());
+        assert!(state.worker_cmds.queued().is_empty());
+        assert!(!path.exists());
+
+        state.get_live_cell = Arc::new(|_| Err(RpcError::Unavailable("node offline".into())));
+        assert_eq!(post(&state), 503);
+        assert!(state.registry.lock().unwrap().is_empty());
+        assert!(state.worker_cmds.queued().is_empty());
+
+        state.get_live_cell = matching.clone();
+        assert_eq!(post(&state), 201);
+        let persisted = std::fs::read(&path).unwrap();
+        state.get_live_cell = Arc::new(move |op| {
+            let mut cell = matching(op)?.unwrap();
+            cell.data.push(1);
+            Ok(Some(cell))
+        });
+        assert_eq!(post(&state), 400);
+        assert_eq!(state.worker_cmds.queued().len(), 1);
+        assert_eq!(std::fs::read(&path).unwrap(), persisted);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn registry_rejects_a_stale_binding_after_a_concurrent_update() {
+        let (reg, path) = temp_registry();
+        let mut state = api_state(reg, [CID.code_hash.as_slice(), &[1]].concat());
+        let registry = state.registry.clone();
+        let find = state.find_process_state.clone();
+        state.find_process_state = Arc::new(move |script| {
+            registry
+                .lock()
+                .unwrap()
+                .register(ProcessRegistration {
+                    identity_type_id_args: [0x11; 32],
+                    identity_type_id: None,
+                    code_type_id_args: [0x33; 32],
+                    code_type_id: None,
+                })
+                .unwrap();
+            find(script)
+        });
+        let body = serde_json::json!({
+            "identity_type_id_args": hex_pref(&[0x11; 32]),
+            "code_type_id_args": hex_pref(&[0x22; 32]),
+        })
+        .to_string();
+
+        let response = route("POST", "/v1/processes", body.as_bytes(), &state).unwrap();
+        assert_eq!(response.0, 409);
+        assert!(state.worker_cmds.queued().is_empty());
+        let registry = state.registry.lock().unwrap();
+        let persisted = registry.get(&type_id_script_hash(&[0x11; 32])).unwrap();
+        assert_eq!(persisted.code_type_id_args, [0x33; 32]);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn registry_rejects_legacy_state_without_persisting_or_starting_worker() {
+        let (reg, path) = temp_registry();
+        let state = api_state(reg, vec![1]);
+        let body = serde_json::json!({
+            "identity_type_id_args": hex_pref(&[0x11; 32]),
+            "code_type_id_args": hex_pref(&[0x22; 32]),
+        })
+        .to_string();
+        let (status, _, _, response) =
+            route("POST", "/v1/processes", body.as_bytes(), &state).unwrap();
+        assert_eq!(status, 400);
+        assert!(String::from_utf8(response)
+            .unwrap()
+            .contains("Process state lock args (TooShort)"));
+        assert!(state.registry.lock().unwrap().is_empty());
+        assert!(state.worker_cmds.queued().is_empty());
+        assert!(!path.exists());
+    }
     use std::time::Duration;
 
     fn temp_registry() -> (ProcessRegistry, std::path::PathBuf) {
@@ -558,11 +743,7 @@ mod tests {
     #[test]
     fn register_list_get_delete_round_trip() {
         let (reg, path) = temp_registry();
-        let state = RegistryApiState {
-            registry: Arc::new(Mutex::new(reg)),
-            worker_cmds: Arc::new(Mutex::new(Vec::new())),
-            busy: ProcessBusyMap::new(),
-        };
+        let state = api_state(reg, [CID.code_hash.as_slice(), &[1]].concat());
         let handle = spawn_registry_api("127.0.0.1:0".parse().unwrap(), state.clone()).unwrap();
         std::thread::sleep(Duration::from_millis(50));
 
@@ -580,7 +761,7 @@ mod tests {
         );
         let (status, resp) = http_exchange(handle.local_addr, &raw);
         assert_eq!(status, 201, "{resp}");
-        assert_eq!(state.worker_cmds.lock().unwrap().len(), 1);
+        assert_eq!(state.worker_cmds.queued().len(), 1);
 
         let (status, resp) = http_exchange(
             handle.local_addr,
@@ -601,7 +782,7 @@ mod tests {
             &format!("DELETE /v1/processes/{id} HTTP/1.1\r\nHost: localhost\r\n\r\n"),
         );
         assert_eq!(status, 204, "{resp}");
-        assert_eq!(state.worker_cmds.lock().unwrap().len(), 2);
+        assert_eq!(state.worker_cmds.queued().len(), 2);
 
         let (status, _) = http_exchange(
             handle.local_addr,
@@ -614,11 +795,7 @@ mod tests {
     #[test]
     fn invalid_hex_rejected() {
         let (reg, path) = temp_registry();
-        let state = RegistryApiState {
-            registry: Arc::new(Mutex::new(reg)),
-            worker_cmds: Arc::new(Mutex::new(Vec::new())),
-            busy: ProcessBusyMap::new(),
-        };
+        let state = api_state(reg, [CID.code_hash.as_slice(), &[1]].concat());
         let handle = spawn_registry_api("127.0.0.1:0".parse().unwrap(), state).unwrap();
         std::thread::sleep(Duration::from_millis(50));
         let body = r#"{"identity_type_id_args":"0xzz","code_type_id_args":"0x11"}"#;

@@ -10,5 +10,7 @@ members = [
 ckb-types = "0.119"
 log = "0.4"
 tracing = "0.1"
-cid-process-executor = { git = "https://github.com/ashuralyk/ckb-common-intention-dispatcher", rev = "5ea581fad5922ad0e4104d99757be143ee6706f8" }
-cid-protocol = { git = "https://github.com/ashuralyk/ckb-common-intention-dispatcher", rev = "5ea581fad5922ad0e4104d99757be143ee6706f8" }
+cid-process-executor = { git = "https://github.com/ashuralyk/ckb-common-intention-dispatcher", rev = "b2d01e0a5a9760c8ee627633365aa98dd7a99859" }
+cid-protocol = { git = "https://github.com/ashuralyk/ckb-common-intention-dispatcher", rev = "b2d01e0a5a9760c8ee627633365aa98dd7a99859" }
+cid-intention-filter = { git = "https://github.com/ashuralyk/ckb-common-intention-dispatcher", rev = "b2d01e0a5a9760c8ee627633365aa98dd7a99859" }
+cid-process-example-policy = { git = "https://github.com/ashuralyk/ckb-common-intention-dispatcher", rev = "b2d01e0a5a9760c8ee627633365aa98dd7a99859" }

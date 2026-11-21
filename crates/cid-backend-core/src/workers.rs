@@ -1,15 +1,18 @@
 //! One OS thread per configured Process. Batch submit work runs on that thread.
 
-use crate::fee::RefundPolicy;
+use crate::fee::{CidLockIdentity, RefundPolicy};
 use crate::host_query::HostQueryRpc;
 use crate::process::ResolvedProcess;
 use crate::process::{ProcessEntry, ProcessResolver};
-use crate::process_batch::{run_process_batch, BatchOutcome, BatchReportDelta, ProcessBatchParams};
+use crate::process_batch::{
+    run_process_batch, BatchMode, BatchOutcome, BatchReportDelta, ProbeBudget, ProcessBatchParams,
+};
 use crate::rpc::{LiveCell, Rpc};
 use crate::scan::ScannedIntention;
 use crate::ssri::SsriHost;
 use crate::submit::SubmitState;
-use ckb_types::packed::{CellDep, OutPoint};
+use crate::worker_commands::WorkerCommands;
+use ckb_types::packed::{Byte32, CellDep, OutPoint};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
@@ -24,22 +27,58 @@ fn process_thread_name(hash: &[u8; 32]) -> String {
     )
 }
 
+fn process_snapshot(process: &ResolvedProcess) -> (OutPoint, Option<OutPoint>) {
+    (
+        process.live_cell.out_point.clone(),
+        process
+            .code_cell
+            .as_ref()
+            .map(|cell| cell.out_point.clone()),
+    )
+}
+
+#[derive(Default, PartialEq, Eq)]
+pub(crate) enum RefundPriority {
+    #[default]
+    None,
+    Ready,
+    AwaitingStatus(Byte32),
+}
+
+impl RefundPriority {
+    pub(crate) fn grant(&mut self) {
+        if !matches!(self, Self::AwaitingStatus(_)) {
+            *self = Self::Ready;
+        }
+    }
+
+    pub(crate) fn is_awaiting(&self, tx_hash: &Byte32) -> bool {
+        matches!(self, Self::AwaitingStatus(pending) if pending == tx_hash)
+    }
+
+    pub(crate) fn confirm_admission(&mut self, tx_hash: &Byte32) {
+        if self.is_awaiting(tx_hash) {
+            *self = Self::None;
+        }
+    }
+}
+
 /// Per-Process mutable state (digest thread and worker thread via lock).
 pub struct ProcessWorkerState {
     pub entry: ProcessEntry,
     pub resolver: ProcessResolver,
     pub submit: SubmitState,
-    pub isolate_resume: Option<Vec<u8>>,
-    pub isolate_expanded: HashSet<Vec<u8>>,
-    /// Stack frames queued by async Rejected/CachedRejected (drop_first + shrink)
-    /// or leftover frames saved on ProcessOccupied. Consumed by the next
-    /// `isolate_window` instead of re-deriving via `already`.
-    pub isolate_pending: Vec<Vec<ScannedIntention>>,
-    /// Out-point keys that saw DigestIncompatible but could not refund yet
-    /// (e.g. fee unaffordable). Below-min leftovers retry refund without a
-    /// legal `[min,max]` assemble window.
-    pub pending_incompatible_refund: HashSet<Vec<u8>>,
+    /// State dependencies of submitted filter refunds, keyed by transaction.
+    pub(crate) refund_state_deps: HashMap<Vec<u8>, OutPoint>,
+    /// Give refunds the first opportunity after a digest releases Process state.
+    pub(crate) refund_priority: RefundPriority,
+    unfunded_process: Option<(OutPoint, Option<OutPoint>)>,
+    /// Shared across assembly jobs within a tick, cleared after all jobs finish.
+    pub(crate) probe_budget: Option<ProbeBudget>,
     pub generation: u64,
+    /// Exit 41 quarantines a state/code pair for the lifetime of the worker.
+    quarantines: HashSet<(OutPoint, Option<OutPoint>)>,
+    pub(crate) filter_missing_logged: bool,
     last_process_code: Option<OutPoint>,
 }
 
@@ -54,11 +93,13 @@ impl ProcessWorkerState {
             entry,
             resolver,
             submit: SubmitState::default(),
-            isolate_resume: None,
-            isolate_expanded: HashSet::new(),
-            isolate_pending: Vec::new(),
-            pending_incompatible_refund: HashSet::new(),
+            refund_state_deps: HashMap::new(),
+            refund_priority: RefundPriority::None,
+            unfunded_process: None,
+            probe_budget: None,
             generation,
+            quarantines: HashSet::new(),
+            filter_missing_logged: false,
             last_process_code: None,
         }
     }
@@ -67,18 +108,38 @@ impl ProcessWorkerState {
         if let Some(cell) = cell {
             if self.last_process_code.as_ref() != Some(&cell.out_point) {
                 self.last_process_code = Some(cell.out_point.clone());
+                self.filter_missing_logged = false;
+                self.unfunded_process = None;
                 self.clear_execution_rejections();
             }
         }
         self.resolver.set_tick_process_code(cell);
     }
 
+    pub(crate) fn quarantine_process(&mut self, process: &ResolvedProcess) {
+        self.quarantines.insert(process_snapshot(process));
+    }
+
+    pub(crate) fn is_process_quarantined(&self, process: &ResolvedProcess) -> bool {
+        self.quarantines.contains(&process_snapshot(process))
+    }
+
+    pub(crate) fn mark_process_unfunded(&mut self, process: &ResolvedProcess) {
+        self.unfunded_process = Some(process_snapshot(process));
+    }
+
+    pub(crate) fn is_process_unfunded(&self, process: &ResolvedProcess) -> bool {
+        self.unfunded_process.as_ref() == Some(&process_snapshot(process))
+    }
+
     pub(crate) fn clear_execution_rejections(&mut self) {
         self.submit.rejected_combos.clear();
-        self.isolate_expanded.clear();
-        self.isolate_pending.clear();
-        self.isolate_resume = None;
-        self.pending_incompatible_refund.clear();
+    }
+
+    pub(crate) fn has_pending_filter_refund(&self, state: &OutPoint) -> bool {
+        self.submit.pending.iter().any(|(hash, tx)| {
+            !tx.currently_committed && self.refund_state_deps.get(hash) == Some(state)
+        })
     }
 
     pub fn process_type_hash(&self) -> [u8; 32] {
@@ -95,38 +156,31 @@ enum ProcessWorkerJob {
         job_epoch: u64,
         process: ResolvedProcess,
         batch: Vec<ScannedIntention>,
+        rest: Arc<[ScannedIntention]>,
         execution_code_key: Vec<u8>,
         tick_cell_deps: Vec<CellDep>,
+        cid_locks: Arc<[CidLockIdentity]>,
         refund_policy: RefundPolicy,
         max_assembled_tx_bytes: usize,
-        refund_only: bool,
+        min: u32,
+        mode: BatchMode,
+        commands: Option<Arc<WorkerCommands>>,
         reply: SyncSender<(BatchOutcome, BatchReportDelta)>,
     },
 }
 
 struct PendingBatch {
     reply: Receiver<(BatchOutcome, BatchReportDelta)>,
-    /// Isolate window fingerprint for the outstanding batch (digest loop).
-    window_fp: Vec<u8>,
-    /// Resume key after Continue/Submitted (first of `rest`); Rejected keeps window.
-    resume_on_continue: Option<Vec<u8>>,
-    /// Window + rest + min so Rejected can push the sync drop_first/shrink frames.
-    window: Vec<ScannedIntention>,
-    rest: Vec<ScannedIntention>,
-    min: u32,
-    refund_only: bool,
+    rest: Arc<[ScannedIntention]>,
+    mode: BatchMode,
 }
 
 /// Completed RunBatch poll result for the digest loop.
 pub struct PolledBatch {
     pub outcome: BatchOutcome,
     pub delta: BatchReportDelta,
-    pub window_fp: Vec<u8>,
-    pub resume_on_continue: Option<Vec<u8>>,
-    pub window: Vec<ScannedIntention>,
-    pub rest: Vec<ScannedIntention>,
-    pub min: u32,
-    pub refund_only: bool,
+    pub rest: Arc<[ScannedIntention]>,
+    pub(crate) mode: BatchMode,
 }
 
 /// Handle to a Process worker thread.
@@ -139,7 +193,7 @@ pub struct ProcessWorker {
     epoch: Arc<AtomicU64>,
     /// True while a RunBatch is outstanding (sent, reply not yet consumed).
     batch_outstanding: Arc<AtomicBool>,
-    /// Non-blocking reply slot — digest loop polls next ticks (P1).
+    /// Non-blocking reply slot — digest loop polls within the tick (P1).
     pending: Mutex<Option<PendingBatch>>,
 }
 
@@ -187,12 +241,8 @@ impl ProcessWorker {
                 Some(PolledBatch {
                     outcome: result.0,
                     delta: result.1,
-                    window_fp: pending.window_fp,
-                    resume_on_continue: pending.resume_on_continue,
-                    window: pending.window,
                     rest: pending.rest,
-                    min: pending.min,
-                    refund_only: pending.refund_only,
+                    mode: pending.mode,
                 })
             }
             Err(mpsc::TryRecvError::Empty) => None,
@@ -205,12 +255,8 @@ impl ProcessWorker {
                         last_error: Some("worker dead: RunBatch reply channel closed".into()),
                         ..BatchReportDelta::default()
                     },
-                    window_fp: pending.window_fp,
-                    resume_on_continue: pending.resume_on_continue,
-                    window: pending.window,
                     rest: pending.rest,
-                    min: pending.min,
-                    refund_only: pending.refund_only,
+                    mode: pending.mode,
                 })
             }
         }
@@ -219,21 +265,21 @@ impl ProcessWorker {
     /// Dispatch RunBatch without blocking the digest loop (P1).
     ///
     /// One in-flight batch per Process (`batch_outstanding`). Outcomes are
-    /// collected via [`try_poll_batch`] on later ticks.
+    /// collected via [`try_poll_batch`] within the same tick.
     #[allow(clippy::too_many_arguments)]
-    pub fn start_batch(
+    pub(crate) fn start_batch(
         &self,
         process: ResolvedProcess,
         batch: Vec<ScannedIntention>,
         execution_code_key: Vec<u8>,
         tick_cell_deps: Vec<CellDep>,
+        cid_locks: Arc<[CidLockIdentity]>,
         refund_policy: RefundPolicy,
         max_assembled_tx_bytes: usize,
-        window_fp: Vec<u8>,
-        resume_on_continue: Option<Vec<u8>>,
         rest: Vec<ScannedIntention>,
         min: u32,
-        refund_only: bool,
+        mode: BatchMode,
+        commands: Option<Arc<WorkerCommands>>,
     ) -> Result<(), StartBatchError> {
         if self
             .batch_outstanding
@@ -243,18 +289,23 @@ impl ProcessWorker {
             return Err(StartBatchError::AlreadyOutstanding);
         }
         let job_epoch = self.epoch.load(Ordering::SeqCst);
+        let rest: Arc<[_]> = rest.into();
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         if self
             .job_tx
             .send(ProcessWorkerJob::RunBatch {
                 job_epoch,
                 process,
-                batch: batch.clone(),
+                batch,
+                rest: rest.clone(),
                 execution_code_key,
                 tick_cell_deps,
+                cid_locks,
                 refund_policy,
                 max_assembled_tx_bytes,
-                refund_only,
+                min,
+                mode,
+                commands,
                 reply: reply_tx,
             })
             .is_err()
@@ -265,12 +316,8 @@ impl ProcessWorker {
         let mut slot = self.pending.lock().expect("pending batch");
         *slot = Some(PendingBatch {
             reply: reply_rx,
-            window_fp,
-            resume_on_continue,
-            window: batch,
             rest,
-            min,
-            refund_only,
+            mode,
         });
         Ok(())
     }
@@ -323,11 +370,15 @@ fn worker_thread_main<R, S>(
                 job_epoch,
                 process,
                 batch,
+                rest,
                 execution_code_key,
                 tick_cell_deps,
+                cid_locks,
                 refund_policy,
                 max_assembled_tx_bytes,
-                refund_only,
+                min,
+                mode,
+                commands,
                 reply,
             } => {
                 if epoch.load(Ordering::SeqCst) != job_epoch {
@@ -355,13 +406,17 @@ fn worker_thread_main<R, S>(
                         state: state.clone(),
                         process: &process,
                         batch,
+                        rest: &rest,
                         execution_code_key: &execution_code_key,
                         tick_cell_deps: &tick_cell_deps,
+                        cid_locks: &cid_locks,
                         refund_policy: &refund_policy,
                         max_assembled_tx_bytes,
                         job_epoch,
                         epoch: epoch.clone(),
-                        refund_only,
+                        min,
+                        mode,
+                        commands,
                     },
                 );
                 // Always forward the real outcome — especially Submitted* after
@@ -508,6 +563,8 @@ where
                     state.resolver = ProcessResolver::for_entry(entry);
                     if code_changed {
                         state.last_process_code = None;
+                        state.filter_missing_logged = false;
+                        state.unfunded_process = None;
                         state.clear_execution_rejections();
                     }
                 });
@@ -660,7 +717,6 @@ mod tests {
         assert!(pool.register(e1.clone()).unwrap());
         pool.get(&hash).unwrap().with_state_mut(|w| {
             w.submit.in_flight.insert(vec![0xaa]);
-            w.isolate_resume = Some(vec![0xbb]);
         });
 
         let mut e1b = e1.clone();
@@ -668,12 +724,11 @@ mod tests {
         assert!(!pool.register(e1b).unwrap());
         pool.get(&hash).unwrap().with_state(|w| {
             assert!(w.submit.in_flight.contains(&vec![0xaa]));
-            assert_eq!(w.isolate_resume.as_deref(), Some(&[0xbb][..]));
         });
     }
 
     #[test]
-    fn register_code_change_clears_rejected_combos_and_isolate_expanded() {
+    fn register_code_change_clears_rejected_combos() {
         let mut pool = WorkerPool::from_entries(
             vec![entry([0x10; 32], [0x20; 32])],
             Arc::new(EmptyRpc),
@@ -682,18 +737,10 @@ mod tests {
         let hash = type_id_script_hash(&[0x10; 32]);
         pool.get(&hash).unwrap().with_state_mut(|w| {
             w.submit.rejected_combos.insert(vec![0x01]);
-            w.isolate_expanded.insert(vec![0x02]);
-            w.isolate_pending.push(Vec::new());
-            w.isolate_resume = Some(vec![0x03]);
-            w.pending_incompatible_refund.insert(vec![0x04]);
         });
         assert!(!pool.register(entry([0x10; 32], [0x21; 32])).unwrap());
         pool.get(&hash).unwrap().with_state(|w| {
             assert!(w.submit.rejected_combos.is_empty());
-            assert!(w.isolate_expanded.is_empty());
-            assert!(w.isolate_pending.is_empty());
-            assert!(w.isolate_resume.is_none());
-            assert!(w.pending_incompatible_refund.is_empty());
         });
     }
 
@@ -712,6 +759,8 @@ mod tests {
                     consumed: vec![],
                     created: vec![],
                     seen_committed: false,
+                    currently_committed: false,
+                    admission_deadline: None,
                 },
             );
         });
@@ -737,6 +786,8 @@ mod tests {
                     consumed: vec![],
                     created: vec![],
                     seen_committed: false,
+                    currently_committed: false,
+                    admission_deadline: None,
                 },
             );
         });

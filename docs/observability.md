@@ -1,7 +1,7 @@
 # Observability (phase 4)
 
-Digest correctness is unchanged. Logs, health, and counters are memory-only: a
-restart drops occupancy and readiness until the next successful indexer scan.
+The daemon holds occupancy and readiness in memory. After a restart, readiness
+returns with the next successful indexer scan.
 
 ## Logs
 
@@ -18,26 +18,44 @@ Stable field `event` (target `cid_backend`):
 
 | `event` | When |
 |---------|------|
-| `tick.start` / `tick.end` | Each digest tick (`scanned`, `skipped`, `submitted`, `conflicts`, `scan_ok`) |
+| `tick.start` / `tick.end` | Each digest tick (`scanned`, `skipped`, `submitted`, `conflicts`, `scan_ok`, `isolate_windows`) |
 | `scan.unavailable` | Indexer/RPC scan failed |
 | `process.resolve_miss` | No usable live Process binary |
-| `ssri.incompatible` | SSRI `Incompatible(code)` |
-| `refund.path` | User-lock refund assemble (`path=user_lock`, includes `fee`, `bounded`, `n`) |
-| `refund.partition` | DigestIncompatible refunds split by lock identity (Exact vs Bounded kept separate; no mixed-identity Bounded tx) |
-| `refund.zero_fee` | Legacy exact Incompatible refund submitted with fee 0 (public-net gap vs `min_fee_rate`; default when allowlist empty / lock not listed) |
-| `tick.skip` (`reason=fee_unaffordable`) | Process recreate cannot fund fee for this window; isolate/shrink (non-permanent) |
-| `tick.skip` (`reason=refund_fee_unaffordable`) | Bounded refund budgets cannot cover miner fee; isolate/shrink like fee_unaffordable (non-permanent) |
+| `assemble.batch_failed` | Assembly error and attempted Intention outpoints |
+| `assemble.probe_failed` | Assembly error for a subset examined during isolation |
+| `assemble.probe_deferred` | A candidate liveness lookup was unavailable |
+| `assemble.invalid` | The assembled transaction failed structural or funding-input validation |
+| `assemble.process_unfunded` | Exit 37 from the audited v0.1.4 example ELF with zero state fee headroom paused assembly for the state and code |
+| `assemble.batch_isolated` | An assembled subset passed transaction validation |
+| `process.unhealthy` | Exit 41 quarantined the Process state/code pair and paused its filter refunds |
+| `ssri.filter_failed` | Filter error deferred the Process bucket |
+| `refund.process_state_pending` | Refund deferred while a pending digest spends or creates its state dependency |
+| `refund.snapshot_mismatch` | Node re-read disagrees with the Intention, Process state, or code snapshot |
+| `refund.path` | Singleton User Lock refund built (`path=user_lock`, `out_point`, `fee`) or unbuildable (`path=unbuildable`, `error`) |
+| `refund.fee_unaffordable` | The singleton bounded refund cannot cover the fee and its Intention stays live |
+| `dry_run.conflict` | Digest dry-run mapped to Conflict |
 | `submit.ok` | `tx_hash` |
 | `submit.conflict` | Submit mapped as Conflict |
-| `submit.rejected` | Transaction-level submit rejection (`TransactionFailedToVerify` / malformed / outputs-validator); that combo is skipped, not every consumed outpoint |
+| `dry_run.rejected` / `submit.rejected` | Permanent transaction validation rejection. The combination is cached and other eligible combinations can still run. |
+| `dry_run.pool_policy_rejected` / `submit.pool_policy_rejected` | The node rejected this transaction on a retryable rule, such as minimum fee rate, size limit, or maturity. The worker can try a different combination in the same tick and retry this combination on a later tick. |
 | `submit.rejected_combo` | Isolation skipped a combo already in `rejected_combos` (no new `send_transaction`) |
+| `pending.admission_unconfirmed` | An unanswered send still holds occupancy while the node has no current admission status for the attempt |
 | `pending.committed` | First sight of Committed (occupancy still held) |
-| `pending.settled` | Confirmation depth reached |
+| `pending.settled` | A canonical commit reached confirmation depth |
+| `pending.noncanonical` | The reported commit block is missing or differs from the canonical hash at its height |
+| `pending.block_lookup` | The canonical commit-height hash lookup failed |
 | `pending.dropped` / `pending.reorg` | Pending/confirming tx gone |
 | `reorg.tip_rewind` | Tip height moved backwards |
 | `config.load_failed` | Illegal env / TOML / health bind failure (process exits) |
 | `config.loaded` | Successful load: path, `network_name`, declared `genesis_hash`, `genesis_status` (`declared_unverified` / `declared_will_verify` / `unset`), rpc/indexer **host only** (no userinfo) |
 | `genesis.verified` | `validate_genesis=true` and `get_block_hash(0x0)` matched (fail-closed otherwise: `genesis.mismatch`) |
+
+Each tick starts a fresh assembly scan of the current filter-accepted candidates,
+capped at 64 subset probes per Process. `isolate_windows` counts dispatched
+assembly jobs, and the assembly events identify attempted subsets. Some
+combinations may repeatedly fall outside the cap. This bounded-search starvation
+is accepted by design. Filter reasons 4–7 can authorize refunds after node
+re-reads and interlock checks, independently of assembly progress.
 
 ## Health HTTP
 

@@ -3,14 +3,15 @@ mod tests {
     use cid_backend_core::digest_loop::LoopConfig;
     use cid_backend_core::rpc::{out_point_key, script_hash32, LiveCell};
     use ckb_types::core::ScriptHashType;
+    use ckb_types::prelude::Entity;
     use std::time::Duration;
 
     use crate::fake_rpc::FakeRpc;
     use crate::helpers::{
-        cid_lock_args, intention_cell, live_cell, lock_script, loop_with_resolver, out_point,
-        process_cell, process_type_script, CID_CODE,
+        cid_lock_args, distinct_intention_cell, intention_cell, live_cell, lock_script,
+        loop_with_resolver, out_point, process_cell, process_type_script, CID_CODE,
     };
-    use crate::scripted_ssri::{Mode, ScriptedSsri};
+    use crate::scripted_ssri::ScriptedSsri;
 
     fn cfg() -> LoopConfig {
         LoopConfig {
@@ -27,7 +28,7 @@ mod tests {
     }
 
     #[test]
-    fn transient_unavailable_submit_retries_next_tick() {
+    fn unavailable_submit_retries_after_node_reports_it_missing() {
         let rpc = FakeRpc::new();
         let ts = process_type_script(26);
         let hash = script_hash32(&ts);
@@ -41,20 +42,12 @@ mod tests {
         let first = loop_.tick();
         assert_eq!(first.submitted, 0);
         assert_eq!(first.conflicts, 0);
-        assert!(!loop_
-            .state()
-            .submit
-            .as_ref()
-            .unwrap()
-            .in_flight
-            .contains(&out_point_key(&intent.out_point)));
-        assert!(!loop_
-            .state()
-            .submit
-            .as_ref()
-            .unwrap()
-            .rejected
-            .contains(&out_point_key(&intent.out_point)));
+        let submit = loop_.state().submit.unwrap();
+        let key = out_point_key(&intent.out_point);
+        assert!(submit.in_flight.contains(&key));
+        assert!(!submit.rejected.contains(&key));
+        assert_eq!(submit.pending.len(), 1);
+        let unacknowledged = submit.pending.keys().next().unwrap();
         assert!(loop_
             .rpc()
             .live_cells()
@@ -63,7 +56,9 @@ mod tests {
 
         let second = loop_.tick();
         assert_eq!(second.submitted, 1, "transient Unavailable must retry");
-        assert_eq!(loop_.rpc().submitted().len(), 1);
+        let submitted = loop_.rpc().submitted();
+        assert_eq!(submitted.len(), 1);
+        assert_eq!(submitted[0].hash().as_slice(), unacknowledged);
     }
 
     #[test]
@@ -249,16 +244,16 @@ mod tests {
             .pending_occupies(&good.out_point));
     }
 
-    /// Async Rejected must queue sync drop_first+shrink frames (isolate_pending),
+    /// Async Rejected must queue drop_first and shrink frames within the tick,
     /// not rely on `already`. min=1, [A,B,C], C poison → shrink [A,B] submits.
     #[test]
     fn async_rejected_min1_shrinks_abc_to_ab() {
         let rpc = FakeRpc::new();
         let ts = process_type_script(36);
         let hash = script_hash32(&ts);
-        let a = intention_cell(1, hash, 100_0000_0000);
-        let b = intention_cell(2, hash, 110_0000_0000);
-        let c = intention_cell(3, hash, 120_0000_0000);
+        let a = distinct_intention_cell(1, hash, 100_0000_0000);
+        let b = distinct_intention_cell(2, hash, 110_0000_0000);
+        let c = distinct_intention_cell(3, hash, 120_0000_0000);
         let proc = process_cell(36, 200_0000_0000, vec![0x7f, b'E', b'L', b'F', 36]);
         rpc.insert_cell(a.clone());
         rpc.insert_cell(b.clone());
@@ -270,7 +265,7 @@ mod tests {
         let first = loop_.tick();
         assert_eq!(
             first.submitted, 1,
-            "after [A,B,C] reject, shrink [A,B] must submit via isolate_pending"
+            "after [A,B,C] reject, shrink [A,B] must submit via same-tick isolation"
         );
         let submitted = &loop_.rpc().submitted()[0];
         let inputs: Vec<_> = submitted
@@ -316,10 +311,10 @@ mod tests {
         let rpc = FakeRpc::new();
         let ts = process_type_script(37);
         let hash = script_hash32(&ts);
-        let a = intention_cell(1, hash, 100_0000_0000);
-        let b = intention_cell(2, hash, 110_0000_0000);
-        let c = intention_cell(3, hash, 120_0000_0000);
-        let d = intention_cell(4, hash, 130_0000_0000);
+        let a = distinct_intention_cell(1, hash, 100_0000_0000);
+        let b = distinct_intention_cell(2, hash, 110_0000_0000);
+        let c = distinct_intention_cell(3, hash, 120_0000_0000);
+        let d = distinct_intention_cell(4, hash, 130_0000_0000);
         let proc = process_cell(37, 200_0000_0000, vec![0x7f, b'E', b'L', b'F', 37]);
         rpc.insert_cell(a.clone());
         rpc.insert_cell(b.clone());
@@ -361,8 +356,8 @@ mod tests {
         let rpc = FakeRpc::new();
         let ts = process_type_script(29);
         let hash = script_hash32(&ts);
-        let bad = intention_cell(1, hash, 100_0000_0000);
-        let good = intention_cell(2, hash, 110_0000_0000);
+        let bad = distinct_intention_cell(1, hash, 100_0000_0000);
+        let good = distinct_intention_cell(2, hash, 110_0000_0000);
         let proc = process_cell(29, 200_0000_0000, vec![0x7f, b'E', b'L', b'F', 29]);
         rpc.insert_cell(bad.clone());
         rpc.insert_cell(good.clone());
@@ -604,32 +599,33 @@ mod tests {
     #[test]
     fn unbuildable_refund_prefix_does_not_starve_later_refundable_intention() {
         let rpc = FakeRpc::new();
+        rpc.insert_cell(crate::helpers::code_cell(
+            0xA0,
+            crate::helpers::PROC_CODE_ARGS,
+            crate::helpers::FIXTURE_ELF.to_vec(),
+        ));
         let ts = process_type_script(34);
         let hash = script_hash32(&ts);
-        const POISON: u8 = 64;
+        const POISON: u8 = 16;
         let mut poison = Vec::new();
         for fill in 1..=POISON {
             let cell = unbuildable_intention(fill, hash);
             rpc.insert_cell(cell.clone());
             poison.push(cell);
         }
-        let good = intention_cell(POISON + 1, hash, 110_0000_0000);
+        let good = intention_cell(POISON + 1, hash, 200_0000_0000);
         let proc = process_cell(34, 200_0000_0000, vec![0x7f, b'E', b'L', b'F', 34]);
         rpc.insert_cell(good.clone());
         rpc.insert_cell(proc.clone());
         let mut loop_ = loop_with_resolver(
             rpc,
-            ScriptedSsri {
-                bounds: (1, 1),
-                mode: Mode::AlwaysIncompatible(21),
-                seen_binaries: Default::default(),
-            },
+            ScriptedSsri::mimic((1, 1)).with_filter(|n| Ok(vec![6; n])),
             cfg(),
             34,
         );
 
         let first = loop_.tick();
-        assert_eq!(first.submitted, 0, "budget stops at 64 unbuildable refunds");
+        assert_eq!(first.submitted, 0, "budget stops at 16 unbuildable refunds");
         assert_eq!(
             loop_.rpc().submit_attempts(),
             0,

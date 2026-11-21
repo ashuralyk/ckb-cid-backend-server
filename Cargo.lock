@@ -80,6 +80,8 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 name = "cid-backend-core"
 version = "0.1.0"
 dependencies = [
+ "cid-intention-filter",
+ "cid-process-example-policy",
  "cid-process-executor",
  "cid-protocol",
  "ckb-types",
@@ -117,6 +119,7 @@ name = "cid-backend-tests"
 version = "0.1.0"
 dependencies = [
  "cid-backend-core",
+ "cid-intention-filter",
  "cid-process-executor",
  "cid-protocol",
  "ckb-hash 0.119.0",
@@ -125,11 +128,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "cid-intention-filter"
+version = "0.1.0"
+source = "git+https://github.com/ashuralyk/ckb-common-intention-dispatcher?rev=b2d01e0a5a9760c8ee627633365aa98dd7a99859#b2d01e0a5a9760c8ee627633365aa98dd7a99859"
+dependencies = [
+ "cid-protocol",
+]
+
+[[package]]
+name = "cid-process-example-policy"
+version = "0.1.0"
+source = "git+https://github.com/ashuralyk/ckb-common-intention-dispatcher?rev=b2d01e0a5a9760c8ee627633365aa98dd7a99859#b2d01e0a5a9760c8ee627633365aa98dd7a99859"
+dependencies = [
+ "cid-intention-filter",
+ "cid-protocol",
+]
+
+[[package]]
 name = "cid-process-executor"
 version = "0.1.0"
-source = "git+https://github.com/ashuralyk/ckb-common-intention-dispatcher?rev=5ea581fad5922ad0e4104d99757be143ee6706f8#5ea581fad5922ad0e4104d99757be143ee6706f8"
+source = "git+https://github.com/ashuralyk/ckb-common-intention-dispatcher?rev=b2d01e0a5a9760c8ee627633365aa98dd7a99859#b2d01e0a5a9760c8ee627633365aa98dd7a99859"
 dependencies = [
  "anyhow",
+ "cid-intention-filter",
+ "cid-protocol",
  "ckb-hash 1.1.1",
  "ckb-types",
  "ckb-vm",
@@ -141,7 +163,7 @@ dependencies = [
 [[package]]
 name = "cid-protocol"
 version = "0.1.0"
-source = "git+https://github.com/ashuralyk/ckb-common-intention-dispatcher?rev=5ea581fad5922ad0e4104d99757be143ee6706f8#5ea581fad5922ad0e4104d99757be143ee6706f8"
+source = "git+https://github.com/ashuralyk/ckb-common-intention-dispatcher?rev=b2d01e0a5a9760c8ee627633365aa98dd7a99859#b2d01e0a5a9760c8ee627633365aa98dd7a99859"
 dependencies = [
  "serde",
  "serde_molecule",

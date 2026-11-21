@@ -16,7 +16,17 @@ mod tests {
         let rpc = FakeRpc::new();
         let entry = fixture_process_entry(0x01);
         let mut resolver = ProcessResolver::for_entry(entry);
-        assert!(resolver.resolve(&rpc, &[0xAB; 32]).unwrap().is_none());
+        assert!(resolver
+            .resolve(
+                &rpc,
+                &[0xAB; 32],
+                cid_backend_core::CidLockIdentity::new(
+                    crate::helpers::CID_CODE,
+                    ckb_types::core::ScriptHashType::Type
+                )
+            )
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -36,7 +46,17 @@ mod tests {
         let entry = fixture_process_entry(unique);
         let mut resolver =
             ProcessResolver::for_entry(entry).with_fallback_binary(FIXTURE_ELF.to_vec());
-        let got = resolver.resolve(&rpc, &hash).unwrap().expect("resolved");
+        let got = resolver
+            .resolve(
+                &rpc,
+                &hash,
+                cid_backend_core::CidLockIdentity::new(
+                    crate::helpers::CID_CODE,
+                    ckb_types::core::ScriptHashType::Type,
+                ),
+            )
+            .unwrap()
+            .expect("resolved");
         assert_eq!(got.binary, FIXTURE_ELF);
         assert_eq!(got.type_hash, hash);
     }
@@ -56,6 +76,16 @@ mod tests {
         let entry = fixture_process_entry(unique);
         let mut resolver =
             ProcessResolver::for_entry(entry).with_fallback_binary(FIXTURE_ELF.to_vec());
-        assert!(resolver.resolve(&rpc, &hash).unwrap().is_none());
+        assert!(resolver
+            .resolve(
+                &rpc,
+                &hash,
+                cid_backend_core::CidLockIdentity::new(
+                    crate::helpers::CID_CODE,
+                    ckb_types::core::ScriptHashType::Type
+                )
+            )
+            .unwrap()
+            .is_none());
     }
 }

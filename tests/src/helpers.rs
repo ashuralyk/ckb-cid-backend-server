@@ -53,6 +53,16 @@ pub fn live_cell(
     }
 }
 
+pub fn code_cell(tag: u8, args: [u8; 32], data: Vec<u8>) -> LiveCell {
+    live_cell(
+        out_point(tag, 0),
+        lock_script([0x99; 32], ScriptHashType::Data1, vec![]),
+        Some(type_id_script(&args)),
+        100_000_000_000,
+        data,
+    )
+}
+
 pub fn user_lock() -> CidScript {
     CidScript {
         code_hash: [0x42; 32],
@@ -195,7 +205,7 @@ pub fn process_cell_for_code(
     let lock = Script::new_builder()
         .code_hash(entry.code.type_script_hash().pack())
         .hash_type(ScriptHashType::Type.into())
-        .args(Vec::<u8>::new().pack())
+        .args([CID_CODE.as_slice(), &[1, unique]].concat().pack())
         .build();
     let ts = type_id_script(&entry.identity.args);
     live_cell(
@@ -226,6 +236,19 @@ pub fn intention_cell(fill: u8, process_type_hash: [u8; 32], capacity: u64) -> L
         CID_CODE,
         ScriptHashType::Type,
     )
+}
+
+/// Distinct CID lock groups for tests that submit several Intentions together.
+pub fn distinct_intention_cell(fill: u8, process_type_hash: [u8; 32], capacity: u64) -> LiveCell {
+    let mut cell = intention_cell(fill, process_type_hash, capacity);
+    let mut user = user_lock();
+    user.args[0] = fill;
+    let args = CidArgs::new(process_type_hash, user, Payload { data: vec![0xAA] })
+        .encode()
+        .unwrap();
+    let lock = cell.lock().as_builder().args(args.pack()).build();
+    cell.output = cell.output.as_builder().lock(lock).build();
+    cell
 }
 
 pub fn intention_cell_with_lock(

@@ -4,6 +4,10 @@ use ckb_types::core::TransactionView;
 use ckb_types::packed::{Byte32, OutPoint};
 use ckb_types::prelude::*;
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
+
+// An unanswered send can still finish after the next status lookup.
+const ADMISSION_GRACE: Duration = Duration::from_secs(30);
 
 /// In-memory submit bookkeeping. Restart drops this; the next scan is the
 /// source of truth.
@@ -20,7 +24,7 @@ pub struct SubmitState {
     /// Identical combos are not resubmitted while that code snapshot is live.
     /// A new Process outpoint **or** Type-ID code outpoint is a new combo.
     pub rejected_combos: HashSet<Vec<u8>>,
-    /// Submitted tx hash bytes → consumed outpoints still treated as in-flight
+    /// Acknowledged or ambiguous tx hash bytes → consumed outpoints treated as in-flight
     /// until the tx is dropped or reaches confirmation depth.
     pub pending: HashMap<Vec<u8>, PendingTx>,
 }
@@ -33,6 +37,10 @@ pub struct PendingTx {
     pub created: Vec<Vec<u8>>,
     /// True after we have observed `TxStatus::Committed` at least once.
     pub seen_committed: bool,
+    /// True only when the latest status poll reports Committed.
+    pub currently_committed: bool,
+    /// Keep an ambiguous send occupied through initially unknown lookups.
+    pub(crate) admission_deadline: Option<Instant>,
 }
 
 impl SubmitState {
@@ -54,14 +62,14 @@ impl SubmitState {
 pub enum DryRunGate {
     Proceed,
     Rejected(String),
-    Skip(String),
+    Skip(RpcError),
 }
 
 pub fn dry_run_gate<R: Rpc>(rpc: &R, tx: &TransactionView) -> DryRunGate {
     match rpc.dry_run_transaction(tx) {
         Ok(()) => DryRunGate::Proceed,
         Err(RpcError::SubmitRejected(m)) => DryRunGate::Rejected(m),
-        Err(e) => DryRunGate::Skip(e.to_string()),
+        Err(e) => DryRunGate::Skip(e),
     }
 }
 
@@ -77,53 +85,50 @@ pub fn submit_execution<R: Rpc>(
             return Err(RpcError::SubmitRejected(format!("fee_guard: {e}")));
         }
     }
-    match rpc.submit_transaction(&skeleton.tx) {
-        Ok(hash) => {
-            let mut keys = Vec::with_capacity(consumed.len());
-            for op in consumed {
-                let k = out_point_key(op);
-                state.in_flight.insert(k.clone());
-                state.failed.remove(&k);
-                state.rejected.remove(&k);
-                keys.push(k);
+    let result = rpc.submit_transaction(&skeleton.tx);
+    let hash = match &result {
+        Ok(hash) => hash.clone(),
+        // A transport error can occur after the node has admitted the tx.
+        Err(RpcError::Unavailable(_)) => skeleton.tx.hash(),
+        Err(_) => {
+            if matches!(result, Err(RpcError::Conflict(_))) {
+                state.failed.extend(consumed.iter().map(out_point_key));
             }
-            let created = (0..skeleton.tx.outputs().len())
-                .map(|i| {
-                    let op = OutPoint::new_builder()
-                        .tx_hash(hash.clone())
-                        .index((i as u32).pack())
-                        .build();
-                    out_point_key(&op)
-                })
-                .collect();
-            state.pending.insert(
-                hash.as_slice().to_vec(),
-                PendingTx {
-                    consumed: keys,
-                    created,
-                    seen_committed: false,
-                },
-            );
-            Ok(hash)
-        }
-        Err(e @ RpcError::Conflict(_)) => {
-            for op in consumed {
-                let k = out_point_key(op);
-                state.failed.insert(k.clone());
-                state.in_flight.remove(&k);
-            }
-            Err(e)
-        }
-        Err(e @ RpcError::SubmitRejected(_)) => {
-            // Transaction-level reject: do not blacklist consumed outpoints.
-            // DigestLoop records a combo fingerprint and isolates sub-batches.
+            // A transaction-level reject does not blacklist consumed outpoints.
             for op in consumed {
                 state.in_flight.remove(&out_point_key(op));
             }
-            Err(e)
+            return result;
         }
-        Err(e) => Err(e),
+    };
+    let mut keys = Vec::with_capacity(consumed.len());
+    for op in consumed {
+        let k = out_point_key(op);
+        state.in_flight.insert(k.clone());
+        state.failed.remove(&k);
+        state.rejected.remove(&k);
+        keys.push(k);
     }
+    let created = (0..skeleton.tx.outputs().len())
+        .map(|i| {
+            let op = OutPoint::new_builder()
+                .tx_hash(hash.clone())
+                .index((i as u32).pack())
+                .build();
+            out_point_key(&op)
+        })
+        .collect();
+    state.pending.insert(
+        hash.as_slice().to_vec(),
+        PendingTx {
+            consumed: keys,
+            created,
+            seen_committed: false,
+            currently_committed: false,
+            admission_deadline: result.is_err().then(|| Instant::now() + ADMISSION_GRACE),
+        },
+    );
+    result
 }
 
 /// Ordered Intention outpoints, optional Process state outpoint, and the

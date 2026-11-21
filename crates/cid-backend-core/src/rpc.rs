@@ -3,7 +3,7 @@ use ckb_types::packed::{Byte32, CellOutput, OutPoint, Script};
 use ckb_types::prelude::*;
 use std::fmt;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveCell {
     pub out_point: OutPoint,
     pub output: CellOutput,
@@ -31,14 +31,23 @@ pub enum TxStatus {
     /// still waits for `LoopConfig::confirmation_depth`.
     Committed {
         block_number: u64,
+        block_hash: [u8; 32],
     },
     Dropped,
+    /// The node reports a rejection for this hash, potentially from an earlier send.
+    Rejected,
+    /// The node has no status for this transaction hash.
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RpcError {
     Unavailable(String),
     SubmitRejected(String),
+    /// The node declined this transaction under a retryable transaction-specific rule.
+    PoolPolicyRejected(String),
+    /// The node declined the transaction because of a temporary pool limit.
+    PoolUnavailable(String),
     Conflict(String),
 }
 
@@ -47,6 +56,8 @@ impl fmt::Display for RpcError {
         match self {
             RpcError::Unavailable(m) => write!(f, "rpc unavailable: {m}"),
             RpcError::SubmitRejected(m) => write!(f, "submit rejected: {m}"),
+            RpcError::PoolPolicyRejected(m) => write!(f, "pool policy rejected: {m}"),
+            RpcError::PoolUnavailable(m) => write!(f, "transaction pool unavailable: {m}"),
             RpcError::Conflict(m) => write!(f, "submit conflict: {m}"),
         }
     }

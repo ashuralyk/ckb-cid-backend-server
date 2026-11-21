@@ -2,7 +2,7 @@
 # Build the pinned CID lock RISC-V binary (ckb_common_intention_dispatcher).
 set -euo pipefail
 
-PIN="${CID_DISPATCHER_REV:-5ea581fad5922ad0e4104d99757be143ee6706f8}"
+PIN="${CID_DISPATCHER_REV:-b2d01e0a5a9760c8ee627633365aa98dd7a99859}"
 CLANG="${CLANG:-clang-18}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEST="${CID_LOCK_ELF_PATH:-$ROOT/tests/fixtures/ckb_common_intention_dispatcher}"

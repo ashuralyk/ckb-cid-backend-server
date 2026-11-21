@@ -12,6 +12,7 @@ pub mod scan;
 pub mod ssri;
 pub mod submit;
 pub mod type_id;
+mod worker_commands;
 pub mod workers;
 
 pub use assemble::{
@@ -25,7 +26,7 @@ pub use code_deps::{
 };
 pub use digest_loop::{
     Clock, DigestLoop, LoopConfig, LoopState, NopClock, RealClock, TickReport, WorkerCommand,
-    DEFAULT_CONFIRMATION_DEPTH, DEFAULT_MAX_ASSEMBLED_TX_BYTES,
+    WorkerCommands, DEFAULT_CONFIRMATION_DEPTH, DEFAULT_MAX_ASSEMBLED_TX_BYTES,
 };
 pub use fee::{
     allocate_refund_fee_cuts, cell_occupied_capacity, fee_covers_shortfalls, fee_for_size,
@@ -59,6 +60,7 @@ pub use submit::{combo_fingerprint, execution_code_key, submit_execution, Pendin
 pub use type_id::{
     type_id_script, type_id_script_hash, TypeIdCodeDep, TypeIdIdentity, TYPE_ID_CODE_HASH,
 };
+pub use worker_commands::RegistrationQueueError;
 pub use workers::{
     ProcessWorker, ProcessWorkerState, WorkerPool, WorkerRegisterError, WorkerRemoveError,
 };
