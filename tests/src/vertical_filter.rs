@@ -75,6 +75,95 @@ mod tests {
     }
 
     #[test]
+    fn unbuildable_refund_warns_on_reason_change_and_still_retries() {
+        use std::io::{self, Write};
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::filter::LevelFilter;
+        use tracing_subscriber::fmt::writer::MakeWriterExt;
+
+        struct Writer(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().write(bytes)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        // The batch runs on its own worker thread, so capture its events globally.
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let writer = logs.clone();
+        let writer = (move || Writer(writer.clone())).with_filter(|metadata| {
+            metadata.target() == "cid_backend"
+                && metadata.fields().field("out_point").is_some()
+                && metadata.fields().field("path").is_some()
+        });
+        tracing_subscriber::fmt()
+            .with_max_level(LevelFilter::DEBUG)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(writer)
+            .try_init()
+            .unwrap();
+
+        let (rpc, _, _) = chain(0);
+        let original = filter_intention(239, 600_0000_0000);
+        let mut invalid = original.clone();
+        invalid.data = vec![0];
+        rpc.insert_cell(invalid.clone());
+        let ssri = ScriptedSsri::mimic((1, 4)).with_filter(|n| Ok(vec![5; n]));
+        let mut loop_ = loop_with_resolver(rpc, ssri, default_loop_config(), 1);
+
+        let point = format!("{:?}", original.out_point);
+        let take_logs = || String::from_utf8(std::mem::take(&mut *logs.lock().unwrap())).unwrap();
+        let is_refund_event = |line: &str| line.contains("refund.path") && line.contains(&point);
+        let assert_failed_refund = |level: &str, reason: &str| {
+            let logs = take_logs();
+            let events: Vec<_> = logs.lines().filter(|line| is_refund_event(line)).collect();
+            assert_eq!(events.len(), 1, "expected one {level} for {point}: {logs}");
+            assert!(events[0].trim_start().starts_with(level), "{logs}");
+            assert!(
+                events[0].contains(&format!("error=refund unbuildable: {reason}")),
+                "{logs}"
+            );
+        };
+
+        for level in ["WARN", "DEBUG", "DEBUG"] {
+            let report = loop_.tick();
+            assert_eq!(report.submitted, 0);
+            assert_failed_refund(level, "untyped Intention must have empty data");
+        }
+
+        // Inject a different live fixture under the same outpoint to observe a
+        // change in the construction error, then allow the same point to build.
+        invalid.output = invalid
+            .output
+            .as_builder()
+            .type_(Some(lock_script([0x33; 32], ScriptHashType::Type, vec![])).pack())
+            .build();
+        loop_.rpc().insert_cell(invalid);
+        for level in ["WARN", "DEBUG"] {
+            assert_eq!(loop_.tick().submitted, 0);
+            assert_failed_refund(level, "non-standard type script; cannot exact-refund");
+        }
+        assert_eq!(loop_.rpc().submit_attempts(), 0);
+        loop_.rpc().insert_cell(original.clone());
+        assert_eq!(loop_.tick().submitted, 1);
+        assert_eq!(input_sets(loop_.rpc()), [vec![original.out_point.clone()]]);
+
+        let logs = take_logs();
+        assert!(
+            !logs
+                .lines()
+                .any(|line| is_refund_event(line) && line.trim_start().starts_with("WARN")),
+            "{logs}"
+        );
+    }
+
+    #[test]
     fn deleting_during_a_refund_sweep_preserves_only_the_admitted_submission() {
         use cid_backend_core::{DigestLoop, NopClock, WorkerCommand, WorkerCommands, WorkerPool};
         use std::sync::Arc;

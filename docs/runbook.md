@@ -15,6 +15,30 @@ Refunds require an exact node reread of the Intention, including its output and 
 
 No private keys, no signing, no `.env`, no contract `deployment/` writes.
 
+## Creating v0.1.4 Intentions
+
+- CKB Intentions have empty data, no type script and capacity of at least
+  occupied capacity plus one shannon.
+- xUDT Intentions use the official xUDT code data hash with `hash_type=data1`.
+  The first 16 data bytes encode a nonzero little-endian `u128` amount. The
+  SDK emits exactly those 16 bytes. A Pudge Type reference resolves by the
+  dep's type script hash and fails CID's fixed Data1 identity check even when
+  the deployed code bytes are identical.
+- CID args contain a Process Type Hash and a decodable versioned entry. The
+  embedded User Lock accepts `data`, `type` and `data1`. A Process defines the
+  meaning of its payload. The offline CLI creates CKB Intentions.
+
+The CID lock first checks the input when it is spent. An unsupported asset can
+therefore be created by a raw transaction and still fail every spend path in
+v0.1.4. A Process filter refund verdict leaves the CID lock validation in force.
+
+For construction failures, inspect `refund.path` with `path=unbuildable`, which
+includes the Intention outpoint and error. Each Process worker tracks up to
+256 outpoints in a five-minute in-memory window. A tracked outpoint logs WARN
+on its first failure in the window and when the reason changes. Repeats and
+new failures beyond the limit log at DEBUG. Each eligible refund still goes
+through its usual live checks and construction on retry.
+
 ## Config
 
 See `examples/cid.testnet.toml` / `examples/cid.network.toml.example`.

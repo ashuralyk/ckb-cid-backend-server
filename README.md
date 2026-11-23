@@ -32,6 +32,11 @@ For each refund, the daemon rereads the Intention at the node and requires an ex
 
 Upstream contract pin for testnet v0.1.4 is `b2d01e0a5a9760c8ee627633365aa98dd7a99859`. For the public config, deployment outpoints, and registry POST body, see the [runbook](docs/runbook.md).
 
+CID v0.1.4 accepts CKB Intentions with empty data, no type script and usable
+capacity, and xUDT Intentions using the official Data1 identity with a nonzero
+amount. The lock applies these asset checks before selecting a spend path. See
+the [runbook's creation requirements](docs/runbook.md#creating-v014-intentions).
+
 ---
 
 ## How to run
