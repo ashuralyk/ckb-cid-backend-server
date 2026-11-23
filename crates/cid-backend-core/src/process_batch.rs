@@ -24,13 +24,16 @@ use cid_protocol::CidArgs;
 use ckb_types::core::ScriptHashType;
 use ckb_types::packed::{CellDep, CellOutput, OutPoint};
 use ckb_types::prelude::{Entity, Unpack};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{hash_map::Entry, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 const LOG_TARGET: &str = "cid_backend";
+const REFUND_WARNING_WINDOW: Duration = Duration::from_secs(300);
+const MAX_REFUND_WARNING_OUTPOINTS: usize = 256;
 const MAX_COMPARISON_PROBES: usize = 64;
 const AUDITED_EXAMPLE_DATA_HASH: [u8; 32] = [
     0x23, 0x74, 0xe4, 0x55, 0xd8, 0xcd, 0xca, 0xe5, 0xd5, 0x38, 0x72, 0x57, 0xec, 0x0d, 0x5b, 0x33,
@@ -53,6 +56,69 @@ impl ProbeBudget {
             arrivals,
             live_reads: 0,
         }
+    }
+}
+
+/// Per-worker diagnostics. A full window downgrades newly seen outpoints
+/// instead of evicting older ones and repeatedly warning during large sweeps.
+#[derive(Default)]
+pub(crate) struct RefundWarnings {
+    window_start: Option<Instant>,
+    reasons: HashMap<OutPoint, String>,
+}
+
+impl RefundWarnings {
+    fn should_warn(&mut self, out_point: &OutPoint, reason: &str, now: Instant) -> bool {
+        if self
+            .window_start
+            .is_none_or(|start| now.duration_since(start) >= REFUND_WARNING_WINDOW)
+        {
+            self.window_start = Some(now);
+            self.reasons.clear();
+        }
+
+        let has_room = self.reasons.len() < MAX_REFUND_WARNING_OUTPOINTS;
+        match self.reasons.entry(out_point.clone()) {
+            Entry::Occupied(mut entry) if entry.get() != reason => {
+                reason.clone_into(entry.get_mut());
+                true
+            }
+            Entry::Vacant(entry) if has_room => {
+                entry.insert(reason.to_owned());
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod refund_warning_tests {
+    use super::*;
+    use ckb_types::prelude::{Builder, Pack};
+
+    #[test]
+    fn warning_window_stays_bounded_and_expires() {
+        let mut warnings = RefundWarnings::default();
+        let start = Instant::now();
+        let points: Vec<_> = (0..=MAX_REFUND_WARNING_OUTPOINTS as u32)
+            .map(|index| OutPoint::new_builder().index(index.pack()).build())
+            .collect();
+        let (overflow, tracked) = points.split_last().unwrap();
+        for point in tracked {
+            assert!(warnings.should_warn(point, "first", start));
+        }
+
+        assert!(!warnings.should_warn(overflow, "first", start));
+        assert!(!warnings.should_warn(&tracked[0], "first", start));
+        assert!(warnings.should_warn(&tracked[0], "changed", start));
+        assert!(!warnings.should_warn(&tracked[0], "changed", start));
+        assert_eq!(warnings.reasons.len(), MAX_REFUND_WARNING_OUTPOINTS);
+
+        let next_window = start + REFUND_WARNING_WINDOW;
+        assert!(warnings.should_warn(overflow, "first", next_window));
+        assert!(warnings.should_warn(&tracked[0], "changed", next_window));
+        assert_eq!(warnings.reasons.len(), 2);
     }
 }
 
@@ -1000,8 +1066,25 @@ fn submit_filter_refund<R: Rpc + HostQueryRpc>(
             report.last_error = Some(error.to_string());
             return BatchOutcome::RetryLater;
         }
+        Err(ref error @ AssembleError::RefundUnbuildable(ref reason)) => {
+            let warn = state
+                .lock()
+                .expect("process worker state")
+                .refund_warnings
+                .should_warn(&item.out_point, reason, Instant::now());
+            if warn {
+                tracing::warn!(target: LOG_TARGET, event = "refund.path", path = "unbuildable",
+                    out_point = ?item.out_point, %error);
+            } else {
+                tracing::debug!(target: LOG_TARGET, event = "refund.path", path = "unbuildable",
+                    out_point = ?item.out_point, %error);
+            }
+            report.skipped += 1;
+            return BatchOutcome::Continue;
+        }
         Err(error) => {
-            tracing::warn!(target: LOG_TARGET, event = "refund.path", path = "unbuildable", %error);
+            tracing::warn!(target: LOG_TARGET, event = "refund.path", path = "unbuildable",
+                out_point = ?item.out_point, %error);
             report.skipped += 1;
             return BatchOutcome::Continue;
         }

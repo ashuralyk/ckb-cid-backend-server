@@ -31,7 +31,7 @@ Stable field `event` (target `cid_backend`):
 | `ssri.filter_failed` | Filter error deferred the Process bucket |
 | `refund.process_state_pending` | Refund deferred while a pending digest spends or creates its state dependency |
 | `refund.snapshot_mismatch` | Node re-read disagrees with the Intention, Process state, or code snapshot |
-| `refund.path` | Singleton User Lock refund built (`path=user_lock`, `out_point`, `fee`) or unbuildable (`path=unbuildable`, `error`) |
+| `refund.path` | Singleton User Lock refund built (`path=user_lock`, `out_point`, `fee`) or unbuildable (`path=unbuildable`, `out_point`, `error`). For `RefundUnbuildable`, each worker tracks up to 256 outpoints per five-minute window. First failures and tracked reason changes log at WARN. Repeats and overflow log at DEBUG. |
 | `refund.fee_unaffordable` | The singleton bounded refund cannot cover the fee and its Intention stays live |
 | `dry_run.conflict` | Digest dry-run mapped to Conflict |
 | `submit.ok` | `tx_hash` |

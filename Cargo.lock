@@ -125,6 +125,7 @@ dependencies = [
  "ckb-hash 0.119.0",
  "ckb-types",
  "serde_molecule",
+ "tracing-subscriber",
 ]
 
 [[package]]

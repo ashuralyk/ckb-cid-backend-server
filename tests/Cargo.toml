@@ -12,3 +12,6 @@ cid-protocol = { workspace = true }
 cid-process-executor = { workspace = true }
 cid-intention-filter = { workspace = true }
 serde_molecule = "1.1"
+
+[dev-dependencies]
+tracing-subscriber = "0.3"

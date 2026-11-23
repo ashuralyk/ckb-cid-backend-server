@@ -6,6 +6,7 @@ use crate::process::ResolvedProcess;
 use crate::process::{ProcessEntry, ProcessResolver};
 use crate::process_batch::{
     run_process_batch, BatchMode, BatchOutcome, BatchReportDelta, ProbeBudget, ProcessBatchParams,
+    RefundWarnings,
 };
 use crate::rpc::{LiveCell, Rpc};
 use crate::scan::ScannedIntention;
@@ -72,6 +73,7 @@ pub struct ProcessWorkerState {
     pub(crate) refund_state_deps: HashMap<Vec<u8>, OutPoint>,
     /// Give refunds the first opportunity after a digest releases Process state.
     pub(crate) refund_priority: RefundPriority,
+    pub(crate) refund_warnings: RefundWarnings,
     unfunded_process: Option<(OutPoint, Option<OutPoint>)>,
     /// Shared across assembly jobs within a tick, cleared after all jobs finish.
     pub(crate) probe_budget: Option<ProbeBudget>,
@@ -95,6 +97,7 @@ impl ProcessWorkerState {
             submit: SubmitState::default(),
             refund_state_deps: HashMap::new(),
             refund_priority: RefundPriority::None,
+            refund_warnings: RefundWarnings::default(),
             unfunded_process: None,
             probe_budget: None,
             generation,
